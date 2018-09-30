@@ -23,7 +23,11 @@ namespace JetBrains.CachingProxy
   public class CachingProxy
   {
     private const int BUFFER_SIZE = 81920;
-    private static readonly HttpClient ourHttpClient = new HttpClient {Timeout = TimeSpan.FromSeconds(10)};
+
+    private static readonly HttpClient ourHttpClient = new HttpClient
+    {
+      Timeout = TimeSpan.FromSeconds(10)
+    };
 
     private readonly RequestDelegate myNext;
     private readonly CachingProxyConfig myConfig;
@@ -35,6 +39,8 @@ namespace JetBrains.CachingProxy
     {
       myNext = next;
       myConfig = config;
+      myLogger = loggerFactory.CreateLogger(GetType().FullName);
+
 
       // Order by length here to handle longer prefixes first
       // This will help to handle overlapping prefixes like:
@@ -45,15 +51,18 @@ namespace JetBrains.CachingProxy
 
       foreach (var prefix in prefixes)
       {
-        // TODO?
-        var uri = new Uri("https:/" + prefix);
+        var uri = UriFromRequestPath(prefix);
         // force reconnection (and DNS re-resolve) every two minutes
         ServicePointManager.FindServicePoint(uri).ConnectionLeaseTimeout = 120000;
       }
 
+      myContentTypeProvider = new FileExtensionContentTypeProvider();
+
       var staticFileOptions = new StaticFileOptions
       {
         FileProvider = new PhysicalFileProvider(myConfig.LocalCachePath),
+        ServeUnknownFileTypes = true,
+        ContentTypeProvider = myContentTypeProvider
       };
 
       myStaticFileMiddleware =
@@ -66,14 +75,26 @@ namespace JetBrains.CachingProxy
       myRedirectToRemoteUrlsRegex = config.RedirectToRemoteUrlsRegex != null
         ? new Regex(config.RedirectToRemoteUrlsRegex, RegexOptions.Compiled)
         : null;
+    }
 
-      Console.Error.WriteLine("CachingProxy init");
+    private void CatchSilently(Action action)
+    {
+      try
+      {
+        action();
+      }
+      catch (Exception e)
+      {
+        myLogger.Log(LogLevel.Error, e, "LogSilently: " + e.Message);
+      }
     }
 
     private static readonly Regex ourGoodPathChars = new Regex("^[a-zA-Z_\\-0-9./]+$", RegexOptions.Compiled);
     private readonly Regex myBlacklistRegex;
     private readonly Regex myRedirectToRemoteUrlsRegex;
     private readonly ResponseCache myResponseCache = new ResponseCache();
+    private readonly ILogger myLogger;
+    private readonly FileExtensionContentTypeProvider myContentTypeProvider;
 
     [SuppressMessage("ReSharper", "UnusedMember.Global")]
     public async Task InvokeAsync(HttpContext context)
@@ -97,8 +118,7 @@ namespace JetBrains.CachingProxy
         return;
       }
 
-      // TODO?
-      var upstreamUri = new Uri("https://" + requestPath);
+      var upstreamUri = UriFromRequestPath(requestPath);
 
       if (myBlacklistRegex != null && myBlacklistRegex.IsMatch(requestPath))
       {
@@ -131,16 +151,45 @@ namespace JetBrains.CachingProxy
         return;
       }
 
-      Console.Error.WriteLine("---- 0 downloading from " + upstreamUri);
+      myLogger.LogDebug("Downloading from {0}", upstreamUri);
 
       var request = new HttpRequestMessage(HttpMethod.Get, upstreamUri);
-      using (var response = await ourHttpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead))
+
+      HttpResponseMessage response;
+      try
       {
-        Console.Error.WriteLine($"---- 2 {response.StatusCode}");
+        response = await ourHttpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, context.RequestAborted);
+      }
+      catch (OperationCanceledException canceledException)
+      {
+        if (context.RequestAborted == canceledException.CancellationToken) return;
+        
+        // Canceled by internal token, means timeout
+
+        myLogger.LogWarning($"Timeout requesting {upstreamUri}");
+        
+        var entry = myResponseCache.PutStatusCode(requestPath, HttpStatusCode.GatewayTimeout);
+
+        SetCachedResponseHeader(context, entry);
+        await SetStatus(context, CachingProxyStatus.NEGATIVE_MISS, HttpStatusCode.NotFound);
+        return;
+      }
+      catch (Exception e)
+      {
+        myLogger.LogWarning(e, $"Exception requesting {upstreamUri}: {e.Message}");
+        
+        var entry = myResponseCache.PutStatusCode(requestPath, HttpStatusCode.ServiceUnavailable);
+        SetCachedResponseHeader(context, entry);
+        await SetStatus(context, CachingProxyStatus.NEGATIVE_MISS, HttpStatusCode.NotFound);
+        return;        
+      }
+
+      using (response)
+      {
         if (!response.IsSuccessStatusCode)
         {
           var entry = myResponseCache.PutStatusCode(requestPath, response.StatusCode);
-          
+
           SetCachedResponseHeader(context, entry);
           await SetStatus(context, CachingProxyStatus.NEGATIVE_MISS, HttpStatusCode.NotFound);
           return;
@@ -156,8 +205,11 @@ namespace JetBrains.CachingProxy
 
         context.Response.ContentLength = contentLength;
 
+        if (myContentTypeProvider.TryGetContentType(requestPath, out var contentType))
+          context.Response.ContentType = contentType;
+
         await SetStatus(context, CachingProxyStatus.MISS, HttpStatusCode.OK);
-        
+
         var tempFile = cachePath + ".tmp." + Guid.NewGuid().ToString();
         try
         {
@@ -169,35 +221,45 @@ namespace JetBrains.CachingProxy
             FileOptions.Asynchronous))
           {
             using (var sourceStream = await response.Content.ReadAsStreamAsync())
-            {
-              // TODO Handle context.RequestAborted
-              // Stopping download from a client should stop downloading and streaming here
-              await CopyToTwoStreamsAsync(sourceStream, context.Response.Body, stream,
-                default(CancellationToken));
-            }
+              await CopyToTwoStreamsAsync(sourceStream, context.Response.Body, stream, context.RequestAborted);
           }
 
           var tempFileInfo = new FileInfo(tempFile);
           if (tempFileInfo.Length != contentLength)
-            throw new Exception(
-              $"Expected {contentLength} bytes from Content-Length, but downloaded {tempFileInfo.Length}: {upstreamUri}");
+          {
+            myLogger.LogWarning($"Expected {contentLength} bytes from Content-Length, but downloaded {tempFileInfo.Length}: {upstreamUri}");
+            
+            // Nothing we can do here for the client. The client itself should check Content-Length
+            return;
+          }
 
-          // TODO test, will report exception on overwrite, we need to skip it
-          File.Move(tempFile, cachePath);
+          try
+          {
+            File.Move(tempFile, cachePath);
+          }
+          catch (IOException)
+          {
+            if (File.Exists(cachePath))
+            {
+              // It's ok, parallel request cached it before us
+            }
+            else throw;
+          }
         }
         finally
         {
-          try
+          CatchSilently(() =>
           {
             if (File.Exists(tempFile))
               File.Delete(tempFile);
-          }
-          catch
-          {
-            // TODO. LogSilently?
-          }
+          });
         }
       }
+    }
+
+    private Uri UriFromRequestPath(string requestPath)
+    {
+      return new Uri("https://" + requestPath.TrimStart('/'));
     }
 
     private async Task SetStatus(HttpContext context, CachingProxyStatus status, HttpStatusCode? httpCode = null,
@@ -214,10 +276,10 @@ namespace JetBrains.CachingProxy
 
     private void SetCachedResponseHeader(HttpContext context, ResponseCache.Entry entry)
     {
-      context.Response.Headers[CachingProxyConstants.CachedStatusHeader] = ((int)entry.StatusCode).ToString();
+      context.Response.Headers[CachingProxyConstants.CachedStatusHeader] = ((int) entry.StatusCode).ToString();
       context.Response.Headers[CachingProxyConstants.CachedUntilHeader] = entry.CacheUntil.ToString("R");
     }
-    
+
     private static async Task CopyToTwoStreamsAsync(Stream source, Stream dest1, Stream dest2,
       CancellationToken cancellationToken)
     {
@@ -229,7 +291,7 @@ namespace JetBrains.CachingProxy
           int length = await source.ReadAsync(new Memory<byte>(buffer), cancellationToken).ConfigureAwait(false);
           if (length == 0)
             break;
-          
+
           await dest1.WriteAsync(new ReadOnlyMemory<byte>(buffer, 0, length), cancellationToken).ConfigureAwait(false);
           await dest2.WriteAsync(new ReadOnlyMemory<byte>(buffer, 0, length), cancellationToken).ConfigureAwait(false);
         }
