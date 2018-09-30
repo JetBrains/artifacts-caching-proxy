@@ -6,7 +6,7 @@
 
 This a standard .NET Core project. 
 
-Install [.NET Core SDK](https://www.microsoft.com/net)
-Open .sln in your favourite IDE or run `dotnet build`
+- Install [.NET Core SDK](https://www.microsoft.com/net)
+- Open .sln in your favourite IDE or run `dotnet build`
 
 We recommend [JetBrains Rider](https://www.jetbrains.com/rider)
