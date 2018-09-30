@@ -47,7 +47,6 @@ namespace JetBrains.CachingProxy
       myConfig = config;
       myLogger = loggerFactory.CreateLogger(GetType().FullName);
 
-
       // Order by length here to handle longer prefixes first
       // This will help to handle overlapping prefixes like:
       // /aprefix
@@ -81,18 +80,6 @@ namespace JetBrains.CachingProxy
       myRedirectToRemoteUrlsRegex = config.RedirectToRemoteUrlsRegex != null
         ? new Regex(config.RedirectToRemoteUrlsRegex, RegexOptions.Compiled)
         : null;
-    }
-
-    private void CatchSilently(Action action)
-    {
-      try
-      {
-        action();
-      }
-      catch (Exception e)
-      {
-        myLogger.Log(LogLevel.Error, e, "LogSilently: " + e.Message);
-      }
     }
 
     [SuppressMessage("ReSharper", "UnusedMember.Global")]
@@ -195,13 +182,6 @@ namespace JetBrains.CachingProxy
         }
 
         var contentLength = response.Content.Headers.ContentLength;
-        if (contentLength == null)
-        {
-          await SetStatus(context, CachingProxyStatus.ERROR, HttpStatusCode.InternalServerError,
-            "Remote server has not returned Content-Length header: " + upstreamUri);
-          return;
-        }
-
         context.Response.ContentLength = contentLength;
 
         if (myContentTypeProvider.TryGetContentType(requestPath, out var contentType))
@@ -209,7 +189,7 @@ namespace JetBrains.CachingProxy
 
         await SetStatus(context, CachingProxyStatus.MISS, HttpStatusCode.OK);
 
-        var tempFile = cachePath + ".tmp." + Guid.NewGuid().ToString();
+        var tempFile = cachePath + ".tmp." + Guid.NewGuid();
         try
         {
           var parent = Directory.GetParent(cachePath);
@@ -224,11 +204,10 @@ namespace JetBrains.CachingProxy
           }
 
           var tempFileInfo = new FileInfo(tempFile);
-          if (tempFileInfo.Length != contentLength)
+          if (contentLength != null && tempFileInfo.Length != contentLength)
           {
             myLogger.LogWarning($"Expected {contentLength} bytes from Content-Length, but downloaded {tempFileInfo.Length}: {upstreamUri}");
-            
-            // Nothing we can do here for the client. The client itself should check Content-Length
+            context.Abort();
             return;
           }
 
@@ -253,6 +232,18 @@ namespace JetBrains.CachingProxy
               File.Delete(tempFile);
           });
         }
+      }
+    }
+
+    private void CatchSilently(Action action)
+    {
+      try
+      {
+        action();
+      }
+      catch (Exception e)
+      {
+        myLogger.Log(LogLevel.Error, e, "LogSilently: " + e.Message);
       }
     }
 

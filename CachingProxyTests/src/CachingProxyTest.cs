@@ -18,6 +18,7 @@ namespace JetBrains.CachingProxy.Tests
 {
   // TODO: Test with wrong content-length from remote side
   // TODO: Test remote 5xx
+  // TODO: Negative caching expiration
   public class CachingProxyTest : IDisposable
   {
     private readonly ITestOutputHelper myOutput;
@@ -37,6 +38,7 @@ namespace JetBrains.CachingProxy.Tests
         {
           "/repo1.maven.org/maven2",
           "/198.51.100.9",
+          "/plugins.gradle.org/m2",
           "/unknown_host.xyz"
         }
       };
@@ -56,7 +58,7 @@ namespace JetBrains.CachingProxy.Tests
         {
           AssertStatusHeader(message, CachingProxyStatus.MISS);
           Assert.Equal("application/java-archive", message.Content.Headers.ContentType.ToString());
-          Assert.Equal(11541, message.Content.Headers.ContentLength);
+          Assert.Equal(11541, GetContentLength(message));
           Assert.Equal(11541, bytes.Length);
           Assert.Equal("eca06bb19a4f55673f8f40d0a20eb0ee0342403ee5856b890d6c612e5facb027", SHA256(bytes));
         });
@@ -65,10 +67,31 @@ namespace JetBrains.CachingProxy.Tests
         (message, bytes) =>
         {
           AssertNoStatusHeader(message);
-          Assert.Equal(11541, message.Content.Headers.ContentLength);
+          Assert.Equal(11541, GetContentLength(message));
           Assert.Equal("application/java-archive", message.Content.Headers.ContentType.ToString());
           Assert.Equal(11541, bytes.Length);
           Assert.Equal("eca06bb19a4f55673f8f40d0a20eb0ee0342403ee5856b890d6c612e5facb027", SHA256(bytes));
+        });
+    }
+    
+    [Fact]
+    public async void Caching_Works_Unknown_ContentLength()
+    {
+      var url = "/plugins.gradle.org/m2/de/undercouch/gradle-download-task/3.4.2/gradle-download-task-3.4.2.pom.sha1";
+      await AssertResponse(url, HttpStatusCode.OK,
+        (message, bytes) =>
+        {
+          AssertStatusHeader(message, CachingProxyStatus.MISS);
+          Assert.Null(GetContentLength(message));
+          Assert.Equal("49a1b31825c921fd25dd374f314245060eb6cae0", Encoding.UTF8.GetString(bytes));
+        });
+
+      await AssertResponse(url, HttpStatusCode.OK,
+        (message, bytes) =>
+        {
+          AssertNoStatusHeader(message);
+          Assert.Equal(40, GetContentLength(message));
+          Assert.Equal("49a1b31825c921fd25dd374f314245060eb6cae0", Encoding.UTF8.GetString(bytes));
         });
     }
 
@@ -192,6 +215,13 @@ namespace JetBrains.CachingProxy.Tests
 
       Assert.Equal(expectedCode, response.StatusCode);
       assertions(response, bytes);
+    }
+
+    private long? GetContentLength(HttpResponseMessage response)
+    {
+      var values = response.Content.Headers.FirstOrDefault(x => x.Key == "Content-Length").Value;
+      if (values == null) return null;
+      return long.Parse(values.FirstOrDefault());
     }
 
     private void AssertStatusHeader(HttpResponseMessage response, CachingProxyStatus status)
