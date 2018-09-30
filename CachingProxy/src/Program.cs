@@ -7,11 +7,7 @@ namespace JetBrains.CachingProxy
   {
     public static void Main(string[] args)
     {
-      CreateWebHostBuilder(args).Build().Run();
+      WebHost.CreateDefaultBuilder<Startup>(args).Build().Run();
     }
-
-    private static IWebHostBuilder CreateWebHostBuilder(string[] args) =>
-      WebHost.CreateDefaultBuilder(args)
-        .UseStartup<Startup>();
   }
 }

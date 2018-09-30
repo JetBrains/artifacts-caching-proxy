@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -10,7 +9,8 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.TestHost;
-using Microsoft.EntityFrameworkCore.Internal;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -31,10 +31,10 @@ namespace JetBrains.CachingProxy.Tests
       myTempDirectory = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
       Directory.CreateDirectory(myTempDirectory);
 
-      var config = new CachingProxyConfig()
+      var config = new CachingProxyConfig
       {
         LocalCachePath = myTempDirectory,
-        Prefixes = new List<string>
+        Prefixes = new[]
         {
           "/repo1.maven.org/maven2",
           "/198.51.100.9",
@@ -44,7 +44,9 @@ namespace JetBrains.CachingProxy.Tests
       };
 
       var builder = new WebHostBuilder()
-        .Configure(app => { app.UseMiddleware<CachingProxy>(config); }
+        .ConfigureServices(services => services.Add(new ServiceDescriptor(typeof(IOptions<CachingProxyConfig>),
+          new OptionsWrapper<CachingProxyConfig>(config))))
+        .Configure(app => { app.UseMiddleware<CachingProxy>(); }
         );
 
       myServer = new TestServer(builder);
@@ -73,7 +75,7 @@ namespace JetBrains.CachingProxy.Tests
           Assert.Equal("eca06bb19a4f55673f8f40d0a20eb0ee0342403ee5856b890d6c612e5facb027", SHA256(bytes));
         });
     }
-    
+
     [Fact]
     public async void Caching_Works_Unknown_ContentLength()
     {
@@ -104,25 +106,24 @@ namespace JetBrains.CachingProxy.Tests
       var response2 = myServer.CreateClient().GetAsync(url);
 
       var result = await Task.WhenAll(response1, response2);
-      
+
       AssertStatusHeader(result[0], CachingProxyStatus.MISS);
       AssertStatusHeader(result[1], CachingProxyStatus.MISS);
 
       await AssertResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/1.10.5/ant-xz-1.10.5.jar", HttpStatusCode.OK,
-        (message, bytes) =>
-        {
-          AssertNoStatusHeader(message);
-        });
+        (message, bytes) => { AssertNoStatusHeader(message); });
     }
 
     [Fact]
     public async void Always_Redirect_Snapshots()
     {
-      await AssertResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/1.0-SNAPSHOT/ant-xz-1.0-SNAPSHOT.jar", HttpStatusCode.TemporaryRedirect,
+      await AssertResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/1.0-SNAPSHOT/ant-xz-1.0-SNAPSHOT.jar",
+        HttpStatusCode.TemporaryRedirect,
         (message, bytes) =>
         {
           AssertStatusHeader(message, CachingProxyStatus.ALWAYS_REDIRECT);
-          Assert.Equal("https://repo1.maven.org/maven2/org/apache/ant/ant-xz/1.0-SNAPSHOT/ant-xz-1.0-SNAPSHOT.jar", message.Headers.Location.ToString());
+          Assert.Equal("https://repo1.maven.org/maven2/org/apache/ant/ant-xz/1.0-SNAPSHOT/ant-xz-1.0-SNAPSHOT.jar",
+            message.Headers.Location.ToString());
         });
     }
 
@@ -130,10 +131,7 @@ namespace JetBrains.CachingProxy.Tests
     public async void Always_Blacklist_MavenMetadataXml()
     {
       await AssertResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/maven-metadata.xml", HttpStatusCode.NotFound,
-        (message, bytes) =>
-        {
-          AssertStatusHeader(message, CachingProxyStatus.BLACKLISTED);
-        });
+        (message, bytes) => { AssertStatusHeader(message, CachingProxyStatus.BLACKLISTED); });
     }
 
     [Fact]
@@ -196,10 +194,7 @@ namespace JetBrains.CachingProxy.Tests
     public async void Unknown_Prefix()
     {
       await AssertResponse("/some_unknown_prefix/a.txt", HttpStatusCode.NotFound,
-        (message, bytes) =>
-        {
-          AssertNoStatusHeader(message);
-        });
+        (message, bytes) => { AssertNoStatusHeader(message); });
     }
 
     private async Task AssertResponse(string url, HttpStatusCode expectedCode,
@@ -233,15 +228,14 @@ namespace JetBrains.CachingProxy.Tests
     private void AssertCachedStatusHeader(HttpResponseMessage response, HttpStatusCode status)
     {
       var statusHeader = response.Headers.GetValues(CachingProxyConstants.CachedStatusHeader).FirstOrDefault();
-      Assert.Equal(statusHeader, ((int)status).ToString());
+      Assert.Equal(statusHeader, ((int) status).ToString());
     }
 
     private void AssertNoStatusHeader(HttpResponseMessage response)
     {
       if (response.Headers.TryGetValues(CachingProxyConstants.StatusHeader, out var headers))
       {
-        throw new Exception($"Expected no {CachingProxyConstants.StatusHeader} header, but got: " +
-                            headers.Join(","));
+        throw new Exception($"Expected no {CachingProxyConstants.StatusHeader} header, but got: " + string.Join(", ", headers));
       }
     }
 

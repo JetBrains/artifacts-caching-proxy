@@ -9,6 +9,7 @@ using System.Net.Http;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using JetBrains.Annotations;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
@@ -36,22 +37,28 @@ namespace JetBrains.CachingProxy
     private readonly ILogger myLogger;
     private readonly FileExtensionContentTypeProvider myContentTypeProvider;
     private readonly RequestDelegate myNext;
-    private readonly CachingProxyConfig myConfig;
     private readonly List<PathString> myPathStringPrefixes;
     private readonly StaticFileMiddleware myStaticFileMiddleware;
 
+    [NotNull] private readonly string myLocalCachePath;
+
     public CachingProxy(RequestDelegate next, IHostingEnvironment hostingEnv,
-      ILoggerFactory loggerFactory, CachingProxyConfig config)
+      ILoggerFactory loggerFactory, IOptions<CachingProxyConfig> config)
     {
-      myNext = next;
-      myConfig = config;
       myLogger = loggerFactory.CreateLogger(GetType().FullName);
+      myLogger.LogInformation("Initialising. Config:\n" + config.Value);
+      
+      myNext = next;
+
+      myLocalCachePath = config.Value.LocalCachePath;
+      if (myLocalCachePath == null) throw new ArgumentNullException("", "LocalCachePath could not be null");
+      if (!Directory.Exists(myLocalCachePath)) throw new ArgumentException("LocalCachePath doesn't exist: " + myLocalCachePath);
 
       // Order by length here to handle longer prefixes first
       // This will help to handle overlapping prefixes like:
       // /aprefix
       // /aprefix/too
-      var prefixes = config.Prefixes.OrderByDescending(x => x.Length).ToList();
+      var prefixes = config.Value.Prefixes.OrderByDescending(x => x.Length).ToList();
       myPathStringPrefixes = prefixes.Select(x => new PathString(x)).ToList();
 
       foreach (var prefix in prefixes)
@@ -65,7 +72,7 @@ namespace JetBrains.CachingProxy
 
       var staticFileOptions = new StaticFileOptions
       {
-        FileProvider = new PhysicalFileProvider(myConfig.LocalCachePath),
+        FileProvider = new PhysicalFileProvider(myLocalCachePath),
         ServeUnknownFileTypes = true,
         ContentTypeProvider = myContentTypeProvider
       };
@@ -73,12 +80,12 @@ namespace JetBrains.CachingProxy
       myStaticFileMiddleware =
         new StaticFileMiddleware(next, hostingEnv, Options.Create(staticFileOptions), loggerFactory);
 
-      myBlacklistRegex = config.BlacklistUrlRegex != null
-        ? new Regex(config.BlacklistUrlRegex, RegexOptions.Compiled)
+      myBlacklistRegex = config.Value.BlacklistUrlRegex != null
+        ? new Regex(config.Value.BlacklistUrlRegex, RegexOptions.Compiled)
         : null;
 
-      myRedirectToRemoteUrlsRegex = config.RedirectToRemoteUrlsRegex != null
-        ? new Regex(config.RedirectToRemoteUrlsRegex, RegexOptions.Compiled)
+      myRedirectToRemoteUrlsRegex = config.Value.RedirectToRemoteUrlsRegex != null
+        ? new Regex(config.Value.RedirectToRemoteUrlsRegex, RegexOptions.Compiled)
         : null;
     }
 
@@ -119,11 +126,8 @@ namespace JetBrains.CachingProxy
         return;
       }
 
-      var localCachePath = myConfig.LocalCachePath;
-      if (localCachePath == null) throw new Exception("Null LocalCachePath");
-
-      var cachePath = Path.GetFullPath(Path.Combine(localCachePath, requestPath));
-      if (cachePath != localCachePath && !cachePath.StartsWith(localCachePath + Path.DirectorySeparatorChar))
+      var cachePath = Path.GetFullPath(Path.Combine(myLocalCachePath, requestPath));
+      if (cachePath != myLocalCachePath && !cachePath.StartsWith(myLocalCachePath + Path.DirectorySeparatorChar))
       {
         await SetStatus(context, CachingProxyStatus.BAD_REQUEST, HttpStatusCode.BadRequest, "Path traversal");
         return;
