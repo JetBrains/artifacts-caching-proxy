@@ -10,3 +10,11 @@ This is a standard .NET Core project.
 - Open .sln in your favourite IDE or run `dotnet build`
 
 We recommend [JetBrains Rider](https://www.jetbrains.com/rider)
+
+## Running
+
+```
+dotnet run --project CachingProxy/CachingProxy.csproj -- LocalCachePath=/tmp Prefixes:0=/plugins.gradle.org/m2 Prefixes:1=/repo1.maven.org/maven2
+```
+
+Then try `curl -v http://127.0.0.1:5000/plugins.gradle.org/m2/de/undercouch/gradle-download-task/3.4.2/gradle-download-task-3.4.2.pom`
