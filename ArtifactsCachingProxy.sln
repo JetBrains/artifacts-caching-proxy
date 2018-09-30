@@ -5,7 +5,7 @@ EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "SolutionFolder", "SolutionFolder", "{8FCADA10-B8C2-4082-91AE-63FBCA623DCA}"
 ProjectSection(SolutionItems) = preProject
 	cache-redirector.sln.DotSettings = ArtifactsCachingProxy.sln.DotSettings
-	README.txt = README.txt
+	README.md = README.md
 	Dockerfile = Dockerfile
 	.travis.yml = .travis.yml
 EndProjectSection

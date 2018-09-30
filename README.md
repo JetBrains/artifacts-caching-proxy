@@ -1,0 +1,12 @@
+# Caching proxy for immutable artifacts
+
+[![JetBrains team project](http://jb.gg/badges/team.svg)](https://confluence.jetbrains.com/display/ALL/JetBrains+on+GitHub)
+
+## Building
+
+This a standard .NET Core project. 
+
+Install [.NET Core SDK](https://www.microsoft.com/net)
+Open .sln in your favourite IDE or run `dotnet build`
+
+We recommend [JetBrains Rider](https://www.jetbrains.com/rider)
