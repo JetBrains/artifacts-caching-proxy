@@ -24,11 +24,17 @@ namespace JetBrains.CachingProxy
   {
     private const int BUFFER_SIZE = 81920;
 
+    private static readonly Regex ourGoodPathChars = new Regex("^[a-zA-Z_\\-0-9./]+$", RegexOptions.Compiled);
     private static readonly HttpClient ourHttpClient = new HttpClient
     {
       Timeout = TimeSpan.FromSeconds(10)
     };
 
+    private readonly Regex myBlacklistRegex;
+    private readonly Regex myRedirectToRemoteUrlsRegex;
+    private readonly ResponseCache myResponseCache = new ResponseCache();
+    private readonly ILogger myLogger;
+    private readonly FileExtensionContentTypeProvider myContentTypeProvider;
     private readonly RequestDelegate myNext;
     private readonly CachingProxyConfig myConfig;
     private readonly List<PathString> myPathStringPrefixes;
@@ -88,13 +94,6 @@ namespace JetBrains.CachingProxy
         myLogger.Log(LogLevel.Error, e, "LogSilently: " + e.Message);
       }
     }
-
-    private static readonly Regex ourGoodPathChars = new Regex("^[a-zA-Z_\\-0-9./]+$", RegexOptions.Compiled);
-    private readonly Regex myBlacklistRegex;
-    private readonly Regex myRedirectToRemoteUrlsRegex;
-    private readonly ResponseCache myResponseCache = new ResponseCache();
-    private readonly ILogger myLogger;
-    private readonly FileExtensionContentTypeProvider myContentTypeProvider;
 
     [SuppressMessage("ReSharper", "UnusedMember.Global")]
     public async Task InvokeAsync(HttpContext context)
