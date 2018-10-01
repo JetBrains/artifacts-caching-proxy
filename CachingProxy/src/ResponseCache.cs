@@ -2,17 +2,31 @@ using System;
 using System.Collections.Concurrent;
 using System.Net;
 using JetBrains.Annotations;
+using Microsoft.AspNetCore.Hosting;
 
 namespace JetBrains.CachingProxy
 {
   // TODO. Cache cleanup after a some time?
   public class ResponseCache
   {
+    private readonly IHostingEnvironment myHostingEnvironment;
+
+    public ResponseCache(IHostingEnvironment hostingEnvironment)
+    {
+      myHostingEnvironment = hostingEnvironment;
+    }
+
     [CanBeNull]
     public Entry GetCachedStatusCode(string cacheKey)
     {
       if (!myCache.TryGetValue(cacheKey, out var entry)) return null;
-      return DateTime.UtcNow > entry.CacheUntil ? null : entry;
+      if (DateTime.UtcNow > entry.CacheUntil)
+      {
+        myCache.TryRemove(cacheKey, out _);
+        return null;
+      }
+
+      return entry;
     }
 
     [NotNull]
