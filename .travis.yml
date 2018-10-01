@@ -3,6 +3,6 @@ mono: none
 dotnet: 2.1.300
 install:
   - dotnet restore
-script: 
+script:
   - dotnet build
   - dotnet test CachingProxyTests/CachingProxyTests.csproj

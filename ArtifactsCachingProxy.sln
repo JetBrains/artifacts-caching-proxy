@@ -8,6 +8,7 @@ ProjectSection(SolutionItems) = preProject
 	README.md = README.md
 	Dockerfile = Dockerfile
 	.travis.yml = .travis.yml
+	.editorconfig = .editorconfig
 EndProjectSection
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CachingProxyTests", "CachingProxyTests\CachingProxyTests.csproj", "{1460FFCE-B691-422B-B14C-97177B6A4446}"

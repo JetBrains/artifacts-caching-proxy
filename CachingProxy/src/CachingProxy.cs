@@ -26,6 +26,7 @@ namespace JetBrains.CachingProxy
     private const int BUFFER_SIZE = 81920;
 
     private static readonly Regex ourGoodPathChars = new Regex("^[a-zA-Z_\\-0-9./]+$", RegexOptions.Compiled);
+
     private static readonly HttpClient ourHttpClient = new HttpClient
     {
       Timeout = TimeSpan.FromSeconds(10)
@@ -47,7 +48,7 @@ namespace JetBrains.CachingProxy
     {
       myLogger = loggerFactory.CreateLogger(GetType().FullName);
       myLogger.LogInformation("Initialising. Config:\n" + config.Value);
-      
+
       myNext = next;
 
       myLocalCachePath = config.Value.LocalCachePath;
@@ -153,11 +154,11 @@ namespace JetBrains.CachingProxy
       catch (OperationCanceledException canceledException)
       {
         if (context.RequestAborted == canceledException.CancellationToken) return;
-        
+
         // Canceled by internal token, means timeout
 
         myLogger.LogWarning($"Timeout requesting {upstreamUri}");
-        
+
         var entry = myResponseCache.PutStatusCode(requestPath, HttpStatusCode.GatewayTimeout);
 
         SetCachedResponseHeader(context, entry);
@@ -167,11 +168,11 @@ namespace JetBrains.CachingProxy
       catch (Exception e)
       {
         myLogger.LogWarning(e, $"Exception requesting {upstreamUri}: {e.Message}");
-        
+
         var entry = myResponseCache.PutStatusCode(requestPath, HttpStatusCode.ServiceUnavailable);
         SetCachedResponseHeader(context, entry);
         await SetStatus(context, CachingProxyStatus.NEGATIVE_MISS, HttpStatusCode.NotFound);
-        return;        
+        return;
       }
 
       using (response)

@@ -8,7 +8,7 @@ namespace JetBrains.CachingProxy
     NEGATIVE_MISS,
     BLACKLISTED,
     ALWAYS_REDIRECT,
-    
+
     BAD_REQUEST,
     ERROR,
   }

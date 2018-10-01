@@ -13,7 +13,7 @@ namespace JetBrains.CachingProxy
     {
       myConfig = config;
     }
-    
+
     public void ConfigureServices(IServiceCollection services)
     {
       services.Configure<CachingProxyConfig>(myConfig);
@@ -23,7 +23,7 @@ namespace JetBrains.CachingProxy
     {
       if (env.IsDevelopment())
         app.UseDeveloperExceptionPage();
-      
+
       app.UseMiddleware<CachingProxy>();
     }
   }
