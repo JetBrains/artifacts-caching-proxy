@@ -47,7 +47,7 @@ namespace JetBrains.CachingProxy
       ILoggerFactory loggerFactory, IOptions<CachingProxyConfig> config)
     {
       myLogger = loggerFactory.CreateLogger(GetType().FullName);
-      myLogger.LogInformation("Initialising. Config:\n" + config.Value);
+      myLogger.LogWarning("Initialising. Config:\n" + config.Value);
 
       myNext = next;
 
@@ -101,7 +101,10 @@ namespace JetBrains.CachingProxy
 
       await myStaticFileMiddleware.Invoke(context);
 
-      if (!context.Request.Method.Equals("GET")) return;
+      var isHead = context.Request.Method.Equals("HEAD", StringComparison.Ordinal);
+      var isGet = context.Request.Method.Equals("GET", StringComparison.Ordinal);
+
+      if (!isHead && !isGet) return;
       if (context.Response.StatusCode != StatusCodes.Status404NotFound) return;
 
       var requestPath = context.Request.Path.ToString().Replace('\\', '/').TrimStart('/');
@@ -135,16 +138,25 @@ namespace JetBrains.CachingProxy
       }
 
       var cachedResponse = myResponseCache.GetCachedStatusCode(requestPath);
-      if (cachedResponse != null)
+      if (cachedResponse != null && !cachedResponse.StatusCode.IsSuccessStatusCode())
       {
         SetCachedResponseHeader(context, cachedResponse);
         await SetStatus(context, CachingProxyStatus.NEGATIVE_HIT, HttpStatusCode.NotFound);
         return;
       }
 
+      // Positive caching for GET handled in static files
+      // We handle positive caching for HEAD here
+      if (cachedResponse != null && cachedResponse.StatusCode.IsSuccessStatusCode() && isHead)
+      {
+        SetCachedResponseHeader(context, cachedResponse);
+        await SetStatus(context, CachingProxyStatus.HIT, HttpStatusCode.OK);
+        return;
+      }
+
       myLogger.LogDebug("Downloading from {0}", upstreamUri);
 
-      var request = new HttpRequestMessage(HttpMethod.Get, upstreamUri);
+      var request = new HttpRequestMessage(isHead ? HttpMethod.Head : HttpMethod.Get, upstreamUri);
 
       HttpResponseMessage response;
       try
@@ -183,6 +195,14 @@ namespace JetBrains.CachingProxy
 
           SetCachedResponseHeader(context, entry);
           await SetStatus(context, CachingProxyStatus.NEGATIVE_MISS, HttpStatusCode.NotFound);
+          return;
+        }
+
+        if (response.IsSuccessStatusCode && isHead)
+        {
+          var entry = myResponseCache.PutStatusCode(requestPath, response.StatusCode);
+          SetCachedResponseHeader(context, entry);
+          await SetStatus(context, CachingProxyStatus.MISS, HttpStatusCode.OK);
           return;
         }
 

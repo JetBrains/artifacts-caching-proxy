@@ -55,7 +55,7 @@ namespace JetBrains.CachingProxy.Tests
     [Fact]
     public async void Caching_Works()
     {
-      await AssertResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/1.10.5/ant-xz-1.10.5.jar", HttpStatusCode.OK,
+      await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/1.10.5/ant-xz-1.10.5.jar", HttpStatusCode.OK,
         (message, bytes) =>
         {
           AssertStatusHeader(message, CachingProxyStatus.MISS);
@@ -65,7 +65,7 @@ namespace JetBrains.CachingProxy.Tests
           Assert.Equal("eca06bb19a4f55673f8f40d0a20eb0ee0342403ee5856b890d6c612e5facb027", SHA256(bytes));
         });
 
-      await AssertResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/1.10.5/ant-xz-1.10.5.jar", HttpStatusCode.OK,
+      await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/1.10.5/ant-xz-1.10.5.jar", HttpStatusCode.OK,
         (message, bytes) =>
         {
           AssertNoStatusHeader(message);
@@ -77,10 +77,28 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
+    public async void Head_With_Existing_File()
+    {
+      await AssertHeadResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/1.10.5/ant-xz-1.10.5.jar", HttpStatusCode.OK,
+        message => AssertStatusHeader(message, CachingProxyStatus.MISS));
+      await AssertHeadResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/1.10.5/ant-xz-1.10.5.jar", HttpStatusCode.OK,
+        message => AssertStatusHeader(message, CachingProxyStatus.HIT));
+    }
+
+    [Fact]
+    public async void Head_With_Missing_File()
+    {
+      await AssertHeadResponse("/repo1.maven.org/maven2/notfound.txt", HttpStatusCode.NotFound,
+        message => AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_MISS));
+      await AssertHeadResponse("/repo1.maven.org/maven2/notfound.txt", HttpStatusCode.NotFound,
+        message => AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_HIT));
+    }
+
+    [Fact]
     public async void Caching_Works_Unknown_ContentLength()
     {
       var url = "/plugins.gradle.org/m2/de/undercouch/gradle-download-task/3.4.2/gradle-download-task-3.4.2.pom.sha1";
-      await AssertResponse(url, HttpStatusCode.OK,
+      await AssertGetResponse(url, HttpStatusCode.OK,
         (message, bytes) =>
         {
           AssertStatusHeader(message, CachingProxyStatus.MISS);
@@ -88,7 +106,7 @@ namespace JetBrains.CachingProxy.Tests
           Assert.Equal("49a1b31825c921fd25dd374f314245060eb6cae0", Encoding.UTF8.GetString(bytes));
         });
 
-      await AssertResponse(url, HttpStatusCode.OK,
+      await AssertGetResponse(url, HttpStatusCode.OK,
         (message, bytes) =>
         {
           AssertNoStatusHeader(message);
@@ -110,14 +128,14 @@ namespace JetBrains.CachingProxy.Tests
       AssertStatusHeader(result[0], CachingProxyStatus.MISS);
       AssertStatusHeader(result[1], CachingProxyStatus.MISS);
 
-      await AssertResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/1.10.5/ant-xz-1.10.5.jar", HttpStatusCode.OK,
+      await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/1.10.5/ant-xz-1.10.5.jar", HttpStatusCode.OK,
         (message, bytes) => { AssertNoStatusHeader(message); });
     }
 
     [Fact]
     public async void Always_Redirect_Snapshots()
     {
-      await AssertResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/1.0-SNAPSHOT/ant-xz-1.0-SNAPSHOT.jar",
+      await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/1.0-SNAPSHOT/ant-xz-1.0-SNAPSHOT.jar",
         HttpStatusCode.TemporaryRedirect,
         (message, bytes) =>
         {
@@ -130,7 +148,7 @@ namespace JetBrains.CachingProxy.Tests
     [Fact]
     public async void Always_Blacklist_MavenMetadataXml()
     {
-      await AssertResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/maven-metadata.xml", HttpStatusCode.NotFound,
+      await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/maven-metadata.xml", HttpStatusCode.NotFound,
         (message, bytes) => { AssertStatusHeader(message, CachingProxyStatus.BLACKLISTED); });
     }
 
@@ -139,14 +157,14 @@ namespace JetBrains.CachingProxy.Tests
     {
       // https://en.wikipedia.org/wiki/Reserved_IP_addresses
       // 198.51.100.0/24 reserved for documentation
-      await AssertResponse("/198.51.100.9/a.txt", HttpStatusCode.NotFound,
+      await AssertGetResponse("/198.51.100.9/a.txt", HttpStatusCode.NotFound,
         (message, bytes) =>
         {
           AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_MISS);
           AssertCachedStatusHeader(message, HttpStatusCode.GatewayTimeout);
         });
 
-      await AssertResponse("/198.51.100.9/a.txt", HttpStatusCode.NotFound,
+      await AssertGetResponse("/198.51.100.9/a.txt", HttpStatusCode.NotFound,
         (message, bytes) =>
         {
           AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_HIT);
@@ -157,14 +175,14 @@ namespace JetBrains.CachingProxy.Tests
     [Fact]
     public async void Unknown_Host()
     {
-      await AssertResponse("/unknown_host.xyz/a.txt", HttpStatusCode.NotFound,
+      await AssertGetResponse("/unknown_host.xyz/a.txt", HttpStatusCode.NotFound,
         (message, bytes) =>
         {
           AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_MISS);
           AssertCachedStatusHeader(message, HttpStatusCode.ServiceUnavailable);
         });
 
-      await AssertResponse("/unknown_host.xyz/a.txt", HttpStatusCode.NotFound,
+      await AssertGetResponse("/unknown_host.xyz/a.txt", HttpStatusCode.NotFound,
         (message, bytes) =>
         {
           AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_HIT);
@@ -175,14 +193,14 @@ namespace JetBrains.CachingProxy.Tests
     [Fact]
     public async void Remote_NotFound()
     {
-      await AssertResponse("/repo1.maven.org/maven2/not_found.txt", HttpStatusCode.NotFound,
+      await AssertGetResponse("/repo1.maven.org/maven2/not_found.txt", HttpStatusCode.NotFound,
         (message, bytes) =>
         {
           AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_MISS);
           AssertCachedStatusHeader(message, HttpStatusCode.NotFound);
         });
 
-      await AssertResponse("/repo1.maven.org/maven2/not_found.txt", HttpStatusCode.NotFound,
+      await AssertGetResponse("/repo1.maven.org/maven2/not_found.txt", HttpStatusCode.NotFound,
         (message, bytes) =>
         {
           AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_HIT);
@@ -193,23 +211,38 @@ namespace JetBrains.CachingProxy.Tests
     [Fact]
     public async void Unknown_Prefix()
     {
-      await AssertResponse("/some_unknown_prefix/a.txt", HttpStatusCode.NotFound,
+      await AssertGetResponse("/some_unknown_prefix/a.txt", HttpStatusCode.NotFound,
         (message, bytes) => { AssertNoStatusHeader(message); });
     }
 
-    private async Task AssertResponse(string url, HttpStatusCode expectedCode,
+    private async Task AssertGetResponse(string url, HttpStatusCode expectedCode,
       Action<HttpResponseMessage, byte[]> assertions)
     {
-      myOutput.WriteLine("*** Query " + url);
-      var response = await myServer.CreateClient().GetAsync(url);
-      var bytes = await response.Content.ReadAsByteArrayAsync();
+      myOutput.WriteLine("*** GET " + url);
+      using (var response = await myServer.CreateClient().GetAsync(url))
+      {
+        var bytes = await response.Content.ReadAsByteArrayAsync();
 
-      myOutput.WriteLine(response.ToString());
-      if (bytes.All(c => c < 128) && bytes.Length < 200)
-        myOutput.WriteLine("Body: " + Encoding.UTF8.GetString(bytes));
+        myOutput.WriteLine(response.ToString());
+        if (bytes.All(c => c < 128) && bytes.Length < 200)
+          myOutput.WriteLine("Body: " + Encoding.UTF8.GetString(bytes));
 
-      Assert.Equal(expectedCode, response.StatusCode);
-      assertions(response, bytes);
+        Assert.Equal(expectedCode, response.StatusCode);
+        assertions(response, bytes);
+      }
+    }
+
+    private async Task AssertHeadResponse(string url, HttpStatusCode expectedCode,
+      Action<HttpResponseMessage> assertions)
+    {
+      myOutput.WriteLine("*** HEAD " + url);
+      using (var response = await myServer.CreateClient().SendAsync(
+        new HttpRequestMessage(HttpMethod.Head, url), HttpCompletionOption.ResponseContentRead))
+      {
+        myOutput.WriteLine(response.ToString());
+        Assert.Equal(expectedCode, response.StatusCode);
+        assertions(response);
+      }
     }
 
     private long? GetContentLength(HttpResponseMessage response)
