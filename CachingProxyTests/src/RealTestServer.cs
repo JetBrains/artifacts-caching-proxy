@@ -10,10 +10,11 @@ namespace JetBrains.CachingProxy.Tests
 {
   public class RealTestServer : IDisposable
   {
-    public static readonly int Port = 4455;
+    private static readonly int Port = 4455;
     public static readonly string Url = $"http://127.0.0.1:{Port}";
 
     private readonly IWebHost myWebHost;
+    public volatile bool Conditional500SendErrorOnce;
 
     public RealTestServer()
     {
@@ -23,11 +24,25 @@ namespace JetBrains.CachingProxy.Tests
           .AddRouting())
         .Configure(app => app
           .UseRouter(router => router
-            .MapGet("ok-after-first-retry", (req, res, data) => res.WriteAsync($"Hello, {data.Values["name"]}!"))
+            .MapGet("conditional-500.txt", (req, res, data) =>
+            {
+              if (Conditional500SendErrorOnce)
+              {
+                Conditional500SendErrorOnce = false;
+                res.StatusCode = (int) HttpStatusCode.InternalServerError;
+                return res.WriteAsync($"Some Error");
+              }
+
+              return res.WriteAsync("ok");
+            })
             .MapGet("500.jar", (req, res, data) =>
             {
               res.StatusCode = (int) HttpStatusCode.InternalServerError;
               return res.WriteAsync($"Some Error");
+            }).MapGet("wrong-content-length.jar", (req, res, data) =>
+            {
+              res.ContentLength = 1024;
+              return res.WriteAsync($"not too much");
             })
             .MapGet("a.jar", (req, res, data) => res.WriteAsync($"a.jar"))
             .MapGet("a.jar/b.jar", (req, res, data) => res.WriteAsync($"b.jar"))

@@ -24,29 +24,26 @@ namespace JetBrains.CachingProxy
 
     private static readonly Regex ourGoodPathChars = new Regex("^[a-zA-Z_\\-0-9./]+$", RegexOptions.Compiled);
 
-    private static readonly HttpClient ourHttpClient = new HttpClient
-    {
-      Timeout = TimeSpan.FromSeconds(10)
-    };
-
     private readonly Regex myBlacklistRegex;
     private readonly Regex myRedirectToRemoteUrlsRegex;
     private readonly ResponseCache myResponseCache = new ResponseCache();
     private readonly ILogger myLogger;
     private readonly FileExtensionContentTypeProvider myContentTypeProvider;
     private readonly RequestDelegate myNext;
+    private readonly ProxyHttpClient myHttpClient;
     private readonly RemoteServers myRemoteServers;
     private readonly StaticFileMiddleware myStaticFileMiddleware;
 
     private readonly CacheFileProvider myCacheFileProvider;
 
     public CachingProxy(RequestDelegate next, IHostingEnvironment hostingEnv,
-      ILoggerFactory loggerFactory, IOptions<CachingProxyConfig> config)
+      ILoggerFactory loggerFactory, IOptions<CachingProxyConfig> config, ProxyHttpClient httpClient)
     {
       myLogger = loggerFactory.CreateLogger(GetType().FullName);
       myLogger.LogWarning("Initialising. Config:\n" + config.Value);
 
       myNext = next;
+      myHttpClient = httpClient;
 
       var localCachePath = config.Value.LocalCachePath;
       if (localCachePath == null) throw new ArgumentNullException("", "LocalCachePath could not be null");
@@ -155,7 +152,7 @@ namespace JetBrains.CachingProxy
       HttpResponseMessage response;
       try
       {
-        response = await ourHttpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, context.RequestAborted);
+        response = await myHttpClient.Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, context.RequestAborted);
       }
       catch (OperationCanceledException canceledException)
       {

@@ -13,18 +13,19 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using Xunit;
 using Xunit.Abstractions;
+
 // ReSharper disable ParameterOnlyUsedForPreconditionCheck.Local
 
 namespace JetBrains.CachingProxy.Tests
 {
-  // TODO: Test with wrong content-length from remote side
   // TODO: Negative caching expiration
+  // TODO: Switch to real server in tests
   public class CachingProxyTest : IDisposable, IClassFixture<CachingProxyFixture>
   {
     private readonly ITestOutputHelper myOutput;
     private readonly TestServer myServer;
     private readonly string myTempDirectory;
-    private RealTestServer myRealTestServer;
+    private readonly RealTestServer myRealTestServer;
 
     public CachingProxyTest(ITestOutputHelper output, CachingProxyFixture cachingProxyFixture)
     {
@@ -46,8 +47,12 @@ namespace JetBrains.CachingProxy.Tests
       };
 
       var builder = new WebHostBuilder()
-        .ConfigureServices(services => services.Add(new ServiceDescriptor(typeof(IOptions<CachingProxyConfig>),
-          new OptionsWrapper<CachingProxyConfig>(config))))
+        .ConfigureServices(services =>
+        {
+          services.Add(new ServiceDescriptor(typeof(IOptions<CachingProxyConfig>),
+            new OptionsWrapper<CachingProxyConfig>(config)));
+          Startup.ConfigureOurServices(services);
+        })
         .Configure(app => { app.UseMiddleware<CachingProxy>(); }
         );
 
@@ -90,6 +95,13 @@ namespace JetBrains.CachingProxy.Tests
 
       await AssertGetResponse("/real/a.jar", HttpStatusCode.OK, (message, bytes) => AssertNoStatusHeader(message));
       await AssertGetResponse("/real/a.jar/b.jar", HttpStatusCode.OK, (message, bytes) => AssertNoStatusHeader(message));
+    }
+
+    [Fact]
+    public async void Retry_After_500()
+    {
+      myRealTestServer.Conditional500SendErrorOnce = true;
+      await AssertGetResponse("/real/conditional-500.txt", HttpStatusCode.OK, (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.MISS));
     }
 
     [Fact]
@@ -248,6 +260,20 @@ namespace JetBrains.CachingProxy.Tests
           AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_HIT);
           AssertCachedStatusHeader(message, HttpStatusCode.NotFound);
         });
+    }
+
+    [Fact]
+    public async void Remote_Wrong_Content_Length()
+    {
+      await Assert.ThrowsAsync<HttpRequestException>(async () =>
+      {
+        await AssertGetResponse("/real/wrong-content-length.jar", HttpStatusCode.NotFound,
+          (message, bytes) =>
+          {
+            AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_MISS);
+            AssertCachedStatusHeader(message, HttpStatusCode.NotFound);
+          });
+      });
     }
 
     [Fact]

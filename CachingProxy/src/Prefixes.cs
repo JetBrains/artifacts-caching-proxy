@@ -23,7 +23,7 @@ namespace JetBrains.CachingProxy
 
         var index = trimmed.IndexOf("=", StringComparison.Ordinal);
         myServers.Add(index < 0
-          ? new RemoteServer(new PathString("/" + trimmed), new Uri("https://" + trimmed))
+          ? new RemoteServer(new PathString("/" + trimmed), new Uri("https://" + trimmed + "/"))
           : new RemoteServer(new PathString("/" + trimmed.Substring(0, index)), new Uri(trimmed.Substring(index + 1).TrimEnd('/'))));
       }
     }
