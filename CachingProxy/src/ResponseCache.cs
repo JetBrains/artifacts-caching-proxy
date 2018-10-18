@@ -24,12 +24,24 @@ namespace JetBrains.CachingProxy
     [NotNull]
     public Entry PutStatusCode(string cacheKey, HttpStatusCode statusCode)
     {
-      Entry entry = new Entry(statusCode, DateTime.UtcNow + ourCacheTimeSpan);
+      Entry entry = new Entry(statusCode, DateTime.UtcNow + GetCacheTimeSpan(statusCode));
       myCache[cacheKey] = entry;
       return entry;
     }
 
-    private static readonly TimeSpan ourCacheTimeSpan = TimeSpan.FromMinutes(5);
+    private static TimeSpan GetCacheTimeSpan(HttpStatusCode statusCode)
+    {
+      switch (statusCode)
+      {
+        // Clear reply from server
+        case HttpStatusCode.OK:
+        case HttpStatusCode.NotFound:
+          return TimeSpan.FromMinutes(5);
+
+        // Internal errors, network timeouts etc
+        default: return TimeSpan.FromMinutes(1);
+      }
+    }
 
     private readonly ConcurrentDictionary<string, Entry> myCache =
       new ConcurrentDictionary<string, Entry>(StringComparer.Ordinal);

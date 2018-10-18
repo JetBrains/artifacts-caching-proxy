@@ -18,7 +18,7 @@ using Xunit.Abstractions;
 
 namespace JetBrains.CachingProxy.Tests
 {
-  // TODO: Negative caching expiration
+  // TODO: Negative caching expiration per status code
   // TODO: Switch to real server in tests
   public class CachingProxyTest : IDisposable, IClassFixture<CachingProxyFixture>
   {
