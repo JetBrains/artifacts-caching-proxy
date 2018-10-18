@@ -9,12 +9,10 @@ using System.Net.Http;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
-using JetBrains.Annotations;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.StaticFiles;
-using Microsoft.Extensions.FileProviders;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -41,7 +39,7 @@ namespace JetBrains.CachingProxy
     private readonly List<PathString> myPathStringPrefixes;
     private readonly StaticFileMiddleware myStaticFileMiddleware;
 
-    [NotNull] private readonly string myLocalCachePath;
+    private readonly CacheFileProvider myCacheFileProvider;
 
     public CachingProxy(RequestDelegate next, IHostingEnvironment hostingEnv,
       ILoggerFactory loggerFactory, IOptions<CachingProxyConfig> config)
@@ -51,9 +49,9 @@ namespace JetBrains.CachingProxy
 
       myNext = next;
 
-      myLocalCachePath = config.Value.LocalCachePath;
-      if (myLocalCachePath == null) throw new ArgumentNullException("", "LocalCachePath could not be null");
-      if (!Directory.Exists(myLocalCachePath)) throw new ArgumentException("LocalCachePath doesn't exist: " + myLocalCachePath);
+      var localCachePath = config.Value.LocalCachePath;
+      if (localCachePath == null) throw new ArgumentNullException("", "LocalCachePath could not be null");
+      if (!Directory.Exists(localCachePath)) throw new ArgumentException("LocalCachePath doesn't exist: " + localCachePath);
 
       // Order by length here to handle longer prefixes first
       // This will help to handle overlapping prefixes like:
@@ -70,10 +68,11 @@ namespace JetBrains.CachingProxy
       }
 
       myContentTypeProvider = new FileExtensionContentTypeProvider();
+      myCacheFileProvider = new CacheFileProvider(localCachePath);
 
       var staticFileOptions = new StaticFileOptions
       {
-        FileProvider = new PhysicalFileProvider(myLocalCachePath),
+        FileProvider = myCacheFileProvider,
         ServeUnknownFileTypes = true,
         ContentTypeProvider = myContentTypeProvider
       };
@@ -130,10 +129,10 @@ namespace JetBrains.CachingProxy
         return;
       }
 
-      var cachePath = Path.GetFullPath(Path.Combine(myLocalCachePath, requestPath));
-      if (cachePath != myLocalCachePath && !cachePath.StartsWith(myLocalCachePath + Path.DirectorySeparatorChar))
+      var cachePath = myCacheFileProvider.GetFileInfo(requestPath).PhysicalPath;
+      if (cachePath == null)
       {
-        await SetStatus(context, CachingProxyStatus.BAD_REQUEST, HttpStatusCode.BadRequest, "Path traversal");
+        await SetStatus(context, CachingProxyStatus.BAD_REQUEST, HttpStatusCode.BadRequest, "Invalid cache path");
         return;
       }
 

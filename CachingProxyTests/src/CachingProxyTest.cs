@@ -19,6 +19,7 @@ namespace JetBrains.CachingProxy.Tests
   // TODO: Test with wrong content-length from remote side
   // TODO: Test remote 5xx
   // TODO: Negative caching expiration
+  // TODO: Test hierarchy conflicts like caching both `a/a.jar` and `a/a.jar/b.jar`
   public class CachingProxyTest : IDisposable
   {
     private readonly ITestOutputHelper myOutput;
@@ -74,6 +75,9 @@ namespace JetBrains.CachingProxy.Tests
           Assert.Equal(11541, bytes.Length);
           Assert.Equal("eca06bb19a4f55673f8f40d0a20eb0ee0342403ee5856b890d6c612e5facb027", SHA256(bytes));
         });
+
+      Assert.Equal(11541, new FileInfo(
+        Path.Combine(myTempDirectory, "repo1.maven.org/maven2/org/apache/ant/ant-xz/1.10.5/cache-ant-xz-1.10.5.jar")).Length);
     }
 
     [Fact]
@@ -141,6 +145,32 @@ namespace JetBrains.CachingProxy.Tests
         {
           AssertStatusHeader(message, CachingProxyStatus.ALWAYS_REDIRECT);
           Assert.Equal("https://repo1.maven.org/maven2/org/apache/ant/ant-xz/1.0-SNAPSHOT/ant-xz-1.0-SNAPSHOT.jar",
+            message.Headers.Location.ToString());
+        });
+    }
+
+    [Fact]
+    public async void Always_Redirect_Directory_Index()
+    {
+      await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/",
+        HttpStatusCode.TemporaryRedirect,
+        (message, bytes) =>
+        {
+          AssertStatusHeader(message, CachingProxyStatus.ALWAYS_REDIRECT);
+          Assert.Equal("https://repo1.maven.org/maven2/org/apache/ant/ant-xz/",
+            message.Headers.Location.ToString());
+        });
+    }
+
+    [Fact]
+    public async void Always_Redirect_Directory_Index_No_Trailing_Slash()
+    {
+      await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz",
+        HttpStatusCode.TemporaryRedirect,
+        (message, bytes) =>
+        {
+          AssertStatusHeader(message, CachingProxyStatus.ALWAYS_REDIRECT);
+          Assert.Equal("https://repo1.maven.org/maven2/org/apache/ant/ant-xz",
             message.Headers.Location.ToString());
         });
     }
