@@ -122,7 +122,9 @@ namespace JetBrains.CachingProxy
         return;
       }
 
-      if (myRedirectToRemoteUrlsRegex != null && myRedirectToRemoteUrlsRegex.IsMatch(requestPath))
+      var isRedirectToRemoteUrl = myRedirectToRemoteUrlsRegex != null && myRedirectToRemoteUrlsRegex.IsMatch(requestPath);
+      var emptyFileExtension = Path.GetExtension(requestPath).Length == 0;
+      if (isRedirectToRemoteUrl || emptyFileExtension)
       {
         await SetStatus(context, CachingProxyStatus.ALWAYS_REDIRECT, HttpStatusCode.TemporaryRedirect);
         context.Response.Headers.Add("Location", upstreamUri.ToString());
