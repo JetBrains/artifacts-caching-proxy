@@ -18,7 +18,6 @@ using Xunit.Abstractions;
 namespace JetBrains.CachingProxy.Tests
 {
   // TODO: Test with wrong content-length from remote side
-  // TODO: Test remote 5xx
   // TODO: Negative caching expiration
   public class CachingProxyTest : IDisposable, IClassFixture<CachingProxyFixture>
   {
@@ -248,6 +247,24 @@ namespace JetBrains.CachingProxy.Tests
         {
           AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_HIT);
           AssertCachedStatusHeader(message, HttpStatusCode.NotFound);
+        });
+    }
+
+    [Fact]
+    public async void Remote_InternalError()
+    {
+      await AssertGetResponse("/real/500.jar", HttpStatusCode.NotFound,
+        (message, bytes) =>
+        {
+          AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_MISS);
+          AssertCachedStatusHeader(message, HttpStatusCode.InternalServerError);
+        });
+
+      await AssertGetResponse("/real/500.jar", HttpStatusCode.NotFound,
+        (message, bytes) =>
+        {
+          AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_HIT);
+          AssertCachedStatusHeader(message, HttpStatusCode.InternalServerError);
         });
     }
 

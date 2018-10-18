@@ -1,10 +1,9 @@
 using System;
-using Microsoft.AspNetCore;
+using System.Net;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
-using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace JetBrains.CachingProxy.Tests
@@ -25,6 +24,11 @@ namespace JetBrains.CachingProxy.Tests
         .Configure(app => app
           .UseRouter(router => router
             .MapGet("ok-after-first-retry", (req, res, data) => res.WriteAsync($"Hello, {data.Values["name"]}!"))
+            .MapGet("500.jar", (req, res, data) =>
+            {
+              res.StatusCode = (int) HttpStatusCode.InternalServerError;
+              return res.WriteAsync($"Some Error");
+            })
             .MapGet("a.jar", (req, res, data) => res.WriteAsync($"a.jar"))
             .MapGet("a.jar/b.jar", (req, res, data) => res.WriteAsync($"b.jar"))
           ))
