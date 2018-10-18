@@ -1,6 +1,5 @@
 using System;
 using System.Buffers;
-using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Linq;
@@ -36,7 +35,7 @@ namespace JetBrains.CachingProxy
     private readonly ILogger myLogger;
     private readonly FileExtensionContentTypeProvider myContentTypeProvider;
     private readonly RequestDelegate myNext;
-    private readonly List<PathString> myPathStringPrefixes;
+    private readonly RemoteServers myRemoteServers;
     private readonly StaticFileMiddleware myStaticFileMiddleware;
 
     private readonly CacheFileProvider myCacheFileProvider;
@@ -53,18 +52,11 @@ namespace JetBrains.CachingProxy
       if (localCachePath == null) throw new ArgumentNullException("", "LocalCachePath could not be null");
       if (!Directory.Exists(localCachePath)) throw new ArgumentException("LocalCachePath doesn't exist: " + localCachePath);
 
-      // Order by length here to handle longer prefixes first
-      // This will help to handle overlapping prefixes like:
-      // /aprefix
-      // /aprefix/too
-      var prefixes = config.Value.Prefixes.OrderByDescending(x => x.Length).ToList();
-      myPathStringPrefixes = prefixes.Select(x => new PathString(x)).ToList();
-
-      foreach (var prefix in prefixes)
+      myRemoteServers = new RemoteServers(config.Value.Prefixes.ToList());
+      foreach (var remoteServer in myRemoteServers.Servers)
       {
-        var uri = UriFromRequestPath(prefix);
         // force reconnection (and DNS re-resolve) every two minutes
-        ServicePointManager.FindServicePoint(uri).ConnectionLeaseTimeout = 120000;
+        ServicePointManager.FindServicePoint(remoteServer.RemoteUri).ConnectionLeaseTimeout = 120000;
       }
 
       myContentTypeProvider = new FileExtensionContentTypeProvider();
@@ -92,7 +84,8 @@ namespace JetBrains.CachingProxy
     [SuppressMessage("ReSharper", "UnusedMember.Global")]
     public async Task InvokeAsync(HttpContext context)
     {
-      if (!myPathStringPrefixes.Any(x => context.Request.Path.StartsWithSegments(x)))
+      var remoteServer = myRemoteServers.LookupRemoteServer(context.Request.Path, out var remainingPath);
+      if (remoteServer == null)
       {
         await myNext(context);
         return;
@@ -114,7 +107,7 @@ namespace JetBrains.CachingProxy
         return;
       }
 
-      var upstreamUri = UriFromRequestPath(requestPath);
+      var upstreamUri = new Uri(remoteServer.RemoteUri, remainingPath.ToString().TrimStart('/'));
 
       if (myBlacklistRegex != null && myBlacklistRegex.IsMatch(requestPath))
       {
@@ -271,11 +264,6 @@ namespace JetBrains.CachingProxy
       {
         myLogger.Log(LogLevel.Error, e, "LogSilently: " + e.Message);
       }
-    }
-
-    private Uri UriFromRequestPath(string requestPath)
-    {
-      return new Uri("https://" + requestPath.TrimStart('/'));
     }
 
     private async Task SetStatus(HttpContext context, CachingProxyStatus status, HttpStatusCode? httpCode = null,

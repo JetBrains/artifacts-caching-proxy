@@ -13,20 +13,21 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using Xunit;
 using Xunit.Abstractions;
+// ReSharper disable ParameterOnlyUsedForPreconditionCheck.Local
 
 namespace JetBrains.CachingProxy.Tests
 {
   // TODO: Test with wrong content-length from remote side
   // TODO: Test remote 5xx
   // TODO: Negative caching expiration
-  // TODO: Test hierarchy conflicts like caching both `a/a.jar` and `a/a.jar/b.jar`
-  public class CachingProxyTest : IDisposable
+  public class CachingProxyTest : IDisposable, IClassFixture<CachingProxyFixture>
   {
     private readonly ITestOutputHelper myOutput;
     private readonly TestServer myServer;
     private readonly string myTempDirectory;
+    private RealTestServer myRealTestServer;
 
-    public CachingProxyTest(ITestOutputHelper output)
+    public CachingProxyTest(ITestOutputHelper output, CachingProxyFixture cachingProxyFixture)
     {
       myOutput = output;
       myTempDirectory = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
@@ -40,7 +41,8 @@ namespace JetBrains.CachingProxy.Tests
           "/repo1.maven.org/maven2",
           "/198.51.100.9",
           "/plugins.gradle.org/m2",
-          "/unknown_host.xyz"
+          "/unknown_host.xyz",
+          $"/real={RealTestServer.Url}"
         }
       };
 
@@ -51,6 +53,7 @@ namespace JetBrains.CachingProxy.Tests
         );
 
       myServer = new TestServer(builder);
+      myRealTestServer = cachingProxyFixture.RealTestServer;
     }
 
     [Fact]
@@ -78,6 +81,16 @@ namespace JetBrains.CachingProxy.Tests
 
       Assert.Equal(11541, new FileInfo(
         Path.Combine(myTempDirectory, "repo1.maven.org/maven2/org/apache/ant/ant-xz/1.10.5/cache-ant-xz-1.10.5.jar")).Length);
+    }
+
+    [Fact]
+    public async void Files_In_Hierarchy()
+    {
+      await AssertGetResponse("/real/a.jar", HttpStatusCode.OK, (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.MISS));
+      await AssertGetResponse("/real/a.jar/b.jar", HttpStatusCode.OK, (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.MISS));
+
+      await AssertGetResponse("/real/a.jar", HttpStatusCode.OK, (message, bytes) => AssertNoStatusHeader(message));
+      await AssertGetResponse("/real/a.jar/b.jar", HttpStatusCode.OK, (message, bytes) => AssertNoStatusHeader(message));
     }
 
     [Fact]
