@@ -14,6 +14,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using Microsoft.Net.Http.Headers;
 
 namespace JetBrains.CachingProxy
 {
@@ -23,6 +24,8 @@ namespace JetBrains.CachingProxy
     private const int BUFFER_SIZE = 81920;
 
     private static readonly Regex ourGoodPathChars = new Regex("^[a-zA-Z_\\-0-9./]+$", RegexOptions.Compiled);
+    private static readonly string ourEternalCachingHeader =
+      new CacheControlHeaderValue { Public = true, MaxAge = TimeSpan.FromDays(365) }.ToString();
 
     private readonly Regex myBlacklistRegex;
     private readonly Regex myRedirectToRemoteUrlsRegex;
@@ -63,7 +66,8 @@ namespace JetBrains.CachingProxy
       {
         FileProvider = myCacheFileProvider,
         ServeUnknownFileTypes = true,
-        ContentTypeProvider = myContentTypeProvider
+        ContentTypeProvider = myContentTypeProvider,
+        OnPrepareResponse = ctx => AddEternalCachingControl(ctx.Context)
       };
 
       myStaticFileMiddleware =
@@ -205,6 +209,10 @@ namespace JetBrains.CachingProxy
 
         await SetStatus(context, CachingProxyStatus.MISS, HttpStatusCode.OK);
 
+        // Cache successful responses indefinitely
+        // as we assume content won't be changed under a fixed url
+        AddEternalCachingControl(context);
+
         var tempFile = cachePath + ".tmp." + Guid.NewGuid();
         try
         {
@@ -279,6 +287,16 @@ namespace JetBrains.CachingProxy
     {
       context.Response.Headers[CachingProxyConstants.CachedStatusHeader] = ((int) entry.StatusCode).ToString();
       context.Response.Headers[CachingProxyConstants.CachedUntilHeader] = entry.CacheUntil.ToString("R");
+
+      // Cache successful responses indefinitely
+      // as we assume content won't be changed under a fixed url
+      if (entry.StatusCode.IsSuccessStatusCode())
+        AddEternalCachingControl(context);
+    }
+
+    private void AddEternalCachingControl(HttpContext context)
+    {
+      context.Response.Headers[HeaderNames.CacheControl] = ourEternalCachingHeader;
     }
 
     private static async Task CopyToTwoStreamsAsync(Stream source, Stream dest1, Stream dest2,

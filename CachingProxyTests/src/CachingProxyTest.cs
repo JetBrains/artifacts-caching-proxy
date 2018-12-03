@@ -71,6 +71,8 @@ namespace JetBrains.CachingProxy.Tests
           Assert.Equal(11541, GetContentLength(message));
           Assert.Equal(11541, bytes.Length);
           Assert.Equal("eca06bb19a4f55673f8f40d0a20eb0ee0342403ee5856b890d6c612e5facb027", SHA256(bytes));
+
+          Assert.Equal("public, max-age=31536000", message.Headers.CacheControl.ToString());
         });
 
       await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/1.10.5/ant-xz-1.10.5.jar", HttpStatusCode.OK,
@@ -81,6 +83,8 @@ namespace JetBrains.CachingProxy.Tests
           Assert.Equal("application/java-archive", message.Content.Headers.ContentType.ToString());
           Assert.Equal(11541, bytes.Length);
           Assert.Equal("eca06bb19a4f55673f8f40d0a20eb0ee0342403ee5856b890d6c612e5facb027", SHA256(bytes));
+
+          Assert.Equal("public, max-age=31536000", message.Headers.CacheControl.ToString());
         });
 
       Assert.Equal(11541, new FileInfo(
@@ -252,6 +256,7 @@ namespace JetBrains.CachingProxy.Tests
         {
           AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_MISS);
           AssertCachedStatusHeader(message, HttpStatusCode.NotFound);
+          Assert.Null(message.Headers.CacheControl);
         });
 
       await AssertGetResponse("/repo1.maven.org/maven2/not_found.txt", HttpStatusCode.NotFound,
@@ -259,6 +264,7 @@ namespace JetBrains.CachingProxy.Tests
         {
           AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_HIT);
           AssertCachedStatusHeader(message, HttpStatusCode.NotFound);
+          Assert.Null(message.Headers.CacheControl);
         });
     }
 
@@ -284,6 +290,7 @@ namespace JetBrains.CachingProxy.Tests
         {
           AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_MISS);
           AssertCachedStatusHeader(message, HttpStatusCode.InternalServerError);
+          Assert.Null(message.Headers.CacheControl);
         });
 
       await AssertGetResponse("/real/500.jar", HttpStatusCode.NotFound,
@@ -291,6 +298,7 @@ namespace JetBrains.CachingProxy.Tests
         {
           AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_HIT);
           AssertCachedStatusHeader(message, HttpStatusCode.InternalServerError);
+          Assert.Null(message.Headers.CacheControl);
         });
     }
 
