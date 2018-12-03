@@ -34,8 +34,8 @@ namespace JetBrains.CachingProxy
     /// </summary>
     private static string ManglePath(string subpath)
     {
-      var trimmed = subpath.TrimEnd(Path.DirectorySeparatorChar);
-      var lastSeparator = trimmed.LastIndexOf(Path.DirectorySeparatorChar);
+      var trimmed = subpath.Replace('\\', '/').TrimEnd('/');
+      var lastSeparator = trimmed.LastIndexOf('/');
       return lastSeparator < 0
         ? $"cache-{trimmed}"
         : $"{trimmed.Substring(0, lastSeparator + 1)}cache-{trimmed.Substring(lastSeparator + 1)}";
