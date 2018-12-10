@@ -78,7 +78,7 @@ namespace JetBrains.CachingProxy.Tests
       await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/1.10.5/ant-xz-1.10.5.jar", HttpStatusCode.OK,
         (message, bytes) =>
         {
-          AssertNoStatusHeader(message);
+          AssertStatusHeader(message, CachingProxyStatus.HIT);
           Assert.Equal(11541, GetContentLength(message));
           Assert.Equal("application/java-archive", message.Content.Headers.ContentType.ToString());
           Assert.Equal(11541, bytes.Length);
@@ -97,8 +97,8 @@ namespace JetBrains.CachingProxy.Tests
       await AssertGetResponse("/real/a.jar", HttpStatusCode.OK, (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.MISS));
       await AssertGetResponse("/real/a.jar/b.jar", HttpStatusCode.OK, (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.MISS));
 
-      await AssertGetResponse("/real/a.jar", HttpStatusCode.OK, (message, bytes) => AssertNoStatusHeader(message));
-      await AssertGetResponse("/real/a.jar/b.jar", HttpStatusCode.OK, (message, bytes) => AssertNoStatusHeader(message));
+      await AssertGetResponse("/real/a.jar", HttpStatusCode.OK, (message, bytes) =>           AssertStatusHeader(message, CachingProxyStatus.HIT));
+      await AssertGetResponse("/real/a.jar/b.jar", HttpStatusCode.OK, (message, bytes) =>           AssertStatusHeader(message, CachingProxyStatus.HIT));
     }
 
     [Fact]
@@ -141,7 +141,7 @@ namespace JetBrains.CachingProxy.Tests
       await AssertGetResponse(url, HttpStatusCode.OK,
         (message, bytes) =>
         {
-          AssertNoStatusHeader(message);
+          AssertStatusHeader(message, CachingProxyStatus.HIT);
           Assert.Equal(40, GetContentLength(message));
           Assert.Equal("49a1b31825c921fd25dd374f314245060eb6cae0", Encoding.UTF8.GetString(bytes));
         });
@@ -161,7 +161,7 @@ namespace JetBrains.CachingProxy.Tests
       AssertStatusHeader(result[1], CachingProxyStatus.MISS);
 
       await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/1.10.5/ant-xz-1.10.5.jar", HttpStatusCode.OK,
-        (message, bytes) => { AssertNoStatusHeader(message); });
+        (message, bytes) => { AssertStatusHeader(message, CachingProxyStatus.HIT); });
     }
 
     [Fact]

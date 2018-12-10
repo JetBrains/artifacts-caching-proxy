@@ -67,7 +67,11 @@ namespace JetBrains.CachingProxy
         FileProvider = myCacheFileProvider,
         ServeUnknownFileTypes = true,
         ContentTypeProvider = myContentTypeProvider,
-        OnPrepareResponse = ctx => AddEternalCachingControl(ctx.Context)
+        OnPrepareResponse = ctx =>
+        {
+          SetStatusHeader(ctx.Context, CachingProxyStatus.HIT);
+          AddEternalCachingControl(ctx.Context);
+        }
       };
 
       myStaticFileMiddleware =
@@ -286,13 +290,18 @@ namespace JetBrains.CachingProxy
     private async Task SetStatus(HttpContext context, CachingProxyStatus status, HttpStatusCode? httpCode = null,
       string responseString = null)
     {
-      context.Response.Headers[CachingProxyConstants.StatusHeader] = status.ToString();
+      SetStatusHeader(context, status);
 
       if (httpCode != null)
         context.Response.StatusCode = (int) httpCode;
 
       if (responseString != null)
         await context.Response.WriteAsync(responseString);
+    }
+
+    private void SetStatusHeader(HttpContext context, CachingProxyStatus status)
+    {
+      context.Response.Headers[CachingProxyConstants.StatusHeader] = status.ToString();
     }
 
     private void SetCachedResponseHeader(HttpContext context, ResponseCache.Entry entry)
