@@ -248,6 +248,18 @@ namespace JetBrains.CachingProxy
             else throw;
           }
         }
+        catch (OperationCanceledException)
+        {
+          // Probable cause: OperationCanceledException from http client myHttpClient
+          // Probable cause: OperationCanceledException from this service's client (context.RequestAborted)
+
+          // ref: https://github.com/aspnet/StaticFiles/commit/bbf1478821c11ecdcad776dad085d6ee09d8f8ee#diff-991aec26255237cd6dbfa787d0995a2aR85
+          // ref: https://github.com/aspnet/StaticFiles/issues/150
+
+          // Don't throw this exception, it's most likely caused by the client disconnecting.
+          // However, if it was cancelled for any other reason we need to prevent empty responses.
+          context.Abort();
+        }
         finally
         {
           CatchSilently(() =>
