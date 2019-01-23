@@ -102,6 +102,12 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
+    public async void File_Name_With_Spaces()
+    {
+      await AssertGetResponse("/real/name with spaces.jar", HttpStatusCode.OK, (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.MISS));
+    }
+
+    [Fact]
     public async void Retry_After_500()
     {
       myRealTestServer.Conditional500SendErrorOnce = true;

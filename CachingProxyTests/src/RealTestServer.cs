@@ -45,6 +45,7 @@ namespace JetBrains.CachingProxy.Tests
               return res.WriteAsync($"not too much");
             })
             .MapGet("a.jar", (req, res, data) => res.WriteAsync($"a.jar"))
+            .MapGet("name with spaces.jar", (req, res, data) => res.WriteAsync($"zzz.jar"))
             .MapGet("a.jar/b.jar", (req, res, data) => res.WriteAsync($"b.jar"))
           ))
         .Start();
