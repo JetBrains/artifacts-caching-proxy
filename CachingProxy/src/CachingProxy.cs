@@ -77,11 +77,11 @@ namespace JetBrains.CachingProxy
       myStaticFileMiddleware =
         new StaticFileMiddleware(next, hostingEnv, Options.Create(staticFileOptions), loggerFactory);
 
-      myBlacklistRegex = config.Value.BlacklistUrlRegex != null
+      myBlacklistRegex = !string.IsNullOrWhiteSpace(config.Value.BlacklistUrlRegex)
         ? new Regex(config.Value.BlacklistUrlRegex, RegexOptions.Compiled)
         : null;
 
-      myRedirectToRemoteUrlsRegex = config.Value.RedirectToRemoteUrlsRegex != null
+      myRedirectToRemoteUrlsRegex = !string.IsNullOrWhiteSpace(config.Value.RedirectToRemoteUrlsRegex)
         ? new Regex(config.Value.RedirectToRemoteUrlsRegex, RegexOptions.Compiled)
         : null;
     }

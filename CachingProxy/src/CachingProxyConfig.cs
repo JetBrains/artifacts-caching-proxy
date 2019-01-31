@@ -6,8 +6,8 @@ namespace JetBrains.CachingProxy
   {
     public string[] Prefixes { get; set; } = new string[0];
     public string LocalCachePath { get; set; } = Path.Combine(Path.GetTempPath(), "artifacts-caching-proxy");
-    public string BlacklistUrlRegex { get; set; } = "^.*maven-metadata\\.xml$";
-    public string RedirectToRemoteUrlsRegex { get; set; } = "^.*-SNAPSHOT.*$";
+    public string BlacklistUrlRegex { get; set; } = null;
+    public string RedirectToRemoteUrlsRegex { get; set; } = "^(.*-SNAPSHOT.*|.*maven-metadata\\.xml)$";
 
     public override string ToString()
     {

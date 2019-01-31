@@ -210,10 +210,16 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
-    public async void Always_Blacklist_MavenMetadataXml()
+    public async void Always_Redirect_MavenMetadataXml()
     {
-      await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/maven-metadata.xml", HttpStatusCode.NotFound,
-        (message, bytes) => { AssertStatusHeader(message, CachingProxyStatus.BLACKLISTED); });
+      await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/maven-metadata.xml",
+        HttpStatusCode.TemporaryRedirect,
+        (message, bytes) =>
+        {
+          AssertStatusHeader(message, CachingProxyStatus.ALWAYS_REDIRECT);
+          Assert.Equal("https://repo1.maven.org/maven2/org/apache/ant/ant-xz/maven-metadata.xml",
+            message.Headers.Location.ToString());
+        });
     }
 
     [Fact]
