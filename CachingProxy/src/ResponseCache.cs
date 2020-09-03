@@ -22,9 +22,11 @@ namespace JetBrains.CachingProxy
     }
 
     [NotNull]
-    public Entry PutStatusCode(string cacheKey, HttpStatusCode statusCode)
+    public Entry PutStatusCode(string cacheKey, HttpStatusCode statusCode, DateTimeOffset? lastModified, string contentType, long? contentLength)
     {
-      Entry entry = new Entry(statusCode, DateTime.UtcNow + GetCacheTimeSpan(statusCode));
+      var entry = new Entry(
+        statusCode, DateTime.UtcNow + GetCacheTimeSpan(statusCode),
+        lastModified: lastModified, contentType: contentType, contentLength: contentLength);
       myCache[cacheKey] = entry;
       return entry;
     }
@@ -48,14 +50,20 @@ namespace JetBrains.CachingProxy
 
     public class Entry
     {
-      internal Entry(HttpStatusCode statusCode, DateTime cacheUntil)
+      internal Entry(HttpStatusCode statusCode, DateTime cacheUntil, DateTimeOffset? lastModified, string contentType, long? contentLength)
       {
         CacheUntil = cacheUntil;
+        LastModified = lastModified;
+        ContentType = contentType;
+        ContentLength = contentLength;
         StatusCode = statusCode;
       }
 
       public readonly DateTime CacheUntil;
       public readonly HttpStatusCode StatusCode;
+      public readonly DateTimeOffset? LastModified;
+      public readonly string ContentType;
+      public readonly long? ContentLength;
     }
   }
 }

@@ -10,7 +10,7 @@ namespace JetBrains.CachingProxy
   {
     private readonly List<RemoteServer> myServers = new List<RemoteServer>();
 
-    public RemoteServers(List<string> prefixes)
+    public RemoteServers(IEnumerable<string> prefixes)
     {
       // Order by length here to handle longer prefixes first
       // This will help to handle overlapping prefixes like:

@@ -71,7 +71,7 @@ namespace JetBrains.CachingProxy.Tests
           Assert.Equal(11541, GetContentLength(message));
           Assert.Equal(11541, bytes.Length);
           Assert.Equal("eca06bb19a4f55673f8f40d0a20eb0ee0342403ee5856b890d6c612e5facb027", SHA256(bytes));
-
+          Assert.Equal("Tue, 10 Jul 2018 04:58:42 GMT", message.Content.Headers.GetValues("Last-Modified").Single());
           Assert.Equal("public, max-age=31536000", message.Headers.CacheControl.ToString());
         });
 
@@ -83,12 +83,29 @@ namespace JetBrains.CachingProxy.Tests
           Assert.Equal("application/java-archive", message.Content.Headers.ContentType.ToString());
           Assert.Equal(11541, bytes.Length);
           Assert.Equal("eca06bb19a4f55673f8f40d0a20eb0ee0342403ee5856b890d6c612e5facb027", SHA256(bytes));
-
+          Assert.Equal("Tue, 10 Jul 2018 04:58:42 GMT", message.Content.Headers.GetValues("Last-Modified").Single());
           Assert.Equal("public, max-age=31536000", message.Headers.CacheControl.ToString());
         });
 
       Assert.Equal(11541, new FileInfo(
         Path.Combine(myTempDirectory, "repo1.maven.org/maven2/org/apache/ant/ant-xz/1.10.5/cache-ant-xz-1.10.5.jar")).Length);
+    }
+
+    [Fact]
+    public async void Get_Followed_By_Head()
+    {
+      await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/1.10.5/ant-xz-1.10.5.jar", HttpStatusCode.OK,
+        (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.MISS));
+
+      await AssertHeadResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/1.10.5/ant-xz-1.10.5.jar", HttpStatusCode.OK,
+        message =>
+        {
+          AssertStatusHeader(message, CachingProxyStatus.HIT);
+          Assert.Equal(11541, GetContentLength(message));
+          Assert.Equal("application/java-archive", message.Content.Headers.ContentType.ToString());
+          Assert.Equal("Tue, 10 Jul 2018 04:58:42 GMT", message.Content.Headers.GetValues("Last-Modified").Single());
+          Assert.Equal("public, max-age=31536000", message.Headers.CacheControl.ToString());
+        });
     }
 
     [Fact]
@@ -118,9 +135,25 @@ namespace JetBrains.CachingProxy.Tests
     public async void Head_With_Existing_File()
     {
       await AssertHeadResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/1.10.5/ant-xz-1.10.5.jar", HttpStatusCode.OK,
-        message => AssertStatusHeader(message, CachingProxyStatus.MISS));
+        message =>
+        {
+          AssertStatusHeader(message, CachingProxyStatus.MISS);
+
+          Assert.Equal("application/java-archive", message.Content.Headers.ContentType.ToString());
+          Assert.Equal(11541, GetContentLength(message));
+          Assert.Equal("Tue, 10 Jul 2018 04:58:42 GMT", message.Content.Headers.GetValues("Last-Modified").Single());
+          Assert.Equal("public, max-age=31536000", message.Headers.CacheControl.ToString());
+        });
       await AssertHeadResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/1.10.5/ant-xz-1.10.5.jar", HttpStatusCode.OK,
-        message => AssertStatusHeader(message, CachingProxyStatus.HIT));
+        message =>
+        {
+          AssertStatusHeader(message, CachingProxyStatus.HIT);
+
+          Assert.Equal("application/java-archive", message.Content.Headers.ContentType.ToString());
+          Assert.Equal(11541, GetContentLength(message));
+          Assert.Equal("Tue, 10 Jul 2018 04:58:42 GMT", message.Content.Headers.GetValues("Last-Modified").Single());
+          Assert.Equal("public, max-age=31536000", message.Headers.CacheControl.ToString());
+        });
     }
 
     [Fact]
@@ -135,28 +168,28 @@ namespace JetBrains.CachingProxy.Tests
     [Fact]
     public async void Caching_Works_Unknown_ContentLength()
     {
-      var url = "/plugins.gradle.org/m2/de/undercouch/gradle-download-task/3.4.2/gradle-download-task-3.4.2.pom.sha1";
+      const string url = "/real/a.jar";
       await AssertGetResponse(url, HttpStatusCode.OK,
         (message, bytes) =>
         {
           AssertStatusHeader(message, CachingProxyStatus.MISS);
           Assert.Null(GetContentLength(message));
-          Assert.Equal("49a1b31825c921fd25dd374f314245060eb6cae0", Encoding.UTF8.GetString(bytes));
+          Assert.Equal("a.jar", Encoding.UTF8.GetString(bytes));
         });
 
       await AssertGetResponse(url, HttpStatusCode.OK,
         (message, bytes) =>
         {
           AssertStatusHeader(message, CachingProxyStatus.HIT);
-          Assert.Equal(40, GetContentLength(message));
-          Assert.Equal("49a1b31825c921fd25dd374f314245060eb6cae0", Encoding.UTF8.GetString(bytes));
+          Assert.Equal(5, GetContentLength(message));
+          Assert.Equal("a.jar", Encoding.UTF8.GetString(bytes));
         });
     }
 
     [Fact]
     public async void Parallel_Requests()
     {
-      var url = "/repo1.maven.org/maven2/org/apache/ant/ant-xz/1.10.5/ant-xz-1.10.5.jar";
+      const string url = "/repo1.maven.org/maven2/org/apache/ant/ant-xz/1.10.5/ant-xz-1.10.5.jar";
 
       var response1 = myServer.CreateClient().GetAsync(url);
       var response2 = myServer.CreateClient().GetAsync(url);
@@ -231,14 +264,14 @@ namespace JetBrains.CachingProxy.Tests
         (message, bytes) =>
         {
           AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_MISS);
-          AssertCachedStatusHeader(message, HttpStatusCode.GatewayTimeout);
+          AssertCachedStatusHeader(message, HttpStatusCode.ServiceUnavailable);
         });
 
       await AssertGetResponse("/198.51.100.9/a.txt", HttpStatusCode.NotFound,
         (message, bytes) =>
         {
           AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_HIT);
-          AssertCachedStatusHeader(message, HttpStatusCode.GatewayTimeout);
+          AssertCachedStatusHeader(message, HttpStatusCode.ServiceUnavailable);
         });
     }
 
@@ -325,52 +358,48 @@ namespace JetBrains.CachingProxy.Tests
       Action<HttpResponseMessage, byte[]> assertions)
     {
       myOutput.WriteLine("*** GET " + url);
-      using (var response = await myServer.CreateClient().GetAsync(url))
-      {
-        var bytes = await response.Content.ReadAsByteArrayAsync();
+      using var response = await myServer.CreateClient().GetAsync(url);
+      var bytes = await response.Content.ReadAsByteArrayAsync();
 
-        myOutput.WriteLine(response.ToString());
-        if (bytes.All(c => c < 128) && bytes.Length < 200)
-          myOutput.WriteLine("Body: " + Encoding.UTF8.GetString(bytes));
+      myOutput.WriteLine(response.ToString());
+      if (bytes.All(c => c < 128) && bytes.Length < 200)
+        myOutput.WriteLine("Body: " + Encoding.UTF8.GetString(bytes));
 
-        Assert.Equal(expectedCode, response.StatusCode);
-        assertions(response, bytes);
-      }
+      Assert.Equal(expectedCode, response.StatusCode);
+      assertions(response, bytes);
     }
 
     private async Task AssertHeadResponse(string url, HttpStatusCode expectedCode,
       Action<HttpResponseMessage> assertions)
     {
       myOutput.WriteLine("*** HEAD " + url);
-      using (var response = await myServer.CreateClient().SendAsync(
-        new HttpRequestMessage(HttpMethod.Head, url), HttpCompletionOption.ResponseContentRead))
-      {
-        myOutput.WriteLine(response.ToString());
-        Assert.Equal(expectedCode, response.StatusCode);
-        assertions(response);
-      }
+      using var response = await myServer.CreateClient().SendAsync(
+        new HttpRequestMessage(HttpMethod.Head, url), HttpCompletionOption.ResponseContentRead);
+      myOutput.WriteLine(response.ToString());
+      Assert.Equal(expectedCode, response.StatusCode);
+      assertions(response);
     }
 
-    private long? GetContentLength(HttpResponseMessage response)
+    private static long? GetContentLength(HttpResponseMessage response)
     {
       var values = response.Content.Headers.FirstOrDefault(x => x.Key == "Content-Length").Value;
       if (values == null) return null;
-      return long.Parse(values.FirstOrDefault());
+      return long.Parse(values.First());
     }
 
-    private void AssertStatusHeader(HttpResponseMessage response, CachingProxyStatus status)
+    private static void AssertStatusHeader(HttpResponseMessage response, CachingProxyStatus status)
     {
       var statusHeader = response.Headers.GetValues(CachingProxyConstants.StatusHeader).FirstOrDefault();
-      Assert.Equal(statusHeader, status.ToString());
+      Assert.Equal(status.ToString(), statusHeader);
     }
 
-    private void AssertCachedStatusHeader(HttpResponseMessage response, HttpStatusCode status)
+    private static void AssertCachedStatusHeader(HttpResponseMessage response, HttpStatusCode status)
     {
       var statusHeader = response.Headers.GetValues(CachingProxyConstants.CachedStatusHeader).FirstOrDefault();
-      Assert.Equal(statusHeader, ((int) status).ToString());
+      Assert.Equal(((int) status).ToString(), statusHeader);
     }
 
-    private void AssertNoStatusHeader(HttpResponseMessage response)
+    private static void AssertNoStatusHeader(HttpResponseMessage response)
     {
       if (response.Headers.TryGetValues(CachingProxyConstants.StatusHeader, out var headers))
       {
@@ -378,9 +407,10 @@ namespace JetBrains.CachingProxy.Tests
       }
     }
 
+    // ReSharper disable once InconsistentNaming
     private static string SHA256(byte[] input)
     {
-      var hash = (new SHA256Managed()).ComputeHash(input);
+      var hash = new SHA256Managed().ComputeHash(input);
       return string.Join("", hash.Select(b => b.ToString("x2")).ToArray());
     }
 

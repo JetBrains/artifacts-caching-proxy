@@ -9,7 +9,6 @@ namespace JetBrains.CachingProxy
     BLACKLISTED,
     ALWAYS_REDIRECT,
 
-    BAD_REQUEST,
-    ERROR,
+    BAD_REQUEST
   }
 }

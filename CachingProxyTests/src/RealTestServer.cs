@@ -10,7 +10,7 @@ namespace JetBrains.CachingProxy.Tests
 {
   public class RealTestServer : IDisposable
   {
-    private static readonly int Port = 4455;
+    private const int Port = 4455;
     public static readonly string Url = $"http://127.0.0.1:{Port}";
 
     private readonly IWebHost myWebHost;
@@ -30,7 +30,7 @@ namespace JetBrains.CachingProxy.Tests
               {
                 Conditional500SendErrorOnce = false;
                 res.StatusCode = (int) HttpStatusCode.InternalServerError;
-                return res.WriteAsync($"Some Error");
+                return res.WriteAsync("Some Error");
               }
 
               return res.WriteAsync("ok");
@@ -38,15 +38,15 @@ namespace JetBrains.CachingProxy.Tests
             .MapGet("500.jar", (req, res, data) =>
             {
               res.StatusCode = (int) HttpStatusCode.InternalServerError;
-              return res.WriteAsync($"Some Error");
+              return res.WriteAsync("Some Error");
             }).MapGet("wrong-content-length.jar", (req, res, data) =>
             {
               res.ContentLength = 1024;
-              return res.WriteAsync($"not too much");
+              return res.WriteAsync("not too much");
             })
-            .MapGet("a.jar", (req, res, data) => res.WriteAsync($"a.jar"))
-            .MapGet("name with spaces.jar", (req, res, data) => res.WriteAsync($"zzz.jar"))
-            .MapGet("a.jar/b.jar", (req, res, data) => res.WriteAsync($"b.jar"))
+            .MapGet("a.jar", (req, res, data) => res.WriteAsync("a.jar"))
+            .MapGet("name with spaces.jar", (req, res, data) => res.WriteAsync("zzz.jar"))
+            .MapGet("a.jar/b.jar", (req, res, data) => res.WriteAsync("b.jar"))
           ))
         .Start();
     }

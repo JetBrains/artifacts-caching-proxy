@@ -11,6 +11,7 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -39,7 +40,7 @@ namespace JetBrains.CachingProxy
 
     private readonly CacheFileProvider myCacheFileProvider;
 
-    public CachingProxy(RequestDelegate next, IHostingEnvironment hostingEnv,
+    public CachingProxy(RequestDelegate next, IWebHostEnvironment hostingEnv,
       ILoggerFactory loggerFactory, IOptions<CachingProxyConfig> config, ProxyHttpClient httpClient)
     {
       myLogger = loggerFactory.CreateLogger(GetType().FullName);
@@ -66,6 +67,7 @@ namespace JetBrains.CachingProxy
       {
         FileProvider = myCacheFileProvider,
         ServeUnknownFileTypes = true,
+        HttpsCompression = HttpsCompressionMode.DoNotCompress,
         ContentTypeProvider = myContentTypeProvider,
         OnPrepareResponse = ctx =>
         {
@@ -148,6 +150,12 @@ namespace JetBrains.CachingProxy
       // We handle positive caching for HEAD here
       if (cachedResponse != null && cachedResponse.StatusCode.IsSuccessStatusCode() && isHead)
       {
+        var responseHeaders = context.Response.GetTypedHeaders();
+
+        responseHeaders.LastModified = cachedResponse.LastModified;
+        responseHeaders.ContentLength = cachedResponse.ContentLength;
+        context.Response.Headers[HeaderNames.ContentType] = cachedResponse.ContentType;
+
         SetCachedResponseHeader(context, cachedResponse);
         await SetStatus(context, CachingProxyStatus.HIT, HttpStatusCode.OK);
         return;
@@ -170,7 +178,7 @@ namespace JetBrains.CachingProxy
 
         myLogger.LogWarning($"Timeout requesting {upstreamUri}");
 
-        var entry = myResponseCache.PutStatusCode(requestPath, HttpStatusCode.GatewayTimeout);
+        var entry = myResponseCache.PutStatusCode(requestPath, HttpStatusCode.GatewayTimeout, lastModified: null, contentType: null, contentLength: null);
 
         SetCachedResponseHeader(context, entry);
         await SetStatus(context, CachingProxyStatus.NEGATIVE_MISS, HttpStatusCode.NotFound);
@@ -180,7 +188,7 @@ namespace JetBrains.CachingProxy
       {
         myLogger.LogWarning(e, $"Exception requesting {upstreamUri}: {e.Message}");
 
-        var entry = myResponseCache.PutStatusCode(requestPath, HttpStatusCode.ServiceUnavailable);
+        var entry = myResponseCache.PutStatusCode(requestPath, HttpStatusCode.ServiceUnavailable, lastModified: null, contentType: null, contentLength: null);
         SetCachedResponseHeader(context, entry);
         await SetStatus(context, CachingProxyStatus.NEGATIVE_MISS, HttpStatusCode.NotFound);
         return;
@@ -190,26 +198,32 @@ namespace JetBrains.CachingProxy
       {
         if (!response.IsSuccessStatusCode)
         {
-          var entry = myResponseCache.PutStatusCode(requestPath, response.StatusCode);
+          var entry = myResponseCache.PutStatusCode(requestPath, response.StatusCode, lastModified: null, contentType: null, contentLength: null);
 
           SetCachedResponseHeader(context, entry);
           await SetStatus(context, CachingProxyStatus.NEGATIVE_MISS, HttpStatusCode.NotFound);
           return;
         }
 
-        if (response.IsSuccessStatusCode && isHead)
+        var contentLength = response.Content.Headers.ContentLength;
+        context.Response.ContentLength = contentLength;
+
+        var contentLastModified = response.Content.Headers.LastModified;
+        if (contentLastModified != null)
+          context.Response.GetTypedHeaders().LastModified = contentLastModified;
+
+        if (myContentTypeProvider.TryGetContentType(requestPath, out var contentType))
+          context.Response.ContentType = contentType;
+
+        if (isHead)
         {
-          var entry = myResponseCache.PutStatusCode(requestPath, response.StatusCode);
+          var entry = myResponseCache.PutStatusCode(
+            requestPath, response.StatusCode,
+            lastModified: contentLastModified, contentType: contentType, contentLength: contentLength);
           SetCachedResponseHeader(context, entry);
           await SetStatus(context, CachingProxyStatus.MISS, HttpStatusCode.OK);
           return;
         }
-
-        var contentLength = response.Content.Headers.ContentLength;
-        context.Response.ContentLength = contentLength;
-
-        if (myContentTypeProvider.TryGetContentType(requestPath, out var contentType))
-          context.Response.ContentType = contentType;
 
         await SetStatus(context, CachingProxyStatus.MISS, HttpStatusCode.OK);
 
@@ -223,11 +237,11 @@ namespace JetBrains.CachingProxy
           var parent = Directory.GetParent(cachePath);
           Directory.CreateDirectory(parent.FullName);
 
-          using (var stream = new FileStream(
+          await using (var stream = new FileStream(
             tempFile, FileMode.CreateNew, FileAccess.Write, FileShare.None, BUFFER_SIZE,
             FileOptions.Asynchronous))
           {
-            using (var sourceStream = await response.Content.ReadAsStreamAsync())
+            await using (var sourceStream = await response.Content.ReadAsStreamAsync())
               await CopyToTwoStreamsAsync(sourceStream, context.Response.Body, stream, context.RequestAborted);
           }
 
@@ -238,6 +252,8 @@ namespace JetBrains.CachingProxy
             context.Abort();
             return;
           }
+
+          if (contentLastModified.HasValue) File.SetLastWriteTimeUtc(tempFile, contentLastModified.Value.UtcDateTime);
 
           try
           {
@@ -287,7 +303,7 @@ namespace JetBrains.CachingProxy
       }
     }
 
-    private async Task SetStatus(HttpContext context, CachingProxyStatus status, HttpStatusCode? httpCode = null,
+    private static async Task SetStatus(HttpContext context, CachingProxyStatus status, HttpStatusCode? httpCode = null,
       string responseString = null)
     {
       SetStatusHeader(context, status);
@@ -299,12 +315,12 @@ namespace JetBrains.CachingProxy
         await context.Response.WriteAsync(responseString);
     }
 
-    private void SetStatusHeader(HttpContext context, CachingProxyStatus status)
+    private static void SetStatusHeader(HttpContext context, CachingProxyStatus status)
     {
       context.Response.Headers[CachingProxyConstants.StatusHeader] = status.ToString();
     }
 
-    private void SetCachedResponseHeader(HttpContext context, ResponseCache.Entry entry)
+    private static void SetCachedResponseHeader(HttpContext context, ResponseCache.Entry entry)
     {
       context.Response.Headers[CachingProxyConstants.CachedStatusHeader] = ((int) entry.StatusCode).ToString();
       context.Response.Headers[CachingProxyConstants.CachedUntilHeader] = entry.CacheUntil.ToString("R");
@@ -315,7 +331,7 @@ namespace JetBrains.CachingProxy
         AddEternalCachingControl(context);
     }
 
-    private void AddEternalCachingControl(HttpContext context)
+    private static void AddEternalCachingControl(HttpContext context)
     {
       context.Response.Headers[HeaderNames.CacheControl] = ourEternalCachingHeader;
     }
@@ -323,12 +339,12 @@ namespace JetBrains.CachingProxy
     private static async Task CopyToTwoStreamsAsync(Stream source, Stream dest1, Stream dest2,
       CancellationToken cancellationToken)
     {
-      byte[] buffer = ArrayPool<byte>.Shared.Rent(BUFFER_SIZE);
+      var buffer = ArrayPool<byte>.Shared.Rent(BUFFER_SIZE);
       try
       {
         while (true)
         {
-          int length = await source.ReadAsync(new Memory<byte>(buffer), cancellationToken).ConfigureAwait(false);
+          var length = await source.ReadAsync(new Memory<byte>(buffer), cancellationToken).ConfigureAwait(false);
           if (length == 0)
             break;
 
