@@ -6,7 +6,7 @@ namespace JetBrains.CachingProxy.Tests
   public class CacheFileProviderTest
   {
     [Fact]
-    public void MangePath1()
+    public void ManglePath1()
     {
       var provider = new CacheFileProvider(Path.GetTempPath());
       Assert.Equal(
@@ -15,7 +15,7 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
-    public void MangePath2()
+    public void ManglePath2()
     {
       var provider = new CacheFileProvider(Path.GetTempPath());
       Assert.Equal(
@@ -24,7 +24,7 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
-    public void MangePath3()
+    public void ManglePath3()
     {
       var provider = new CacheFileProvider(Path.GetTempPath());
       Assert.Equal(
@@ -33,7 +33,7 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
-    public void MangePath4()
+    public void ManglePath4()
     {
       var provider = new CacheFileProvider(Path.GetTempPath());
       var fileInfo = provider.GetFileInfo(Path.Combine("..", ".."));
