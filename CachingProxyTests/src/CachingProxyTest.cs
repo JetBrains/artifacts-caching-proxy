@@ -264,14 +264,18 @@ namespace JetBrains.CachingProxy.Tests
         (message, bytes) =>
         {
           AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_MISS);
-          AssertCachedStatusHeader(message, HttpStatusCode.ServiceUnavailable);
+          var cachedStatus = message.Headers.GetValues(CachingProxyConstants.CachedStatusHeader).First();
+          Assert.True(cachedStatus == "503" || cachedStatus == "504",
+            $"cached status should be 503 or 504: {cachedStatus}");
         });
 
       await AssertGetResponse("/198.51.100.9/a.txt", HttpStatusCode.NotFound,
         (message, bytes) =>
         {
           AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_HIT);
-          AssertCachedStatusHeader(message, HttpStatusCode.ServiceUnavailable);
+          var cachedStatus = message.Headers.GetValues(CachingProxyConstants.CachedStatusHeader).First();
+          Assert.True(cachedStatus == "503" || cachedStatus == "504",
+            $"cached status should be 503 or 504: {cachedStatus}");
         });
     }
 
