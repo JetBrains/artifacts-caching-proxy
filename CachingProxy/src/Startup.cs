@@ -33,9 +33,12 @@ namespace JetBrains.CachingProxy
 
     public static void ConfigureOurServices(IServiceCollection services)
     {
-      services.AddHttpClient<ProxyHttpClient>(client => { client.Timeout = TimeSpan.FromSeconds(5); })
+      services.AddHttpClient<ProxyHttpClient>(client => { client.Timeout = TimeSpan.FromSeconds(20); })
         .AddTransientHttpErrorPolicy(builder => builder.WaitAndRetryAsync(new[]
         {
+          TimeSpan.FromSeconds(1),
+          TimeSpan.FromSeconds(1),
+          TimeSpan.FromSeconds(1),
           TimeSpan.FromSeconds(1)
         }));
     }
