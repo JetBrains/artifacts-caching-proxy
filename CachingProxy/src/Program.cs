@@ -1,5 +1,6 @@
 ﻿using Microsoft.AspNetCore;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.Extensions.Logging;
 
 namespace JetBrains.CachingProxy
 {
@@ -7,7 +8,9 @@ namespace JetBrains.CachingProxy
   {
     public static void Main(string[] args)
     {
-      WebHost.CreateDefaultBuilder<Startup>(args).Build().Run();
+      WebHost.CreateDefaultBuilder<Startup>(args)
+        .ConfigureLogging(logging => logging.AddJsonConsole())
+        .Build().Run();
     }
   }
 }
