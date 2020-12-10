@@ -7,6 +7,7 @@ namespace JetBrains.CachingProxy
     public string[] Prefixes { get; set; } = new string[0];
     public string LocalCachePath { get; set; } = Path.Combine(Path.GetTempPath(), "artifacts-caching-proxy");
     public string BlacklistUrlRegex { get; set; } = null;
+    public long MinimumFreeDiskSpaceMb { get; set; } = 2048;
     public string RedirectToRemoteUrlsRegex { get; set; } = "^(.*-SNAPSHOT.*|.*maven-metadata\\.xml)$";
 
     public override string ToString()
@@ -14,6 +15,7 @@ namespace JetBrains.CachingProxy
       return $"{nameof(Prefixes)}: {string.Join(", ", Prefixes)},\n" +
              $"{nameof(LocalCachePath)}: {LocalCachePath},\n" +
              $"{nameof(BlacklistUrlRegex)}: {BlacklistUrlRegex},\n" +
+             $"{nameof(MinimumFreeDiskSpaceMb)}: {MinimumFreeDiskSpaceMb},\n" +
              $"{nameof(RedirectToRemoteUrlsRegex)}: {RedirectToRemoteUrlsRegex}";
     }
   }

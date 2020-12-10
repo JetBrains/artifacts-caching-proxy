@@ -39,6 +39,8 @@ namespace JetBrains.CachingProxy
     private readonly StaticFileMiddleware myStaticFileMiddleware;
 
     private readonly CacheFileProvider myCacheFileProvider;
+    private readonly string myLocalCachePath;
+    private readonly long myMinimumFreeDiskSpaceMb;
 
     public CachingProxy(RequestDelegate next, IWebHostEnvironment hostingEnv,
       ILoggerFactory loggerFactory, IOptions<CachingProxyConfig> config, ProxyHttpClient httpClient)
@@ -49,9 +51,10 @@ namespace JetBrains.CachingProxy
       myNext = next;
       myHttpClient = httpClient;
 
-      var localCachePath = config.Value.LocalCachePath;
-      if (localCachePath == null) throw new ArgumentNullException("", "LocalCachePath could not be null");
-      if (!Directory.Exists(localCachePath)) throw new ArgumentException("LocalCachePath doesn't exist: " + localCachePath);
+      myMinimumFreeDiskSpaceMb = config.Value.MinimumFreeDiskSpaceMb;
+      myLocalCachePath = config.Value.LocalCachePath;
+      if (myLocalCachePath == null) throw new ArgumentNullException("", "LocalCachePath could not be null");
+      if (!Directory.Exists(myLocalCachePath)) throw new ArgumentException("LocalCachePath doesn't exist: " + myLocalCachePath);
 
       myRemoteServers = new RemoteServers(config.Value.Prefixes.ToList());
       foreach (var remoteServer in myRemoteServers.Servers)
@@ -61,7 +64,7 @@ namespace JetBrains.CachingProxy
       }
 
       myContentTypeProvider = new FileExtensionContentTypeProvider();
-      myCacheFileProvider = new CacheFileProvider(localCachePath);
+      myCacheFileProvider = new CacheFileProvider(myLocalCachePath);
 
       var staticFileOptions = new StaticFileOptions
       {
@@ -91,6 +94,22 @@ namespace JetBrains.CachingProxy
     [SuppressMessage("ReSharper", "UnusedMember.Global")]
     public async Task InvokeAsync(HttpContext context)
     {
+      if (context.Request.Path == "/health")
+      {
+        var availableFreeSpaceMb = new DriveInfo(myLocalCachePath).AvailableFreeSpace / (1024 * 1024);
+        if (availableFreeSpaceMb < myMinimumFreeDiskSpaceMb)
+        {
+          context.Response.StatusCode = 500;
+          await context.Response.WriteAsync($"Not Enough Free Disk Space. {availableFreeSpaceMb} MB is free at {myLocalCachePath}, " +
+                                            $"but minimum is {myMinimumFreeDiskSpaceMb} MB");
+          return;
+        }
+
+        context.Response.StatusCode = 200;
+        await context.Response.WriteAsync("OK");
+        return;
+      }
+
       var remoteServer = myRemoteServers.LookupRemoteServer(context.Request.Path, out var remainingPath);
       if (remoteServer == null)
       {

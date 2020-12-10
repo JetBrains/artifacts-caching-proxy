@@ -43,7 +43,8 @@ namespace JetBrains.CachingProxy.Tests
           "/plugins.gradle.org/m2",
           "/unknown_host.xyz",
           $"/real={RealTestServer.Url}"
-        }
+        },
+        MinimumFreeDiskSpaceMb = 2,
       };
 
       var builder = new WebHostBuilder()
@@ -58,6 +59,16 @@ namespace JetBrains.CachingProxy.Tests
 
       myServer = new TestServer(builder);
       myRealTestServer = cachingProxyFixture.RealTestServer;
+    }
+
+    [Fact]
+    public async void Health_OK()
+    {
+      await AssertGetResponse("/health", HttpStatusCode.OK,
+        (message, bytes) =>
+        {
+          Assert.Equal("OK", Encoding.UTF8.GetString(bytes));
+        });
     }
 
     [Fact]
