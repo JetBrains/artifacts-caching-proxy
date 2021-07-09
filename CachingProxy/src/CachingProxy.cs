@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Net.Mime;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
@@ -56,7 +57,7 @@ namespace JetBrains.CachingProxy
       if (myLocalCachePath == null) throw new ArgumentNullException("", "LocalCachePath could not be null");
       if (!Directory.Exists(myLocalCachePath)) throw new ArgumentException("LocalCachePath doesn't exist: " + myLocalCachePath);
 
-      myRemoteServers = new RemoteServers(config.Value.Prefixes.ToList());
+      myRemoteServers = new RemoteServers(config.Value.Prefixes.ToList(), config.Value.ContentTypeValidationPrefixes.ToList());
       foreach (var remoteServer in myRemoteServers.Servers)
       {
         // force reconnection (and DNS re-resolve) every two minutes
@@ -142,7 +143,8 @@ namespace JetBrains.CachingProxy
       }
 
       var isRedirectToRemoteUrl = myRedirectToRemoteUrlsRegex != null && myRedirectToRemoteUrlsRegex.IsMatch(requestPath);
-      var emptyFileExtension = Path.GetExtension(requestPath).Length == 0;
+      var requestPathExtension = Path.GetExtension(requestPath);
+      var emptyFileExtension = requestPathExtension.Length == 0;
       if (isRedirectToRemoteUrl || emptyFileExtension)
       {
         await SetStatus(context, CachingProxyStatus.ALWAYS_REDIRECT, HttpStatusCode.TemporaryRedirect);
@@ -224,6 +226,26 @@ namespace JetBrains.CachingProxy
           return;
         }
 
+        if (remoteServer.ValidateContentTypes)
+        {
+          // If content type validation is enabled, only .html, .htm and .txt files may have text/* content type
+          // This prevents e.g. caching of error pages with 200 OK code (jcenter)
+          var responseContentType = response.Content.Headers.ContentType?.MediaType;
+          if (requestPathExtension != ".html" &&
+              requestPathExtension != ".txt" &&
+              requestPathExtension != ".htm")
+          {
+            if (responseContentType is MediaTypeNames.Text.Html or MediaTypeNames.Text.Plain)
+            {
+              // return 503 Service Unavailable, since the client will most likely retry it with 5xx error codes
+              context.Response.StatusCode = (int) HttpStatusCode.ServiceUnavailable;
+              context.Response.ContentType = MediaTypeNames.Text.Plain;
+              await context.Response.WriteAsync($"{upstreamUri} returned content type '{responseContentType}' which is forbidden by content type validation for file extension '{requestPathExtension}'");
+              return;
+            }
+          }
+        }
+
         var contentLength = response.Content.Headers.ContentLength;
         context.Response.ContentLength = contentLength;
 
@@ -254,7 +276,7 @@ namespace JetBrains.CachingProxy
         try
         {
           var parent = Directory.GetParent(cachePath);
-          Directory.CreateDirectory(parent.FullName);
+          Directory.CreateDirectory(parent!.FullName);
 
           await using (var stream = new FileStream(
             tempFile, FileMode.CreateNew, FileAccess.Write, FileShare.None, BUFFER_SIZE,

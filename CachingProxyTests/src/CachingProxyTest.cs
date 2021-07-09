@@ -44,6 +44,10 @@ namespace JetBrains.CachingProxy.Tests
           "/unknown_host.xyz",
           $"/real={RealTestServer.Url}"
         },
+        ContentTypeValidationPrefixes = new[]
+        {
+          "/real"
+        },
         MinimumFreeDiskSpaceMb = 2,
       };
 
@@ -127,6 +131,12 @@ namespace JetBrains.CachingProxy.Tests
 
       await AssertGetResponse("/real/a.jar", HttpStatusCode.OK, (message, bytes) =>           AssertStatusHeader(message, CachingProxyStatus.HIT));
       await AssertGetResponse("/real/a.jar/b.jar", HttpStatusCode.OK, (message, bytes) =>           AssertStatusHeader(message, CachingProxyStatus.HIT));
+    }
+
+    [Fact]
+    public async void Remote_CacheHtmlFile()
+    {
+      await AssertGetResponse("/real/a.html", HttpStatusCode.OK, (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.MISS));
     }
 
     [Fact]
@@ -359,6 +369,17 @@ namespace JetBrains.CachingProxy.Tests
           AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_HIT);
           AssertCachedStatusHeader(message, HttpStatusCode.InternalServerError);
           Assert.Null(message.Headers.CacheControl);
+        });
+    }
+
+    [Fact]
+    public async void Remote_WrongContentType()
+    {
+      await AssertGetResponse("/real/wrong-content-type.jar", HttpStatusCode.ServiceUnavailable,
+        (message, bytes) =>
+        {
+          var text = Encoding.UTF8.GetString(bytes);
+          Assert.Equal($"{RealTestServer.Url}/wrong-content-type.jar returned content type 'text/html' which is forbidden by content type validation for file extension '.jar'", text);
         });
     }
 

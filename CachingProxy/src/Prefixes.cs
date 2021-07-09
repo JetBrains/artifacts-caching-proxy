@@ -10,8 +10,10 @@ namespace JetBrains.CachingProxy
   {
     private readonly List<RemoteServer> myServers = new List<RemoteServer>();
 
-    public RemoteServers(IEnumerable<string> prefixes)
+    public RemoteServers(IEnumerable<string> prefixes, ICollection<string> contentTypeValidationPrefixes)
     {
+      var trimmedPrefixes = new HashSet<string>();
+
       // Order by length here to handle longer prefixes first
       // This will help to handle overlapping prefixes like:
       // /aprefix
@@ -22,9 +24,20 @@ namespace JetBrains.CachingProxy
         if (trimmed.Length == 0) throw new ArgumentException("Prefix is empty: " + prefix);
 
         var index = trimmed.IndexOf("=", StringComparison.Ordinal);
+        var trimmedPrefix = index < 0 ? $"/{trimmed}" : $"/{trimmed.Substring(0, index)}";
+        trimmedPrefixes.Add(trimmedPrefix);
+
+        var validateContentType = contentTypeValidationPrefixes.Contains(trimmedPrefix);
         myServers.Add(index < 0
-          ? new RemoteServer(new PathString("/" + trimmed), new Uri("https://" + trimmed + "/"))
-          : new RemoteServer(new PathString("/" + trimmed.Substring(0, index)), new Uri(trimmed.Substring(index + 1).TrimEnd('/'))));
+          ? new RemoteServer(new PathString(trimmedPrefix), new Uri("https://" + trimmed + "/"), validateContentType)
+          : new RemoteServer(new PathString(trimmedPrefix), new Uri(trimmed.Substring(index + 1).TrimEnd('/')), validateContentType));
+      }
+
+      foreach (var contentTypeValidationPrefix in contentTypeValidationPrefixes)
+      {
+        if (!trimmedPrefixes.Contains(contentTypeValidationPrefix))
+          throw new ArgumentException(
+            $"ContentTypeValidation prefix '{contentTypeValidationPrefix}' must be present in Prefixes list");
       }
     }
 
@@ -45,14 +58,16 @@ namespace JetBrains.CachingProxy
 
     public class RemoteServer
     {
-      internal RemoteServer(PathString prefix, Uri remoteUri)
+      internal RemoteServer(PathString prefix, Uri remoteUri, bool validateContentTypes)
       {
         Prefix = prefix;
         RemoteUri = remoteUri;
+        ValidateContentTypes = validateContentTypes;
       }
 
       public PathString Prefix { get; }
       public Uri RemoteUri { get; }
+      public bool ValidateContentTypes { get; }
 
       public override string ToString() => $"{Prefix}={RemoteUri}";
     }

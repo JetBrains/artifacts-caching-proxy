@@ -1,5 +1,6 @@
 using System;
 using System.Net;
+using System.Net.Mime;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
@@ -47,6 +48,16 @@ namespace JetBrains.CachingProxy.Tests
             .MapGet("a.jar", (req, res, data) => res.WriteAsync("a.jar"))
             .MapGet("name with spaces.jar", (req, res, data) => res.WriteAsync("zzz.jar"))
             .MapGet("a.jar/b.jar", (req, res, data) => res.WriteAsync("b.jar"))
+            .MapGet("a.html", (req, res, data) =>
+            {
+              res.ContentType = MediaTypeNames.Text.Html;
+              return res.WriteAsync("some html");
+            })
+            .MapGet("wrong-content-type.jar", (req, res, data) =>
+            {
+              res.ContentType = MediaTypeNames.Text.Html;
+              return res.WriteAsync("some html");
+            })
           ))
         .Start();
     }
