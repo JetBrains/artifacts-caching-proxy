@@ -226,21 +226,24 @@ namespace JetBrains.CachingProxy
           return;
         }
 
-        if (remoteServer.ValidateContentTypes)
+        // If content type validation is enabled, only .html, .htm and .txt files may have text/* content type
+        // This prevents e.g. caching of error pages with 200 OK code (jcenter)
+        var responseContentType = response.Content.Headers.ContentType?.MediaType;
+        if (requestPathExtension != ".html" &&
+            requestPathExtension != ".txt" &&
+            requestPathExtension != ".htm")
         {
-          // If content type validation is enabled, only .html, .htm and .txt files may have text/* content type
-          // This prevents e.g. caching of error pages with 200 OK code (jcenter)
-          var responseContentType = response.Content.Headers.ContentType?.MediaType;
-          if (requestPathExtension != ".html" &&
-              requestPathExtension != ".txt" &&
-              requestPathExtension != ".htm")
+          if (responseContentType is MediaTypeNames.Text.Html or MediaTypeNames.Text.Plain)
           {
-            if (responseContentType is MediaTypeNames.Text.Html or MediaTypeNames.Text.Plain)
+            myLogger.LogWarning($"{upstreamUri} returned content type '{responseContentType}' which is possibly wrong for file extension '{requestPathExtension}'");
+
+            if (remoteServer.ValidateContentTypes)
             {
               // return 503 Service Unavailable, since the client will most likely retry it with 5xx error codes
               context.Response.StatusCode = (int) HttpStatusCode.ServiceUnavailable;
               context.Response.ContentType = MediaTypeNames.Text.Plain;
-              await context.Response.WriteAsync($"{upstreamUri} returned content type '{responseContentType}' which is forbidden by content type validation for file extension '{requestPathExtension}'");
+              await context.Response.WriteAsync(
+                $"{upstreamUri} returned content type '{responseContentType}' which is forbidden by content type validation for file extension '{requestPathExtension}'");
               return;
             }
           }
