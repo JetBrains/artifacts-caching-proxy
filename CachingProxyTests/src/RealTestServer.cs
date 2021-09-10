@@ -47,6 +47,7 @@ namespace JetBrains.CachingProxy.Tests
             })
             .MapGet("a.jar", (req, res, data) => res.WriteAsync("a.jar"))
             .MapGet("name with spaces.jar", (req, res, data) => res.WriteAsync("zzz.jar"))
+            .MapGet("name+with+plus.jar", (req, res, data) => res.WriteAsync("zzz.jar"))
             .MapGet("a.jar/b.jar", (req, res, data) => res.WriteAsync("b.jar"))
             .MapGet("a.html", (req, res, data) =>
             {
