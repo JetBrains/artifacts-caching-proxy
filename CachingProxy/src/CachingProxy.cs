@@ -226,12 +226,14 @@ namespace JetBrains.CachingProxy
           return;
         }
 
-        // If content type validation is enabled, only .html, .htm and .txt files may have text/* content type
+        // If content type validation is enabled, only .html, .htm, .txt, .sha1, .md5 files may have text/* content type
         // This prevents e.g. caching of error pages with 200 OK code (jcenter)
         var responseContentType = response.Content.Headers.ContentType?.MediaType;
         if (requestPathExtension != ".html" &&
             requestPathExtension != ".txt" &&
-            requestPathExtension != ".htm")
+            requestPathExtension != ".htm" &&
+            requestPathExtension != ".sha1" &&
+            requestPathExtension != ".md5")
         {
           if (responseContentType is MediaTypeNames.Text.Html or MediaTypeNames.Text.Plain)
           {
