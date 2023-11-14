@@ -535,7 +535,7 @@ namespace JetBrains.CachingProxy.Tests
     // ReSharper disable once InconsistentNaming
     private static string SHA256(byte[] input)
     {
-      var hash = new SHA256Managed().ComputeHash(input);
+      var hash = System.Security.Cryptography.SHA256.Create().ComputeHash(input);
       return string.Join("", hash.Select(b => b.ToString("x2")).ToArray());
     }
 
