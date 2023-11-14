@@ -1,11 +1,16 @@
 using System;
+using System.IO;
+using System.IO.Compression;
 using System.Net;
 using System.Net.Mime;
+using System.Text;
+using System.Threading.Tasks;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Net.Http.Headers;
 
 namespace JetBrains.CachingProxy.Tests
 {
@@ -46,6 +51,45 @@ namespace JetBrains.CachingProxy.Tests
               return res.WriteAsync("not too much");
             })
             .MapGet("a.jar", (req, res, data) => res.WriteAsync("a.jar"))
+            .MapGet("gzipEncoding.txt", (req, res, data) =>
+            {
+              res.Headers[HeaderNames.ContentEncoding] = "gzip";
+              var textContent = Encoding.UTF8.GetBytes("my content string");
+
+              using var mso = new MemoryStream();
+
+              using (var gs = new GZipStream(mso, CompressionMode.Compress))
+                new MemoryStream(textContent).CopyTo(gs);
+
+              var buffer = mso.ToArray();
+
+              return res.Body.WriteAsync(buffer, 0, buffer.Length);
+            })
+            .MapVerb("HEAD", "gzipEncoding.txt", (req, res, data) =>
+            {
+              res.Headers[HeaderNames.ContentEncoding] = "gzip";
+              var textContent = Encoding.UTF8.GetBytes("my content string");
+
+              using var mso = new MemoryStream();
+
+              using (var gs = new GZipStream(mso, CompressionMode.Compress))
+                new MemoryStream(textContent).CopyTo(gs);
+
+              var buffer = mso.ToArray();
+
+              res.Headers["Content-Length"] = buffer.Length.ToString();
+              return Task.CompletedTask;
+            })
+            .MapGet("fakeBrEncoding.txt", (req, res, data) =>
+            {
+              res.Headers[HeaderNames.ContentEncoding] = "br";
+              return res.WriteAsync("garbage");
+            })
+            .MapGet("fakeMultipleEncodings.txt", (req, res, data) =>
+            {
+              res.Headers[HeaderNames.ContentEncoding] = "deflate, gzip";
+              return res.WriteAsync("garbage");
+            })
             .MapGet("name with spaces.jar", (req, res, data) => res.WriteAsync("zzz.jar"))
             .MapGet("name+with+plus.jar", (req, res, data) => res.WriteAsync("zzz.jar"))
             .MapGet("a.jar/b.jar", (req, res, data) => res.WriteAsync("b.jar"))

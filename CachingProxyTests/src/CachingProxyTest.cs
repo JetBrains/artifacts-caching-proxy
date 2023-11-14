@@ -146,6 +146,89 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
+    public async void Content_Encoding_Is_Preserved()
+    {
+      await AssertGetResponse("/real/gzipEncoding.txt", HttpStatusCode.OK, (message, bytes) =>
+        {
+          AssertStatusHeader(message, CachingProxyStatus.MISS);
+          // 37 - gzipped response length
+          Assert.Equal(37, bytes.Length);
+          Assert.Equal("gzip", message.Content.Headers.ContentEncoding.SingleOrDefault());
+        }
+      );
+
+      await AssertGetResponse("/real/gzipEncoding.txt", HttpStatusCode.OK, (message, bytes) =>
+        {
+          AssertStatusHeader(message, CachingProxyStatus.HIT);
+          Assert.Equal(37, GetContentLength(message));
+          Assert.Equal("gzip", message.Content.Headers.ContentEncoding.SingleOrDefault());
+        }
+      );
+    }
+
+    [Fact]
+    public async void Content_Encoding_Is_Preserved_Head_Request()
+    {
+      await AssertHeadResponse("/real/gzipEncoding.txt", HttpStatusCode.OK, message =>
+        {
+          AssertStatusHeader(message, CachingProxyStatus.MISS);
+          // 37 - gzipped response length
+          Assert.Equal(37, GetContentLength(message));
+          Assert.Equal("gzip", message.Content.Headers.ContentEncoding.SingleOrDefault());
+        }
+      );
+
+      await AssertHeadResponse("/real/gzipEncoding.txt", HttpStatusCode.OK, message =>
+        {
+          AssertStatusHeader(message, CachingProxyStatus.HIT);
+          // 37 - gzipped response length
+          Assert.Equal(37, GetContentLength(message));
+          Assert.Equal("gzip", message.Content.Headers.ContentEncoding.SingleOrDefault());
+        }
+      );
+    }
+
+    [Fact]
+    public async void Content_Encoding_Is_Cached_For_Head_Response()
+    {
+      await AssertGetResponse("/real/gzipEncoding.txt", HttpStatusCode.OK, (message, bytes) =>
+        {
+          AssertStatusHeader(message, CachingProxyStatus.MISS);
+          // 37 - gzipped response length
+          Assert.Equal(37, bytes.Length);
+          Assert.Equal("gzip", message.Content.Headers.ContentEncoding.SingleOrDefault());
+        }
+      );
+
+      await AssertHeadResponse("/real/gzipEncoding.txt", HttpStatusCode.OK, message =>
+        {
+          AssertStatusHeader(message, CachingProxyStatus.HIT);
+          // 37 - gzipped response length
+          Assert.Equal(37, GetContentLength(message));
+          Assert.Equal("gzip", message.Content.Headers.ContentEncoding.SingleOrDefault());
+        }
+      );
+    }
+
+    [Fact]
+    public async void Only_Gzip_Encoding_Supported_In_Content_Encoding()
+    {
+      await AssertGetResponse("/real/fakeBrEncoding.txt", HttpStatusCode.ServiceUnavailable, (message, bytes) =>
+      {
+        Assert.Equal($"{RealTestServer.Url}/fakeBrEncoding.txt returned Content-Encoding 'br' which is not supported", Encoding.UTF8.GetString(bytes));
+      });
+    }
+
+    [Fact]
+    public async void Multiple_Encodings_Are_Not_Supported_In_Content_Encoding()
+    {
+      await AssertGetResponse("/real/fakeMultipleEncodings.txt", HttpStatusCode.ServiceUnavailable, (message, bytes) =>
+      {
+        Assert.Equal($"{RealTestServer.Url}/fakeMultipleEncodings.txt returned multiple Content-Encoding which is not allowed: deflate, gzip", Encoding.UTF8.GetString(bytes));
+      });
+    }
+
+    [Fact]
     public async void File_Name_With_Plus()
     {
       await AssertGetResponse("/real/name+with+plus.jar", HttpStatusCode.OK, (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.MISS));

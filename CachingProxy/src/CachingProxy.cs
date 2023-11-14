@@ -31,7 +31,7 @@ namespace JetBrains.CachingProxy
 
     private readonly Regex myBlacklistRegex;
     private readonly Regex myRedirectToRemoteUrlsRegex;
-    private readonly ResponseCache myResponseCache = new ResponseCache();
+    private readonly ResponseCache myResponseCache = new();
     private readonly ILogger myLogger;
     private readonly FileExtensionContentTypeProvider myContentTypeProvider;
     private readonly RequestDelegate myNext;
@@ -46,7 +46,7 @@ namespace JetBrains.CachingProxy
     public CachingProxy(RequestDelegate next, IWebHostEnvironment hostingEnv,
       ILoggerFactory loggerFactory, IOptions<CachingProxyConfig> config, ProxyHttpClient httpClient)
     {
-      myLogger = loggerFactory.CreateLogger(GetType().FullName);
+      myLogger = loggerFactory.CreateLogger(GetType().FullName!);
       myLogger.LogWarning("Initialising. Config:\n" + config.Value);
 
       myNext = next;
@@ -61,7 +61,9 @@ namespace JetBrains.CachingProxy
       foreach (var remoteServer in myRemoteServers.Servers)
       {
         // force reconnection (and DNS re-resolve) every two minutes
+#pragma warning disable SYSLIB0014
         ServicePointManager.FindServicePoint(remoteServer.RemoteUri).ConnectionLeaseTimeout = 120000;
+#pragma warning restore SYSLIB0014
       }
 
       myContentTypeProvider = new FileExtensionContentTypeProvider();
@@ -75,6 +77,10 @@ namespace JetBrains.CachingProxy
         ContentTypeProvider = myContentTypeProvider,
         OnPrepareResponse = ctx =>
         {
+          var contentEncoding = myCacheFileProvider.GetContentEncoding(ctx.File);
+          if (contentEncoding != null)
+            ctx.Context.Response.Headers[HeaderNames.ContentEncoding] = contentEncoding;
+
           SetStatusHeader(ctx.Context, CachingProxyStatus.HIT);
           AddEternalCachingControl(ctx.Context);
         }
@@ -152,13 +158,6 @@ namespace JetBrains.CachingProxy
         return;
       }
 
-      var cachePath = myCacheFileProvider.GetFileInfo(requestPath).PhysicalPath;
-      if (cachePath == null)
-      {
-        await SetStatus(context, CachingProxyStatus.BAD_REQUEST, HttpStatusCode.BadRequest, "Invalid cache path");
-        return;
-      }
-
       var cachedResponse = myResponseCache.GetCachedStatusCode(requestPath);
       if (cachedResponse != null && !cachedResponse.StatusCode.IsSuccessStatusCode())
       {
@@ -176,6 +175,9 @@ namespace JetBrains.CachingProxy
         responseHeaders.LastModified = cachedResponse.LastModified;
         responseHeaders.ContentLength = cachedResponse.ContentLength;
         context.Response.Headers[HeaderNames.ContentType] = cachedResponse.ContentType;
+
+        if (cachedResponse.ContentEncoding != null)
+          context.Response.Headers[HeaderNames.ContentEncoding] = cachedResponse.ContentEncoding;
 
         SetCachedResponseHeader(context, cachedResponse);
         await SetStatus(context, CachingProxyStatus.HIT, HttpStatusCode.OK);
@@ -199,7 +201,7 @@ namespace JetBrains.CachingProxy
 
         myLogger.LogWarning($"Timeout requesting {upstreamUri}");
 
-        var entry = myResponseCache.PutStatusCode(requestPath, HttpStatusCode.GatewayTimeout, lastModified: null, contentType: null, contentLength: null);
+        var entry = myResponseCache.PutStatusCode(requestPath, HttpStatusCode.GatewayTimeout, lastModified: null, contentType: null, contentEncoding: null, contentLength: null);
 
         SetCachedResponseHeader(context, entry);
         await SetStatus(context, CachingProxyStatus.NEGATIVE_MISS, HttpStatusCode.NotFound);
@@ -209,7 +211,7 @@ namespace JetBrains.CachingProxy
       {
         myLogger.LogWarning(e, $"Exception requesting {upstreamUri}: {e.Message}");
 
-        var entry = myResponseCache.PutStatusCode(requestPath, HttpStatusCode.ServiceUnavailable, lastModified: null, contentType: null, contentLength: null);
+        var entry = myResponseCache.PutStatusCode(requestPath, HttpStatusCode.ServiceUnavailable, lastModified: null, contentType: null, contentEncoding: null, contentLength: null);
         SetCachedResponseHeader(context, entry);
         await SetStatus(context, CachingProxyStatus.NEGATIVE_MISS, HttpStatusCode.NotFound);
         return;
@@ -219,7 +221,7 @@ namespace JetBrains.CachingProxy
       {
         if (!response.IsSuccessStatusCode)
         {
-          var entry = myResponseCache.PutStatusCode(requestPath, response.StatusCode, lastModified: null, contentType: null, contentLength: null);
+          var entry = myResponseCache.PutStatusCode(requestPath, response.StatusCode, lastModified: null, contentType: null, contentEncoding: null, contentLength: null);
 
           SetCachedResponseHeader(context, entry);
           await SetStatus(context, CachingProxyStatus.NEGATIVE_MISS, HttpStatusCode.NotFound);
@@ -241,7 +243,7 @@ namespace JetBrains.CachingProxy
 
             if (remoteServer.ValidateContentTypes)
             {
-              // return 503 Service Unavailable, since the client will most likely retry it with 5xx error codes
+              // return 503 Service Unavailable, since the client will most likely not retry it with 5xx error codes
               context.Response.StatusCode = (int) HttpStatusCode.ServiceUnavailable;
               context.Response.ContentType = MediaTypeNames.Text.Plain;
               await context.Response.WriteAsync(
@@ -258,6 +260,31 @@ namespace JetBrains.CachingProxy
         if (contentLastModified != null)
           context.Response.GetTypedHeaders().LastModified = contentLastModified;
 
+        var headersContentEncoding = response.Content.Headers.ContentEncoding;
+        if (headersContentEncoding.Count > 1)
+        {
+          // return 503 Service Unavailable, since the client will most likely not retry it with 5xx error codes
+          context.Response.StatusCode = (int) HttpStatusCode.ServiceUnavailable;
+          context.Response.ContentType = MediaTypeNames.Text.Plain;
+          await context.Response.WriteAsync(
+            $"{upstreamUri} returned multiple Content-Encoding which is not allowed: {string.Join(", ", headersContentEncoding)}");
+          return;
+        }
+
+        string contentEncoding = headersContentEncoding.Count == 0 ? null : headersContentEncoding.Single();
+        if (contentEncoding != null && contentEncoding != "gzip")
+        {
+          // return 503 Service Unavailable, since the client will most likely not retry it with 5xx error codes
+          context.Response.StatusCode = (int) HttpStatusCode.ServiceUnavailable;
+          context.Response.ContentType = MediaTypeNames.Text.Plain;
+          await context.Response.WriteAsync(
+            $"{upstreamUri} returned Content-Encoding '{contentEncoding}' which is not supported");
+          return;
+        }
+
+        if (contentEncoding != null)
+          context.Response.Headers[HeaderNames.ContentEncoding] = contentEncoding;
+
         if (myContentTypeProvider.TryGetContentType(requestPath, out var contentType))
           context.Response.ContentType = contentType;
 
@@ -265,7 +292,7 @@ namespace JetBrains.CachingProxy
         {
           var entry = myResponseCache.PutStatusCode(
             requestPath, response.StatusCode,
-            lastModified: contentLastModified, contentType: contentType, contentLength: contentLength);
+            lastModified: contentLastModified, contentType: contentType, contentEncoding: contentEncoding, contentLength: contentLength);
           SetCachedResponseHeader(context, entry);
           await SetStatus(context, CachingProxyStatus.MISS, HttpStatusCode.OK);
           return;
@@ -276,6 +303,13 @@ namespace JetBrains.CachingProxy
         // Cache successful responses indefinitely
         // as we assume content won't be changed under a fixed url
         AddEternalCachingControl(context);
+
+        var cachePath = myCacheFileProvider.GetFutureCacheFileLocation(requestPath, contentEncoding);
+        if (cachePath == null)
+        {
+          await SetStatus(context, CachingProxyStatus.BAD_REQUEST, HttpStatusCode.BadRequest, "Invalid cache path");
+          return;
+        }
 
         var tempFile = cachePath + ".tmp." + Guid.NewGuid();
         try

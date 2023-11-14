@@ -22,11 +22,11 @@ namespace JetBrains.CachingProxy
     }
 
     [NotNull]
-    public Entry PutStatusCode(string cacheKey, HttpStatusCode statusCode, DateTimeOffset? lastModified, string contentType, long? contentLength)
+    public Entry PutStatusCode(string cacheKey, HttpStatusCode statusCode, DateTimeOffset? lastModified, string contentType, [CanBeNull] string contentEncoding, long? contentLength)
     {
       var entry = new Entry(
         statusCode, DateTime.UtcNow + GetCacheTimeSpan(statusCode),
-        lastModified: lastModified, contentType: contentType, contentLength: contentLength);
+        lastModified: lastModified, contentType: contentType, contentEncoding: contentEncoding, contentLength: contentLength);
       myCache[cacheKey] = entry;
       return entry;
     }
@@ -45,17 +45,17 @@ namespace JetBrains.CachingProxy
       }
     }
 
-    private readonly ConcurrentDictionary<string, Entry> myCache =
-      new ConcurrentDictionary<string, Entry>(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, Entry> myCache = new(StringComparer.Ordinal);
 
     public class Entry
     {
-      internal Entry(HttpStatusCode statusCode, DateTime cacheUntil, DateTimeOffset? lastModified, string contentType, long? contentLength)
+      internal Entry(HttpStatusCode statusCode, DateTime cacheUntil, DateTimeOffset? lastModified, string contentType, [CanBeNull] string contentEncoding, long? contentLength)
       {
         CacheUntil = cacheUntil;
         LastModified = lastModified;
         ContentType = contentType;
         ContentLength = contentLength;
+        ContentEncoding = contentEncoding;
         StatusCode = statusCode;
       }
 
@@ -63,7 +63,8 @@ namespace JetBrains.CachingProxy
       public readonly HttpStatusCode StatusCode;
       public readonly DateTimeOffset? LastModified;
       public readonly string ContentType;
-      public readonly long? ContentLength;
+      [CanBeNull] public readonly string ContentEncoding;
+      [CanBeNull] public readonly long? ContentLength;
     }
   }
 }
