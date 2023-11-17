@@ -234,6 +234,7 @@ namespace JetBrains.CachingProxy
         if (requestPathExtension != ".html" &&
             requestPathExtension != ".txt" &&
             requestPathExtension != ".htm" &&
+            requestPathExtension != ".sha256" &&
             requestPathExtension != ".sha1" &&
             requestPathExtension != ".md5")
         {
