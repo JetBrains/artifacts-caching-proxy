@@ -235,6 +235,12 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
+    public async void Path_With_At_Symbol()
+    {
+      await AssertGetResponse("/real/@username/package/-/package-3.1.2.tgz", HttpStatusCode.OK, (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.MISS));
+    }
+
+    [Fact]
     public async void Retry_After_500()
     {
       myRealTestServer.Conditional500SendErrorOnce = true;
