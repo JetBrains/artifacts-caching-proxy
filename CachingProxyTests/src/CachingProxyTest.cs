@@ -15,8 +15,6 @@ using Polly;
 using Xunit;
 using Xunit.Abstractions;
 
-// ReSharper disable ParameterOnlyUsedForPreconditionCheck.Local
-
 namespace JetBrains.CachingProxy.Tests
 {
   // TODO: Negative caching expiration per status code
@@ -37,18 +35,18 @@ namespace JetBrains.CachingProxy.Tests
       var config = new CachingProxyConfig
       {
         LocalCachePath = myTempDirectory,
-        Prefixes = new[]
-        {
+        Prefixes =
+        [
           "/repo1.maven.org/maven2",
           "/198.51.100.9",
           "/plugins.gradle.org/m2",
           "/unknown_host.xyz",
           $"/real={RealTestServer.Url}"
-        },
-        ContentTypeValidationPrefixes = new[]
-        {
+        ],
+        ContentTypeValidationPrefixes =
+        [
           "/real"
-        },
+        ],
         MinimumFreeDiskSpaceMb = 2,
       };
 
@@ -67,7 +65,7 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
-    public async void Health_OK()
+    public async Task Health_OK()
     {
       await AssertGetResponse("/health", HttpStatusCode.OK,
         (message, bytes) =>
@@ -77,7 +75,7 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
-    public async void Caching_Works()
+    public async Task Caching_Works()
     {
       await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/1.10.5/ant-xz-1.10.5.jar", HttpStatusCode.OK,
         (message, bytes) =>
@@ -108,7 +106,7 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
-    public async void Get_Followed_By_Head()
+    public async Task Get_Followed_By_Head()
     {
       await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/1.10.5/ant-xz-1.10.5.jar", HttpStatusCode.OK,
         (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.MISS));
@@ -125,7 +123,7 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
-    public async void Files_In_Hierarchy()
+    public async Task Files_In_Hierarchy()
     {
       await AssertGetResponse("/real/a.jar", HttpStatusCode.OK, (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.MISS));
       await AssertGetResponse("/real/a.jar/b.jar", HttpStatusCode.OK, (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.MISS));
@@ -135,19 +133,19 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
-    public async void Remote_CacheHtmlFile()
+    public async Task Remote_CacheHtmlFile()
     {
       await AssertGetResponse("/real/a.html", HttpStatusCode.OK, (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.MISS));
     }
 
     [Fact]
-    public async void File_Name_With_Spaces()
+    public async Task File_Name_With_Spaces()
     {
       await AssertGetResponse("/real/name with spaces.jar", HttpStatusCode.OK, (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.MISS));
     }
 
     [Fact]
-    public async void Content_Encoding_Is_Preserved()
+    public async Task Content_Encoding_Is_Preserved()
     {
       await AssertGetResponse("/real/gzipEncoding.txt", HttpStatusCode.OK, (message, bytes) =>
         {
@@ -168,7 +166,7 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
-    public async void Content_Encoding_Is_Preserved_Head_Request()
+    public async Task Content_Encoding_Is_Preserved_Head_Request()
     {
       await AssertHeadResponse("/real/gzipEncoding.txt", HttpStatusCode.OK, message =>
         {
@@ -190,7 +188,7 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
-    public async void Content_Encoding_Is_Cached_For_Head_Response()
+    public async Task Content_Encoding_Is_Cached_For_Head_Response()
     {
       await AssertGetResponse("/real/gzipEncoding.txt", HttpStatusCode.OK, (message, bytes) =>
         {
@@ -212,7 +210,7 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
-    public async void Only_Gzip_Encoding_Supported_In_Content_Encoding()
+    public async Task Only_Gzip_Encoding_Supported_In_Content_Encoding()
     {
       await AssertGetResponse("/real/fakeBrEncoding.txt", HttpStatusCode.ServiceUnavailable, (message, bytes) =>
       {
@@ -221,7 +219,7 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
-    public async void Multiple_Encodings_Are_Not_Supported_In_Content_Encoding()
+    public async Task Multiple_Encodings_Are_Not_Supported_In_Content_Encoding()
     {
       await AssertGetResponse("/real/fakeMultipleEncodings.txt", HttpStatusCode.ServiceUnavailable, (message, bytes) =>
       {
@@ -230,26 +228,26 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
-    public async void File_Name_With_Plus()
+    public async Task File_Name_With_Plus()
     {
       await AssertGetResponse("/real/name+with+plus.jar", HttpStatusCode.OK, (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.MISS));
     }
 
     [Fact]
-    public async void Path_With_At_Symbol()
+    public async Task Path_With_At_Symbol()
     {
       await AssertGetResponse("/real/@username/package/-/package-3.1.2.tgz", HttpStatusCode.OK, (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.MISS));
     }
 
     [Fact]
-    public async void Retry_After_500()
+    public async Task Retry_After_500()
     {
       myRealTestServer.Conditional500SendErrorOnce = true;
       await AssertGetResponse("/real/conditional-500.txt", HttpStatusCode.OK, (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.MISS));
     }
 
     [Fact]
-    public async void Head_With_Existing_File()
+    public async Task Head_With_Existing_File()
     {
       await AssertHeadResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/1.10.5/ant-xz-1.10.5.jar", HttpStatusCode.OK,
         message =>
@@ -274,7 +272,7 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
-    public async void Head_With_Missing_File()
+    public async Task Head_With_Missing_File()
     {
       await AssertHeadResponse("/repo1.maven.org/maven2/notfound.txt", HttpStatusCode.NotFound,
         message => AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_MISS));
@@ -283,7 +281,7 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
-    public async void Caching_Works_Unknown_ContentLength()
+    public async Task Caching_Works_Unknown_ContentLength()
     {
       const string url = "/real/a.jar";
       await AssertGetResponse(url, HttpStatusCode.OK,
@@ -304,7 +302,7 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
-    public async void Parallel_Requests()
+    public async Task Parallel_Requests()
     {
       const string url = "/repo1.maven.org/maven2/org/apache/ant/ant-xz/1.10.5/ant-xz-1.10.5.jar";
 
@@ -321,7 +319,7 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
-    public async void Always_Redirect_Snapshots()
+    public async Task Always_Redirect_Snapshots()
     {
       await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/1.0-SNAPSHOT/ant-xz-1.0-SNAPSHOT.jar",
         HttpStatusCode.TemporaryRedirect,
@@ -334,7 +332,7 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
-    public async void Always_Redirect_Directory_Index()
+    public async Task Always_Redirect_Directory_Index()
     {
       await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/",
         HttpStatusCode.TemporaryRedirect,
@@ -347,7 +345,7 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
-    public async void Always_Redirect_Directory_Index_No_Trailing_Slash()
+    public async Task Always_Redirect_Directory_Index_No_Trailing_Slash()
     {
       await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz",
         HttpStatusCode.TemporaryRedirect,
@@ -360,7 +358,7 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
-    public async void Always_Redirect_MavenMetadataXml()
+    public async Task Always_Redirect_MavenMetadataXml()
     {
       await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/maven-metadata.xml",
         HttpStatusCode.TemporaryRedirect,
@@ -373,7 +371,7 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
-    public async void No_Route_To_Host()
+    public async Task No_Route_To_Host()
     {
       // https://en.wikipedia.org/wiki/Reserved_IP_addresses
       // 198.51.100.0/24 reserved for documentation
@@ -397,7 +395,7 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
-    public async void Unknown_Host()
+    public async Task Unknown_Host()
     {
       await AssertGetResponse("/unknown_host.xyz/a.txt", HttpStatusCode.NotFound,
         (message, bytes) =>
@@ -415,7 +413,7 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
-    public async void Remote_NotFound()
+    public async Task Remote_NotFound()
     {
       await AssertGetResponse("/repo1.maven.org/maven2/not_found.txt", HttpStatusCode.NotFound,
         (message, bytes) =>
@@ -435,7 +433,7 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
-    public async void Remote_Wrong_Content_Length()
+    public async Task Remote_Wrong_Content_Length()
     {
       await Assert.ThrowsAsync<HttpRequestException>(async () =>
       {
@@ -449,7 +447,7 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
-    public async void Remote_InternalError()
+    public async Task Remote_InternalError()
     {
       await AssertGetResponse("/real/500.jar", HttpStatusCode.NotFound,
         (message, bytes) =>
@@ -469,7 +467,7 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
-    public async void Remote_WrongContentType()
+    public async Task Remote_WrongContentType()
     {
       await AssertGetResponse("/real/wrong-content-type.jar", HttpStatusCode.ServiceUnavailable,
         (message, bytes) =>
@@ -480,7 +478,7 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
-    public async void Unknown_Prefix()
+    public async Task Unknown_Prefix()
     {
       await AssertGetResponse("/some_unknown_prefix/a.txt", HttpStatusCode.NotFound,
         (message, bytes) => { AssertNoStatusHeader(message); });

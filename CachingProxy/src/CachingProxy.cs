@@ -154,7 +154,7 @@ namespace JetBrains.CachingProxy
       if (isRedirectToRemoteUrl || emptyFileExtension)
       {
         await SetStatus(context, CachingProxyStatus.ALWAYS_REDIRECT, HttpStatusCode.TemporaryRedirect);
-        context.Response.Headers.Add("Location", upstreamUri.ToString());
+        context.Response.Headers["Location"]= upstreamUri.ToString();
         return;
       }
 
