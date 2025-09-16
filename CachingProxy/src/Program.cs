@@ -1,16 +1,48 @@
-﻿using Microsoft.AspNetCore;
-using Microsoft.AspNetCore.Hosting;
+﻿using System;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using Polly;
 
-namespace JetBrains.CachingProxy
+namespace JetBrains.CachingProxy;
+
+public static class Program
 {
-  public static class Program
+  public static Task Main(string[] args)
   {
-    public static void Main(string[] args)
+    var builder = WebApplication.CreateBuilder(args);
+
+    builder.Logging.AddJsonConsole();
+
+    // Bind CachingProxyConfig from configuration
+    builder.Services.Configure<CachingProxyConfig>(builder.Configuration);
+
+    ConfigureOurServices(builder.Services);
+
+    var app = builder.Build();
+
+    if (app.Environment.IsDevelopment())
     {
-      WebHost.CreateDefaultBuilder<Startup>(args)
-        .ConfigureLogging(logging => logging.AddJsonConsole())
-        .Build().Run();
+      app.UseDeveloperExceptionPage();
     }
+
+    app.UseMiddleware<CachingProxy>();
+
+    return app.RunAsync();
+  }
+
+  public static void ConfigureOurServices(IServiceCollection services)
+  {
+    services
+      .AddHttpClient<ProxyHttpClient>((provider, client) =>
+      {
+        var config = provider.GetRequiredService<IOptions<CachingProxyConfig>>().Value;
+        client.Timeout = TimeSpan.FromSeconds(config.RequestTimeoutSec);
+      })
+      .AddTransientHttpErrorPolicy(policyBuilder => policyBuilder.WaitAndRetryAsync(4,
+        static retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt - 1))));
   }
 }

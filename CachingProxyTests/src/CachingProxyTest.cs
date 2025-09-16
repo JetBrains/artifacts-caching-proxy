@@ -11,6 +11,7 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
+using Polly;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -56,7 +57,7 @@ namespace JetBrains.CachingProxy.Tests
         {
           services.Add(new ServiceDescriptor(typeof(IOptions<CachingProxyConfig>),
             new OptionsWrapper<CachingProxyConfig>(config)));
-          Startup.ConfigureOurServices(services);
+          Program.ConfigureOurServices(services);
         })
         .Configure(app => { app.UseMiddleware<CachingProxy>(); }
         );
