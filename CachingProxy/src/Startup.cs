@@ -39,13 +39,8 @@ namespace JetBrains.CachingProxy
           var config = provider.GetRequiredService<IOptions<CachingProxyConfig>>().Value;
           client.Timeout = TimeSpan.FromSeconds(config.RequestTimeoutSec);
         })
-        .AddTransientHttpErrorPolicy(builder => builder.WaitAndRetryAsync(new[]
-        {
-          TimeSpan.FromSeconds(1),
-          TimeSpan.FromSeconds(2),
-          TimeSpan.FromSeconds(3),
-          TimeSpan.FromSeconds(5)
-        }));
+        .AddTransientHttpErrorPolicy(builder => builder.WaitAndRetryAsync(4, retryAttempt =>
+          TimeSpan.FromSeconds(Math.Pow(2, retryAttempt - 1))));
     }
   }
 }
