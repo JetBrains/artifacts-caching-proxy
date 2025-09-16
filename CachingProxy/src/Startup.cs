@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Options;
 using Polly;
 
 namespace JetBrains.CachingProxy
@@ -33,13 +34,17 @@ namespace JetBrains.CachingProxy
 
     public static void ConfigureOurServices(IServiceCollection services)
     {
-      services.AddHttpClient<ProxyHttpClient>(client => { client.Timeout = TimeSpan.FromSeconds(20); })
+      services.AddHttpClient<ProxyHttpClient>((provider, client) =>
+        {
+          var config = provider.GetRequiredService<IOptions<CachingProxyConfig>>().Value;
+          client.Timeout = TimeSpan.FromSeconds(config.RequestTimeoutSec);
+        })
         .AddTransientHttpErrorPolicy(builder => builder.WaitAndRetryAsync(new[]
         {
           TimeSpan.FromSeconds(1),
-          TimeSpan.FromSeconds(1),
-          TimeSpan.FromSeconds(1),
-          TimeSpan.FromSeconds(1)
+          TimeSpan.FromSeconds(2),
+          TimeSpan.FromSeconds(3),
+          TimeSpan.FromSeconds(5)
         }));
     }
   }
