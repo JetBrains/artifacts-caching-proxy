@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -15,7 +16,17 @@ public static class Program
   {
     var builder = WebApplication.CreateBuilder(args);
 
-    builder.Logging.AddJsonConsole();
+    builder.WebHost.UseSentry();
+
+    if (builder.Environment.IsDevelopment())
+    {
+      builder.Logging.AddSimpleConsole();
+    }
+    else
+    {
+      builder.Logging.AddJsonConsole();
+      builder.Logging.AddSentry();
+    }
 
     // Bind CachingProxyConfig from configuration
     builder.Services.Configure<CachingProxyConfig>(builder.Configuration);

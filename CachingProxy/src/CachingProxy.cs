@@ -47,7 +47,7 @@ namespace JetBrains.CachingProxy
       ILoggerFactory loggerFactory, IOptions<CachingProxyConfig> config, ProxyHttpClient httpClient)
     {
       myLogger = loggerFactory.CreateLogger(GetType().FullName!);
-      myLogger.LogWarning("Initialising. Config:\n" + config.Value);
+      myLogger.LogInformation("Initialising. Config:\n" + config.Value);
 
       myNext = next;
       myHttpClient = httpClient;
