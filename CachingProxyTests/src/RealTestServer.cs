@@ -1,7 +1,6 @@
 using System;
 using System.IO;
 using System.IO.Compression;
-using System.Net;
 using System.Net.Mime;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Builder;
@@ -34,7 +33,7 @@ namespace JetBrains.CachingProxy.Tests
               if (Conditional500SendErrorOnce)
               {
                 Conditional500SendErrorOnce = false;
-                res.StatusCode = (int) HttpStatusCode.InternalServerError;
+                res.StatusCode = StatusCodes.Status500InternalServerError;
                 return res.WriteAsync("Some Error");
               }
 
@@ -42,7 +41,7 @@ namespace JetBrains.CachingProxy.Tests
             })
             .MapGet("500.jar", (req, res, data) =>
             {
-              res.StatusCode = (int) HttpStatusCode.InternalServerError;
+              res.StatusCode = StatusCodes.Status500InternalServerError;
               return res.WriteAsync("Some Error");
             }).MapGet("wrong-content-length.jar", (req, res, data) =>
             {
@@ -65,7 +64,7 @@ namespace JetBrains.CachingProxy.Tests
 
               return Task.CompletedTask;
             })
-            .MapVerb("HEAD", "gzipEncoding.txt", (req, res, data) =>
+            .MapVerb(HttpMethods.Head, "gzipEncoding.txt", (req, res, data) =>
             {
               res.Headers[HeaderNames.ContentEncoding] = "gzip";
               var textContent = "my content string"u8;

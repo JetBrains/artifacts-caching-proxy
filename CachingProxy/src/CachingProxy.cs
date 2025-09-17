@@ -101,13 +101,13 @@ namespace JetBrains.CachingProxy
         var availableFreeSpaceMb = new DriveInfo(myLocalCachePath).AvailableFreeSpace / (1024 * 1024);
         if (availableFreeSpaceMb < myMinimumFreeDiskSpaceMb)
         {
-          context.Response.StatusCode = 500;
+          context.Response.StatusCode = StatusCodes.Status500InternalServerError;
           await context.Response.WriteAsync($"Not Enough Free Disk Space. {availableFreeSpaceMb} MB is free at {myLocalCachePath}, " +
                                             $"but minimum is {myMinimumFreeDiskSpaceMb} MB");
           return;
         }
 
-        context.Response.StatusCode = 200;
+        context.Response.StatusCode = StatusCodes.Status200OK;
         await context.Response.WriteAsync("OK");
         return;
       }
@@ -121,8 +121,8 @@ namespace JetBrains.CachingProxy
 
       await myStaticFileMiddleware.Invoke(context);
 
-      var isHead = context.Request.Method.Equals("HEAD", StringComparison.Ordinal);
-      var isGet = context.Request.Method.Equals("GET", StringComparison.Ordinal);
+      var isHead = HttpMethods.IsHead(context.Request.Method);
+      var isGet = HttpMethods.IsGet(context.Request.Method);
 
       if (!isHead && !isGet) return;
       if (context.Response.StatusCode != StatusCodes.Status404NotFound) return;
@@ -241,7 +241,7 @@ namespace JetBrains.CachingProxy
             if (remoteServer.ValidateContentTypes)
             {
               // return 503 Service Unavailable, since the client will most likely not retry it with 5xx error codes
-              context.Response.StatusCode = (int) HttpStatusCode.ServiceUnavailable;
+              context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
               context.Response.ContentType = MediaTypeNames.Text.Plain;
               await context.Response.WriteAsync(
                 $"{upstreamUri} returned content type '{responseContentType}' which is forbidden by content type validation for file extension '{requestPathExtension}'");
@@ -261,7 +261,7 @@ namespace JetBrains.CachingProxy
         if (headersContentEncoding.Count > 1)
         {
           // return 503 Service Unavailable, since the client will most likely not retry it with 5xx error codes
-          context.Response.StatusCode = (int) HttpStatusCode.ServiceUnavailable;
+          context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
           context.Response.ContentType = MediaTypeNames.Text.Plain;
           await context.Response.WriteAsync(
             $"{upstreamUri} returned multiple Content-Encoding which is not allowed: {string.Join(", ", headersContentEncoding)}");
@@ -272,7 +272,7 @@ namespace JetBrains.CachingProxy
         if (contentEncoding != null && contentEncoding != "gzip")
         {
           // return 503 Service Unavailable, since the client will most likely not retry it with 5xx error codes
-          context.Response.StatusCode = (int) HttpStatusCode.ServiceUnavailable;
+          context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
           context.Response.ContentType = MediaTypeNames.Text.Plain;
           await context.Response.WriteAsync(
             $"{upstreamUri} returned Content-Encoding '{contentEncoding}' which is not supported");
