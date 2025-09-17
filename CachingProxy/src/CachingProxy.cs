@@ -16,6 +16,7 @@ using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Primitives;
 using Microsoft.Net.Http.Headers;
 
 namespace JetBrains.CachingProxy
@@ -26,7 +27,7 @@ namespace JetBrains.CachingProxy
 
     [GeneratedRegex(@"^([\x20a-zA-Z_\-0-9./+@]|%20)+$", RegexOptions.Compiled)]
     private partial Regex OurGoodPathChars { get; }
-    private static readonly string ourEternalCachingHeader =
+    private static readonly StringValues ourEternalCachingHeader =
       new CacheControlHeaderValue { Public = true, MaxAge = TimeSpan.FromDays(365) }.ToString();
 
     private readonly Regex? myBlacklistRegex;
@@ -74,7 +75,7 @@ namespace JetBrains.CachingProxy
         {
           var contentEncoding = myCacheFileProvider.GetContentEncoding(ctx.File);
           if (contentEncoding != null)
-            ctx.Context.Response.Headers[HeaderNames.ContentEncoding] = contentEncoding;
+            ctx.Context.Response.Headers.ContentEncoding = contentEncoding;
 
           SetStatusHeader(ctx.Context, CachingProxyStatus.HIT);
           AddEternalCachingControl(ctx.Context);
@@ -149,7 +150,7 @@ namespace JetBrains.CachingProxy
       if (isRedirectToRemoteUrl || emptyFileExtension)
       {
         await SetStatus(context, CachingProxyStatus.ALWAYS_REDIRECT, HttpStatusCode.TemporaryRedirect);
-        context.Response.Headers["Location"]= upstreamUri.ToString();
+        context.Response.GetTypedHeaders().Location = upstreamUri;
         return;
       }
 
@@ -169,10 +170,10 @@ namespace JetBrains.CachingProxy
 
         responseHeaders.LastModified = cachedResponse.LastModified;
         responseHeaders.ContentLength = cachedResponse.ContentLength;
-        context.Response.Headers[HeaderNames.ContentType] = cachedResponse.ContentType;
+        context.Response.Headers.ContentType = cachedResponse.ContentType;
 
         if (cachedResponse.ContentEncoding != null)
-          context.Response.Headers[HeaderNames.ContentEncoding] = cachedResponse.ContentEncoding;
+          context.Response.Headers.ContentEncoding = cachedResponse.ContentEncoding;
 
         SetCachedResponseHeader(context, cachedResponse);
         await SetStatus(context, CachingProxyStatus.HIT, HttpStatusCode.OK);
@@ -280,7 +281,7 @@ namespace JetBrains.CachingProxy
         }
 
         if (contentEncoding != null)
-          context.Response.Headers[HeaderNames.ContentEncoding] = contentEncoding;
+          context.Response.Headers.ContentEncoding = contentEncoding;
 
         if (myContentTypeProvider.TryGetContentType(requestPath, out var contentType))
           context.Response.ContentType = contentType;
@@ -410,7 +411,7 @@ namespace JetBrains.CachingProxy
 
     private static void AddEternalCachingControl(HttpContext context)
     {
-      context.Response.Headers[HeaderNames.CacheControl] = ourEternalCachingHeader;
+      context.Response.Headers.CacheControl = ourEternalCachingHeader;
     }
 
     private static async Task CopyToTwoStreamsAsync(Stream source, Stream dest1, FileStream dest2, CancellationToken cancellationToken)

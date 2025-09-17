@@ -8,7 +8,6 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Net.Http.Headers;
 
 namespace JetBrains.CachingProxy.Tests
 {
@@ -51,7 +50,7 @@ namespace JetBrains.CachingProxy.Tests
             .MapGet("a.jar", (req, res, data) => res.WriteAsync("a.jar"))
             .MapGet("gzipEncoding.txt", (req, res, data) =>
             {
-              res.Headers[HeaderNames.ContentEncoding] = "gzip";
+              res.Headers.ContentEncoding = "gzip";
               var textContent = "my content string"u8;
 
               using var mso = new MemoryStream();
@@ -66,7 +65,7 @@ namespace JetBrains.CachingProxy.Tests
             })
             .MapVerb(HttpMethods.Head, "gzipEncoding.txt", (req, res, data) =>
             {
-              res.Headers[HeaderNames.ContentEncoding] = "gzip";
+              res.Headers.ContentEncoding = "gzip";
               var textContent = "my content string"u8;
 
               using var mso = new MemoryStream();
@@ -76,18 +75,18 @@ namespace JetBrains.CachingProxy.Tests
 
               if (mso.TryGetBuffer(out var buffer))
               {
-                res.Headers["Content-Length"] = buffer.Count.ToString();
+                res.Headers.ContentLength = buffer.Count;
               }
               return Task.CompletedTask;
             })
             .MapGet("fakeBrEncoding.txt", (req, res, data) =>
             {
-              res.Headers[HeaderNames.ContentEncoding] = "br";
+              res.Headers.ContentEncoding = "br";
               return res.WriteAsync("garbage");
             })
             .MapGet("fakeMultipleEncodings.txt", (req, res, data) =>
             {
-              res.Headers[HeaderNames.ContentEncoding] = "deflate, gzip";
+              res.Headers.ContentEncoding = "deflate, gzip";
               return res.WriteAsync("garbage");
             })
             .MapGet("name with spaces.jar", (req, res, data) => res.WriteAsync("zzz.jar"))
