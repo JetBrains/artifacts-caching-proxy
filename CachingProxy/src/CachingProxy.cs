@@ -36,6 +36,7 @@ namespace JetBrains.CachingProxy
     private readonly ILogger myLogger;
     private readonly FileExtensionContentTypeProvider myContentTypeProvider;
     private readonly RequestDelegate myNext;
+    private readonly CachingProxyMetrics myMetrics;
     private readonly ProxyHttpClient myHttpClient;
     private readonly RemoteServers myRemoteServers;
     private readonly StaticFileMiddleware myStaticFileMiddleware;
@@ -44,13 +45,14 @@ namespace JetBrains.CachingProxy
     private readonly string myLocalCachePath;
     private readonly long myMinimumFreeDiskSpaceMb;
 
-    public CachingProxy(RequestDelegate next, IWebHostEnvironment hostingEnv,
+    public CachingProxy(RequestDelegate next, IWebHostEnvironment hostingEnv, CachingProxyMetrics metrics,
       ILoggerFactory loggerFactory, IOptions<CachingProxyConfig> config, ProxyHttpClient httpClient)
     {
       myLogger = loggerFactory.CreateLogger<CachingProxy>();
       myLogger.LogInformation("Initialising. Config:\n{CachingProxyConfig}", config.Value);
 
       myNext = next;
+      myMetrics = metrics;
       myHttpClient = httpClient;
 
       myMinimumFreeDiskSpaceMb = config.Value.MinimumFreeDiskSpaceMb;
@@ -382,7 +384,7 @@ namespace JetBrains.CachingProxy
       }
     }
 
-    private static async Task SetStatus(HttpContext context, CachingProxyStatus status, HttpStatusCode? httpCode = null, string? responseString = null)
+    private async Task SetStatus(HttpContext context, CachingProxyStatus status, HttpStatusCode? httpCode = null, string? responseString = null)
     {
       SetStatusHeader(context, status);
 
@@ -393,9 +395,10 @@ namespace JetBrains.CachingProxy
         await context.Response.WriteAsync(responseString);
     }
 
-    private static void SetStatusHeader(HttpContext context, CachingProxyStatus status)
+    private void SetStatusHeader(HttpContext context, CachingProxyStatus status)
     {
       context.Response.Headers[CachingProxyConstants.StatusHeader] = status.ToString();
+      myMetrics.IncrementRequests(status);
     }
 
     private static void SetCachedResponseHeader(HttpContext context, ResponseCache.Entry entry)

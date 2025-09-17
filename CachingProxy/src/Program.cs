@@ -6,6 +6,8 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using OpenTelemetry.Metrics;
+using OpenTelemetry.Resources;
 using Polly;
 
 namespace JetBrains.CachingProxy;
@@ -33,12 +35,27 @@ public static class Program
 
     ConfigureOurServices(builder.Services);
 
+    builder.Services
+      .AddOpenTelemetry()
+      .ConfigureResource(resource => resource.AddService(builder.Environment.ApplicationName))
+      .WithMetrics(metrics => metrics
+        .AddAspNetCoreInstrumentation()
+        .AddHttpClientInstrumentation()
+        .AddRuntimeInstrumentation()
+        .AddMeter(CachingProxyMetrics.MeterName)
+        .AddPrometheusExporter()
+        .AddConsoleExporter()
+        .AddOtlpExporter()
+      );
+
     var app = builder.Build();
 
     if (app.Environment.IsDevelopment())
     {
       app.UseDeveloperExceptionPage();
     }
+
+    app.UseOpenTelemetryPrometheusScrapingEndpoint();
 
     app.UseMiddleware<CachingProxy>();
 
@@ -48,6 +65,7 @@ public static class Program
   public static void ConfigureOurServices(IServiceCollection services)
   {
     services
+      .AddSingleton<CachingProxyMetrics>()
       .AddHttpClient<ProxyHttpClient>((provider, client) =>
       {
         var config = provider.GetRequiredService<IOptions<CachingProxyConfig>>().Value;
@@ -60,6 +78,6 @@ public static class Program
         handler.UseCookies = false;
       })
       .AddTransientHttpErrorPolicy(policyBuilder => policyBuilder.WaitAndRetryAsync(
-        4, static retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt - 1))));
+        4, retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt - 1))));
   }
 }
