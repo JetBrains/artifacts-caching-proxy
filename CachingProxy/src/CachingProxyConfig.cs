@@ -4,13 +4,13 @@ namespace JetBrains.CachingProxy
 {
   public class CachingProxyConfig
   {
-    public string[] Prefixes { get; set; } = new string[0];
-    public string[] ContentTypeValidationPrefixes { get; set; } = new string[0];
-    public string LocalCachePath { get; set; } = Path.Combine(Path.GetTempPath(), "artifacts-caching-proxy");
-    public string BlacklistUrlRegex { get; set; } = null;
-    public long MinimumFreeDiskSpaceMb { get; set; } = 2048;
-    public long RequestTimeoutSec { get; set; } = 20;
-    public string RedirectToRemoteUrlsRegex { get; set; } = "^(.*-SNAPSHOT.*|.*maven-metadata\\.xml)$";
+    public string[] Prefixes { get; init; } = [];
+    public string[] ContentTypeValidationPrefixes { get; init; } = [];
+    public string LocalCachePath { get; init; } = Path.Combine(Path.GetTempPath(), "artifacts-caching-proxy");
+    public string? BlacklistUrlRegex { get; init; }
+    public long MinimumFreeDiskSpaceMb { get; init; } = 2048;
+    public long RequestTimeoutSec { get; init; } = 20;
+    public string RedirectToRemoteUrlsRegex { get; init; } = "^(.*-SNAPSHOT.*|.*maven-metadata\\.xml)$";
 
     public override string ToString()
     {

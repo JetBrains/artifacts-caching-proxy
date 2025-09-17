@@ -53,7 +53,13 @@ public static class Program
         var config = provider.GetRequiredService<IOptions<CachingProxyConfig>>().Value;
         client.Timeout = TimeSpan.FromSeconds(config.RequestTimeoutSec);
       })
-      .AddTransientHttpErrorPolicy(policyBuilder => policyBuilder.WaitAndRetryAsync(4,
-        static retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt - 1))));
+      .UseSocketsHttpHandler((handler, _) =>
+      {
+        // force reconnection (and DNS re-resolve) every two minutes
+        handler.PooledConnectionLifetime = TimeSpan.FromMinutes(2);
+        handler.UseCookies = false;
+      })
+      .AddTransientHttpErrorPolicy(policyBuilder => policyBuilder.WaitAndRetryAsync(
+        4, static retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt - 1))));
   }
 }

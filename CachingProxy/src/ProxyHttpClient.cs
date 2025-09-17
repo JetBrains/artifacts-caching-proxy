@@ -2,14 +2,9 @@ using System.Net.Http;
 
 namespace JetBrains.CachingProxy
 {
-  public class ProxyHttpClient
+  public class ProxyHttpClient(HttpClient client)
   {
-    public HttpClient Client { get; }
-
-    public ProxyHttpClient(HttpClient client)
-    {
-      Client = client;
-    }
+    public HttpClient Client { get; } = client;
 
     // TODO. Move some client logic here
   }

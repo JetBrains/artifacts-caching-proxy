@@ -3,7 +3,6 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
-using System.Security.Cryptography;
 using System.Text;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Builder;
@@ -11,7 +10,6 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
-using Polly;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -81,12 +79,12 @@ namespace JetBrains.CachingProxy.Tests
         (message, bytes) =>
         {
           AssertStatusHeader(message, CachingProxyStatus.MISS);
-          Assert.Equal("application/java-archive", message.Content.Headers.ContentType.ToString());
+          Assert.Equal("application/java-archive", message.Content.Headers.ContentType?.ToString());
           Assert.Equal(11541, GetContentLength(message));
           Assert.Equal(11541, bytes.Length);
           Assert.Equal("eca06bb19a4f55673f8f40d0a20eb0ee0342403ee5856b890d6c612e5facb027", SHA256(bytes));
           Assert.Equal("Tue, 10 Jul 2018 04:58:42 GMT", message.Content.Headers.GetValues("Last-Modified").Single());
-          Assert.Equal("public, max-age=31536000", message.Headers.CacheControl.ToString());
+          Assert.Equal("public, max-age=31536000", message.Headers.CacheControl?.ToString());
         });
 
       await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/1.10.5/ant-xz-1.10.5.jar", HttpStatusCode.OK,
@@ -94,11 +92,11 @@ namespace JetBrains.CachingProxy.Tests
         {
           AssertStatusHeader(message, CachingProxyStatus.HIT);
           Assert.Equal(11541, GetContentLength(message));
-          Assert.Equal("application/java-archive", message.Content.Headers.ContentType.ToString());
+          Assert.Equal("application/java-archive", message.Content.Headers.ContentType?.ToString());
           Assert.Equal(11541, bytes.Length);
           Assert.Equal("eca06bb19a4f55673f8f40d0a20eb0ee0342403ee5856b890d6c612e5facb027", SHA256(bytes));
           Assert.Equal("Tue, 10 Jul 2018 04:58:42 GMT", message.Content.Headers.GetValues("Last-Modified").Single());
-          Assert.Equal("public, max-age=31536000", message.Headers.CacheControl.ToString());
+          Assert.Equal("public, max-age=31536000", message.Headers.CacheControl?.ToString());
         });
 
       Assert.Equal(11541, new FileInfo(
@@ -116,9 +114,9 @@ namespace JetBrains.CachingProxy.Tests
         {
           AssertStatusHeader(message, CachingProxyStatus.HIT);
           Assert.Equal(11541, GetContentLength(message));
-          Assert.Equal("application/java-archive", message.Content.Headers.ContentType.ToString());
+          Assert.Equal("application/java-archive", message.Content.Headers.ContentType?.ToString());
           Assert.Equal("Tue, 10 Jul 2018 04:58:42 GMT", message.Content.Headers.GetValues("Last-Modified").Single());
-          Assert.Equal("public, max-age=31536000", message.Headers.CacheControl.ToString());
+          Assert.Equal("public, max-age=31536000", message.Headers.CacheControl?.ToString());
         });
     }
 
@@ -254,20 +252,20 @@ namespace JetBrains.CachingProxy.Tests
         {
           AssertStatusHeader(message, CachingProxyStatus.MISS);
 
-          Assert.Equal("application/java-archive", message.Content.Headers.ContentType.ToString());
+          Assert.Equal("application/java-archive", message.Content.Headers.ContentType?.ToString());
           Assert.Equal(11541, GetContentLength(message));
           Assert.Equal("Tue, 10 Jul 2018 04:58:42 GMT", message.Content.Headers.GetValues("Last-Modified").Single());
-          Assert.Equal("public, max-age=31536000", message.Headers.CacheControl.ToString());
+          Assert.Equal("public, max-age=31536000", message.Headers.CacheControl?.ToString());
         });
       await AssertHeadResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/1.10.5/ant-xz-1.10.5.jar", HttpStatusCode.OK,
         message =>
         {
           AssertStatusHeader(message, CachingProxyStatus.HIT);
 
-          Assert.Equal("application/java-archive", message.Content.Headers.ContentType.ToString());
+          Assert.Equal("application/java-archive", message.Content.Headers.ContentType?.ToString());
           Assert.Equal(11541, GetContentLength(message));
           Assert.Equal("Tue, 10 Jul 2018 04:58:42 GMT", message.Content.Headers.GetValues("Last-Modified").Single());
-          Assert.Equal("public, max-age=31536000", message.Headers.CacheControl.ToString());
+          Assert.Equal("public, max-age=31536000", message.Headers.CacheControl?.ToString());
         });
     }
 
@@ -327,7 +325,7 @@ namespace JetBrains.CachingProxy.Tests
         {
           AssertStatusHeader(message, CachingProxyStatus.ALWAYS_REDIRECT);
           Assert.Equal("https://repo1.maven.org/maven2/org/apache/ant/ant-xz/1.0-SNAPSHOT/ant-xz-1.0-SNAPSHOT.jar",
-            message.Headers.Location.ToString());
+            message.Headers.Location?.ToString());
         });
     }
 
@@ -340,7 +338,7 @@ namespace JetBrains.CachingProxy.Tests
         {
           AssertStatusHeader(message, CachingProxyStatus.ALWAYS_REDIRECT);
           Assert.Equal("https://repo1.maven.org/maven2/org/apache/ant/ant-xz/",
-            message.Headers.Location.ToString());
+            message.Headers.Location?.ToString());
         });
     }
 
@@ -353,7 +351,7 @@ namespace JetBrains.CachingProxy.Tests
         {
           AssertStatusHeader(message, CachingProxyStatus.ALWAYS_REDIRECT);
           Assert.Equal("https://repo1.maven.org/maven2/org/apache/ant/ant-xz",
-            message.Headers.Location.ToString());
+            message.Headers.Location?.ToString());
         });
     }
 
@@ -366,7 +364,7 @@ namespace JetBrains.CachingProxy.Tests
         {
           AssertStatusHeader(message, CachingProxyStatus.ALWAYS_REDIRECT);
           Assert.Equal("https://repo1.maven.org/maven2/org/apache/ant/ant-xz/maven-metadata.xml",
-            message.Headers.Location.ToString());
+            message.Headers.Location?.ToString());
         });
     }
 

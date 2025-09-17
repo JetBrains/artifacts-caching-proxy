@@ -1,20 +1,14 @@
 using System;
-using JetBrains.Annotations;
 using Microsoft.Extensions.FileProviders;
 using Microsoft.Extensions.Primitives;
 
 namespace JetBrains.CachingProxy
 {
-  public class CacheFileProvider: IFileProvider
+  public class CacheFileProvider(string cacheDirectory) : IFileProvider
   {
     private static readonly string ourGzippedContentSuffix = "-gzip-Ege4dHyCEA7IM";
 
-    private readonly PhysicalFileProvider myPhysicalFileProvider;
-
-    public CacheFileProvider(string cacheDirectory)
-    {
-      myPhysicalFileProvider = new PhysicalFileProvider(cacheDirectory);
-    }
+    private readonly PhysicalFileProvider myPhysicalFileProvider = new(cacheDirectory);
 
     public IFileInfo GetFileInfo(string subpath)
     {
@@ -31,16 +25,15 @@ namespace JetBrains.CachingProxy
       return myPhysicalFileProvider.GetDirectoryContents(ManglePath(subpath, ""));
     }
 
-    public string GetFutureCacheFileLocation(string subpath, string contentEncoding)
+    public string? GetFutureCacheFileLocation(string subpath, string? contentEncoding)
     {
       var fileInfo = myPhysicalFileProvider.GetFileInfo(ManglePath(subpath, GetContentEncodingCacheFileSuffix(contentEncoding)));
-      return fileInfo?.PhysicalPath;
+      return fileInfo.PhysicalPath;
     }
 
-    [CanBeNull]
-    public string GetContentEncoding(IFileInfo fileInfo)
+    public string? GetContentEncoding(IFileInfo fileInfo)
     {
-      return fileInfo.PhysicalPath.EndsWith(ourGzippedContentSuffix) ? "gzip" : null;
+      return fileInfo.PhysicalPath?.EndsWith(ourGzippedContentSuffix) ?? false ? "gzip" : null;
     }
 
     public IChangeToken Watch(string filter)
@@ -49,7 +42,7 @@ namespace JetBrains.CachingProxy
     }
 
     /// <summary>
-    /// Change sub-path upon converting to local file system path to handle hierarchy-conflicts like
+    /// Change sub-path upon converting to a local file system path to handle hierarchy-conflicts like
     /// caching both a/a.jar and a/b/c/c.jar
     /// </summary>
     private static string ManglePath(string subpath, string contentEncodingSuffix)
@@ -58,11 +51,10 @@ namespace JetBrains.CachingProxy
       var lastSeparator = trimmed.LastIndexOf('/');
       return lastSeparator < 0
         ? $"cache-{trimmed}"
-        : $"{trimmed.Substring(0, lastSeparator + 1)}cache-{trimmed.Substring(lastSeparator + 1)}{contentEncodingSuffix}";
+        : $"{trimmed[..(lastSeparator + 1)]}cache-{trimmed[(lastSeparator + 1)..]}{contentEncodingSuffix}";
     }
 
-    [NotNull]
-    private static string GetContentEncodingCacheFileSuffix([CanBeNull] string contentEncoding) =>
+    private static string GetContentEncodingCacheFileSuffix(string? contentEncoding) =>
       contentEncoding switch
       {
         null => "",

@@ -20,17 +20,17 @@ using Microsoft.Net.Http.Headers;
 
 namespace JetBrains.CachingProxy
 {
-  [SuppressMessage("ReSharper", "ClassNeverInstantiated.Global")]
-  public class CachingProxy
+  public partial class CachingProxy
   {
     private const int BUFFER_SIZE = 81920;
 
-    private static readonly Regex ourGoodPathChars = new Regex("^([\\x20a-zA-Z_\\-0-9./+@]|%20)+$", RegexOptions.Compiled);
+    [GeneratedRegex(@"^([\x20a-zA-Z_\-0-9./+@]|%20)+$", RegexOptions.Compiled)]
+    private partial Regex OurGoodPathChars { get; }
     private static readonly string ourEternalCachingHeader =
       new CacheControlHeaderValue { Public = true, MaxAge = TimeSpan.FromDays(365) }.ToString();
 
-    private readonly Regex myBlacklistRegex;
-    private readonly Regex myRedirectToRemoteUrlsRegex;
+    private readonly Regex? myBlacklistRegex;
+    private readonly Regex? myRedirectToRemoteUrlsRegex;
     private readonly ResponseCache myResponseCache = new();
     private readonly ILogger myLogger;
     private readonly FileExtensionContentTypeProvider myContentTypeProvider;
@@ -46,25 +46,20 @@ namespace JetBrains.CachingProxy
     public CachingProxy(RequestDelegate next, IWebHostEnvironment hostingEnv,
       ILoggerFactory loggerFactory, IOptions<CachingProxyConfig> config, ProxyHttpClient httpClient)
     {
-      myLogger = loggerFactory.CreateLogger(GetType().FullName!);
-      myLogger.LogInformation("Initialising. Config:\n" + config.Value);
+      myLogger = loggerFactory.CreateLogger<CachingProxy>();
+      myLogger.LogInformation("Initialising. Config:\n{CachingProxyConfig}", config.Value);
 
       myNext = next;
       myHttpClient = httpClient;
 
       myMinimumFreeDiskSpaceMb = config.Value.MinimumFreeDiskSpaceMb;
       myLocalCachePath = config.Value.LocalCachePath;
-      if (myLocalCachePath == null) throw new ArgumentNullException("", "LocalCachePath could not be null");
-      if (!Directory.Exists(myLocalCachePath)) throw new ArgumentException("LocalCachePath doesn't exist: " + myLocalCachePath);
+      if (myLocalCachePath == null)
+        throw new ArgumentNullException(nameof(myLocalCachePath), "LocalCachePath could not be null");
+      if (!Directory.Exists(myLocalCachePath))
+        throw new ArgumentException("LocalCachePath doesn't exist: " + myLocalCachePath);
 
       myRemoteServers = new RemoteServers(config.Value.Prefixes.ToList(), config.Value.ContentTypeValidationPrefixes.ToList());
-      foreach (var remoteServer in myRemoteServers.Servers)
-      {
-        // force reconnection (and DNS re-resolve) every two minutes
-#pragma warning disable SYSLIB0014
-        ServicePointManager.FindServicePoint(remoteServer.RemoteUri).ConnectionLeaseTimeout = 120000;
-#pragma warning restore SYSLIB0014
-      }
 
       myContentTypeProvider = new FileExtensionContentTypeProvider();
       myCacheFileProvider = new CacheFileProvider(myLocalCachePath);
@@ -134,7 +129,7 @@ namespace JetBrains.CachingProxy
 
       var requestPath = context.Request.Path.ToString().Replace('\\', '/').TrimStart('/');
       if (requestPath.Contains("..", StringComparison.Ordinal) ||
-          !ourGoodPathChars.IsMatch(requestPath))
+          !OurGoodPathChars.IsMatch(requestPath))
       {
         await SetStatus(context, CachingProxyStatus.BAD_REQUEST, HttpStatusCode.BadRequest, "Invalid request path");
         return;
@@ -184,7 +179,7 @@ namespace JetBrains.CachingProxy
         return;
       }
 
-      myLogger.LogDebug("Downloading from {0}", upstreamUri);
+      myLogger.LogDebug("Downloading from {UpstreamUri}", upstreamUri);
 
       var request = new HttpRequestMessage(isHead ? HttpMethod.Head : HttpMethod.Get, upstreamUri);
 
@@ -197,9 +192,9 @@ namespace JetBrains.CachingProxy
       {
         if (context.RequestAborted == canceledException.CancellationToken) return;
 
-        // Canceled by internal token, means timeout
+        // Canceled by internal token means timeout
 
-        myLogger.LogWarning($"Timeout requesting {upstreamUri}");
+        myLogger.LogWarning("Timeout requesting {UpstreamUri}", upstreamUri);
 
         var entry = myResponseCache.PutStatusCode(requestPath, HttpStatusCode.GatewayTimeout, lastModified: null, contentType: null, contentEncoding: null, contentLength: null);
 
@@ -209,7 +204,7 @@ namespace JetBrains.CachingProxy
       }
       catch (Exception e)
       {
-        myLogger.LogWarning(e, $"Exception requesting {upstreamUri}: {e.Message}");
+        myLogger.LogWarning(e, "Exception requesting {UpstreamUri}: {Message}", upstreamUri, e.Message);
 
         var entry = myResponseCache.PutStatusCode(requestPath, HttpStatusCode.ServiceUnavailable, lastModified: null, contentType: null, contentEncoding: null, contentLength: null);
         SetCachedResponseHeader(context, entry);
@@ -229,7 +224,7 @@ namespace JetBrains.CachingProxy
         }
 
         // If content type validation is enabled, only .html, .htm, .txt, .sha1, .md5 files may have text/* content type
-        // This prevents e.g. caching of error pages with 200 OK code (jcenter)
+        // This prevents, e.g. caching of error pages with 200 OK code (jcenter)
         var responseContentType = response.Content.Headers.ContentType?.MediaType;
         if (requestPathExtension != ".html" &&
             requestPathExtension != ".txt" &&
@@ -240,7 +235,8 @@ namespace JetBrains.CachingProxy
         {
           if (responseContentType is MediaTypeNames.Text.Html or MediaTypeNames.Text.Plain)
           {
-            myLogger.LogWarning($"{upstreamUri} returned content type '{responseContentType}' which is possibly wrong for file extension '{requestPathExtension}'");
+            myLogger.LogWarning("{UpstreamUri} returned content type '{ResponseContentType}' which is possibly wrong for file extension '{RequestPathExtension}'",
+              upstreamUri, responseContentType, requestPathExtension);
 
             if (remoteServer.ValidateContentTypes)
             {
@@ -272,7 +268,7 @@ namespace JetBrains.CachingProxy
           return;
         }
 
-        string contentEncoding = headersContentEncoding.Count == 0 ? null : headersContentEncoding.Single();
+        var contentEncoding = headersContentEncoding.Count == 0 ? null : headersContentEncoding.Single();
         if (contentEncoding != null && contentEncoding != "gzip")
         {
           // return 503 Service Unavailable, since the client will most likely not retry it with 5xx error codes
@@ -329,7 +325,8 @@ namespace JetBrains.CachingProxy
           var tempFileInfo = new FileInfo(tempFile);
           if (contentLength != null && tempFileInfo.Length != contentLength)
           {
-            myLogger.LogWarning($"Expected {contentLength} bytes from Content-Length, but downloaded {tempFileInfo.Length}: {upstreamUri}");
+            myLogger.LogWarning("Expected {ContentLength} bytes from Content-Length, but downloaded {Length}: {UpstreamUri}",
+              contentLength, tempFileInfo.Length, upstreamUri);
             context.Abort();
             return;
           }
@@ -344,7 +341,7 @@ namespace JetBrains.CachingProxy
           {
             if (File.Exists(cachePath))
             {
-              // It's ok, parallel request cached it before us
+              // It's ok, a parallel request cached it before us
             }
             else throw;
           }
@@ -380,12 +377,11 @@ namespace JetBrains.CachingProxy
       }
       catch (Exception e)
       {
-        myLogger.Log(LogLevel.Error, e, "LogSilently: " + e.Message);
+        myLogger.Log(LogLevel.Error, e, "LogSilently: {Message}", e.Message);
       }
     }
 
-    private static async Task SetStatus(HttpContext context, CachingProxyStatus status, HttpStatusCode? httpCode = null,
-      string responseString = null)
+    private static async Task SetStatus(HttpContext context, CachingProxyStatus status, HttpStatusCode? httpCode = null, string? responseString = null)
     {
       SetStatusHeader(context, status);
 
@@ -417,25 +413,18 @@ namespace JetBrains.CachingProxy
       context.Response.Headers[HeaderNames.CacheControl] = ourEternalCachingHeader;
     }
 
-    private static async Task CopyToTwoStreamsAsync(Stream source, Stream dest1, Stream dest2,
-      CancellationToken cancellationToken)
+    private static async Task CopyToTwoStreamsAsync(Stream source, Stream dest1, FileStream dest2, CancellationToken cancellationToken)
     {
-      var buffer = ArrayPool<byte>.Shared.Rent(BUFFER_SIZE);
-      try
+      using var buffer = MemoryPool<byte>.Shared.Rent(BUFFER_SIZE);
+      var memory = buffer.Memory;
+      while (true)
       {
-        while (true)
-        {
-          var length = await source.ReadAsync(new Memory<byte>(buffer), cancellationToken).ConfigureAwait(false);
-          if (length == 0)
-            break;
+        var length = await source.ReadAsync(memory, cancellationToken).ConfigureAwait(false);
+        if (length == 0)
+          break;
 
-          await dest1.WriteAsync(new ReadOnlyMemory<byte>(buffer, 0, length), cancellationToken).ConfigureAwait(false);
-          await dest2.WriteAsync(new ReadOnlyMemory<byte>(buffer, 0, length), cancellationToken).ConfigureAwait(false);
-        }
-      }
-      finally
-      {
-        ArrayPool<byte>.Shared.Return(buffer);
+        await dest1.WriteAsync(memory[..length], cancellationToken).ConfigureAwait(false);
+        await dest2.WriteAsync(memory[..length], cancellationToken).ConfigureAwait(false);
       }
     }
   }

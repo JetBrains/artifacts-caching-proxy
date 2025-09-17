@@ -1,15 +1,13 @@
 using System;
 using System.Collections.Concurrent;
 using System.Net;
-using JetBrains.Annotations;
 
 namespace JetBrains.CachingProxy
 {
   // TODO. Cache cleanup after a some time?
   public class ResponseCache
   {
-    [CanBeNull]
-    public Entry GetCachedStatusCode(string cacheKey)
+    public Entry? GetCachedStatusCode(string cacheKey)
     {
       if (!myCache.TryGetValue(cacheKey, out var entry)) return null;
       if (DateTime.UtcNow > entry.CacheUntil)
@@ -21,8 +19,7 @@ namespace JetBrains.CachingProxy
       return entry;
     }
 
-    [NotNull]
-    public Entry PutStatusCode(string cacheKey, HttpStatusCode statusCode, DateTimeOffset? lastModified, string contentType, [CanBeNull] string contentEncoding, long? contentLength)
+    public Entry PutStatusCode(string cacheKey, HttpStatusCode statusCode, DateTimeOffset? lastModified, string? contentType, string? contentEncoding, long? contentLength)
     {
       var entry = new Entry(
         statusCode, DateTime.UtcNow + GetCacheTimeSpan(statusCode),
@@ -33,23 +30,19 @@ namespace JetBrains.CachingProxy
 
     private static TimeSpan GetCacheTimeSpan(HttpStatusCode statusCode)
     {
-      switch (statusCode)
+      return statusCode switch
       {
-        // Clear reply from server
-        case HttpStatusCode.OK:
-        case HttpStatusCode.NotFound:
-          return TimeSpan.FromMinutes(5);
-
-        // Internal errors, network timeouts etc
-        default: return TimeSpan.FromMinutes(1);
-      }
+        // Clear reply from a server
+        HttpStatusCode.OK or HttpStatusCode.NotFound => TimeSpan.FromMinutes(5),
+        _ => TimeSpan.FromMinutes(1)
+      };
     }
 
     private readonly ConcurrentDictionary<string, Entry> myCache = new(StringComparer.Ordinal);
 
     public class Entry
     {
-      internal Entry(HttpStatusCode statusCode, DateTime cacheUntil, DateTimeOffset? lastModified, string contentType, [CanBeNull] string contentEncoding, long? contentLength)
+      internal Entry(HttpStatusCode statusCode, DateTime cacheUntil, DateTimeOffset? lastModified, string? contentType, string? contentEncoding, long? contentLength)
       {
         CacheUntil = cacheUntil;
         LastModified = lastModified;
@@ -62,9 +55,9 @@ namespace JetBrains.CachingProxy
       public readonly DateTime CacheUntil;
       public readonly HttpStatusCode StatusCode;
       public readonly DateTimeOffset? LastModified;
-      public readonly string ContentType;
-      [CanBeNull] public readonly string ContentEncoding;
-      [CanBeNull] public readonly long? ContentLength;
+      public readonly string? ContentType;
+      public readonly string? ContentEncoding;
+      public readonly long? ContentLength;
     }
   }
 }

@@ -3,7 +3,6 @@ using System.IO;
 using System.IO.Compression;
 using System.Net;
 using System.Net.Mime;
-using System.Text;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
@@ -54,30 +53,32 @@ namespace JetBrains.CachingProxy.Tests
             .MapGet("gzipEncoding.txt", (req, res, data) =>
             {
               res.Headers[HeaderNames.ContentEncoding] = "gzip";
-              var textContent = Encoding.UTF8.GetBytes("my content string");
+              var textContent = "my content string"u8;
 
               using var mso = new MemoryStream();
 
               using (var gs = new GZipStream(mso, CompressionMode.Compress))
-                new MemoryStream(textContent).CopyTo(gs);
+                gs.Write(textContent);
 
-              var buffer = mso.ToArray();
+              if (mso.TryGetBuffer(out var buffer))
+                return res.Body.WriteAsync(buffer).AsTask();
 
-              return res.Body.WriteAsync(buffer, 0, buffer.Length);
+              return Task.CompletedTask;
             })
             .MapVerb("HEAD", "gzipEncoding.txt", (req, res, data) =>
             {
               res.Headers[HeaderNames.ContentEncoding] = "gzip";
-              var textContent = Encoding.UTF8.GetBytes("my content string");
+              var textContent = "my content string"u8;
 
               using var mso = new MemoryStream();
 
               using (var gs = new GZipStream(mso, CompressionMode.Compress))
-                new MemoryStream(textContent).CopyTo(gs);
+                gs.Write(textContent);
 
-              var buffer = mso.ToArray();
-
-              res.Headers["Content-Length"] = buffer.Length.ToString();
+              if (mso.TryGetBuffer(out var buffer))
+              {
+                res.Headers["Content-Length"] = buffer.Count.ToString();
+              }
               return Task.CompletedTask;
             })
             .MapGet("fakeBrEncoding.txt", (req, res, data) =>
@@ -108,9 +109,6 @@ namespace JetBrains.CachingProxy.Tests
         .Start();
     }
 
-    public void Dispose()
-    {
-      myWebHost.Dispose();
-    }
+    public void Dispose() => myWebHost.Dispose();
   }
 }

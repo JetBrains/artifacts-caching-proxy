@@ -1,14 +1,13 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using JetBrains.Annotations;
 using Microsoft.AspNetCore.Http;
 
 namespace JetBrains.CachingProxy
 {
   public class RemoteServers
   {
-    private readonly List<RemoteServer> myServers = new List<RemoteServer>();
+    private readonly List<RemoteServer> myServers = new();
 
     public RemoteServers(IEnumerable<string> prefixes, ICollection<string> contentTypeValidationPrefixes)
     {
@@ -23,14 +22,14 @@ namespace JetBrains.CachingProxy
         var trimmed = prefix.Trim('/');
         if (trimmed.Length == 0) throw new ArgumentException("Prefix is empty: " + prefix);
 
-        var index = trimmed.IndexOf("=", StringComparison.Ordinal);
-        var trimmedPrefix = index < 0 ? $"/{trimmed}" : $"/{trimmed.Substring(0, index)}";
+        var index = trimmed.IndexOf('=');
+        var trimmedPrefix = index < 0 ? $"/{trimmed}" : $"/{trimmed[..index]}";
         trimmedPrefixes.Add(trimmedPrefix);
 
         var validateContentType = contentTypeValidationPrefixes.Contains(trimmedPrefix);
         myServers.Add(index < 0
           ? new RemoteServer(new PathString(trimmedPrefix), new Uri("https://" + trimmed + "/"), validateContentType)
-          : new RemoteServer(new PathString(trimmedPrefix), new Uri(trimmed.Substring(index + 1).TrimEnd('/')), validateContentType));
+          : new RemoteServer(new PathString(trimmedPrefix), new Uri(trimmed[(index + 1)..].TrimEnd('/')), validateContentType));
       }
 
       foreach (var contentTypeValidationPrefix in contentTypeValidationPrefixes)
@@ -41,8 +40,7 @@ namespace JetBrains.CachingProxy
       }
     }
 
-    [CanBeNull]
-    public RemoteServer LookupRemoteServer(PathString url, out PathString remainingPart)
+    public RemoteServer? LookupRemoteServer(PathString url, out PathString remainingPart)
     {
       foreach (var server in myServers)
       {

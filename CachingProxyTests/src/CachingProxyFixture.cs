@@ -1,15 +1,11 @@
 using System;
 
-namespace JetBrains.CachingProxy.Tests
-{
-  // ReSharper disable once ClassNeverInstantiated.Global
-  public class CachingProxyFixture : IDisposable
-  {
-    public readonly RealTestServer RealTestServer = new RealTestServer();
+namespace JetBrains.CachingProxy.Tests;
 
-    public void Dispose()
-    {
-      RealTestServer.Dispose();
-    }
-  }
+// ReSharper disable once ClassNeverInstantiated.Global
+public class CachingProxyFixture : IDisposable
+{
+  public readonly RealTestServer RealTestServer = new();
+
+  public void Dispose() => RealTestServer.Dispose();
 }
