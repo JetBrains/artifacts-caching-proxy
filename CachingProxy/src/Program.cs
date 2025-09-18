@@ -44,7 +44,6 @@ public static class Program
         .AddRuntimeInstrumentation()
         .AddMeter(CachingProxyMetrics.MeterName)
         .AddPrometheusExporter()
-        .AddConsoleExporter()
         .AddOtlpExporter()
       );
 
