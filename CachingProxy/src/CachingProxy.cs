@@ -104,9 +104,12 @@ namespace JetBrains.CachingProxy
         var availableFreeSpaceMb = new DriveInfo(myLocalCachePath).AvailableFreeSpace / (1024 * 1024);
         if (availableFreeSpaceMb < myMinimumFreeDiskSpaceMb)
         {
+          myLogger.LogError(
+            "Not Enough Free Disk Space. {AvailableFreeSpaceMb} MB is free at {LocalCachePath}, but minimum is {MinimumFreeDiskSpaceMb} MB",
+            availableFreeSpaceMb, myLocalCachePath, myMinimumFreeDiskSpaceMb);
           context.Response.StatusCode = StatusCodes.Status500InternalServerError;
-          await context.Response.WriteAsync($"Not Enough Free Disk Space. {availableFreeSpaceMb} MB is free at {myLocalCachePath}, " +
-                                            $"but minimum is {myMinimumFreeDiskSpaceMb} MB");
+          await context.Response.WriteAsync(
+            $"Not Enough Free Disk Space. {availableFreeSpaceMb} MB is free at {myLocalCachePath}, but minimum is {myMinimumFreeDiskSpaceMb} MB");
           return;
         }
 
@@ -238,7 +241,8 @@ namespace JetBrains.CachingProxy
         {
           if (responseContentType is MediaTypeNames.Text.Html or MediaTypeNames.Text.Plain)
           {
-            myLogger.LogWarning("{UpstreamUri} returned content type '{ResponseContentType}' which is possibly wrong for file extension '{RequestPathExtension}'",
+            myLogger.Log(remoteServer.ValidateContentTypes ? LogLevel.Error : LogLevel.Warning,
+              "{UpstreamUri} returned content type '{ResponseContentType}' which is possibly wrong for file extension '{RequestPathExtension}'",
               upstreamUri, responseContentType, requestPathExtension);
 
             if (remoteServer.ValidateContentTypes)
@@ -263,6 +267,8 @@ namespace JetBrains.CachingProxy
         var headersContentEncoding = response.Content.Headers.ContentEncoding;
         if (headersContentEncoding.Count > 1)
         {
+          myLogger.LogError("{UpstreamUri} returned multiple Content-Encoding which is not allowed: {ContentEncoding}",
+            upstreamUri, string.Join(", ", headersContentEncoding));
           // return 503 Service Unavailable, since the client will most likely not retry it with 5xx error codes
           context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
           context.Response.ContentType = MediaTypeNames.Text.Plain;
@@ -274,6 +280,8 @@ namespace JetBrains.CachingProxy
         var contentEncoding = headersContentEncoding.Count == 0 ? null : headersContentEncoding.Single();
         if (contentEncoding != null && contentEncoding != "gzip")
         {
+          myLogger.LogError("{UpstreamUri} returned Content-Encoding '{ContentEncoding}' which is not supported",
+            upstreamUri, contentEncoding);
           // return 503 Service Unavailable, since the client will most likely not retry it with 5xx error codes
           context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
           context.Response.ContentType = MediaTypeNames.Text.Plain;
