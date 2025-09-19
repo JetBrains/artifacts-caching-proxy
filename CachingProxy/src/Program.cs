@@ -40,7 +40,6 @@ public static class Program
       .ConfigureResource(resource => resource.AddService(builder.Environment.ApplicationName))
       .WithMetrics(metrics => metrics
         .AddAspNetCoreInstrumentation()
-        .AddHttpClientInstrumentation()
         .AddRuntimeInstrumentation()
         .AddMeter(CachingProxyMetrics.MeterName)
         .AddPrometheusExporter()
