@@ -1,5 +1,7 @@
 using System;
 using System.Buffers;
+using System.Collections.Frozen;
+using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Linq;
@@ -95,6 +97,16 @@ namespace JetBrains.CachingProxy
         ? new Regex(config.Value.RedirectToRemoteUrlsRegex, RegexOptions.Compiled)
         : null;
     }
+
+    private static readonly FrozenSet<string> ourAllowedTextFileExtensions =
+      FrozenSet.Create(StringComparer.OrdinalIgnoreCase,
+        ".htm",
+        ".html",
+        ".txt",
+        ".sha1",
+        ".sha256",
+        ".sha512",
+        ".md5");
 
     [SuppressMessage("ReSharper", "UnusedMember.Global")]
     public async Task InvokeAsync(HttpContext context)
@@ -229,15 +241,10 @@ namespace JetBrains.CachingProxy
           return;
         }
 
-        // If content type validation is enabled, only .html, .htm, .txt, .sha1, .md5 files may have text/* content type
-        // This prevents, e.g. caching of error pages with 200 OK code (jcenter)
+        // If content type validation is enabled, only specified files may have text/* content type
+        // This prevents, e.g., caching of error pages with 200 OK code (jcenter)
         var responseContentType = response.Content.Headers.ContentType?.MediaType;
-        if (requestPathExtension != ".html" &&
-            requestPathExtension != ".txt" &&
-            requestPathExtension != ".htm" &&
-            requestPathExtension != ".sha256" &&
-            requestPathExtension != ".sha1" &&
-            requestPathExtension != ".md5")
+        if (!ourAllowedTextFileExtensions.Contains(requestPathExtension))
         {
           if (responseContentType is MediaTypeNames.Text.Html or MediaTypeNames.Text.Plain)
           {
