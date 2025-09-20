@@ -1,7 +1,6 @@
 using System;
 using System.Buffers;
 using System.Collections.Frozen;
-using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Linq;
@@ -116,7 +115,7 @@ namespace JetBrains.CachingProxy
         var availableFreeSpaceMb = new DriveInfo(myLocalCachePath).AvailableFreeSpace / (1024 * 1024);
         if (availableFreeSpaceMb < myMinimumFreeDiskSpaceMb)
         {
-          myLogger.LogError(
+          myLogger.LogError(Event.NotEnoughFreeDiskSpace,
             "Not Enough Free Disk Space. {AvailableFreeSpaceMb} MB is free at {LocalCachePath}, but minimum is {MinimumFreeDiskSpaceMb} MB",
             availableFreeSpaceMb, myLocalCachePath, myMinimumFreeDiskSpaceMb);
           context.Response.StatusCode = StatusCodes.Status500InternalServerError;
@@ -212,7 +211,7 @@ namespace JetBrains.CachingProxy
 
         // Canceled by internal token means timeout
 
-        myLogger.LogWarning("Timeout requesting {UpstreamUri}", upstreamUri);
+        myLogger.LogWarning(Event.Timeout, "Timeout requesting {UpstreamUri}", upstreamUri);
 
         var entry = myResponseCache.PutStatusCode(requestPath, HttpStatusCode.GatewayTimeout, lastModified: null, contentType: null, contentEncoding: null, contentLength: null);
 
@@ -248,7 +247,7 @@ namespace JetBrains.CachingProxy
         {
           if (responseContentType is MediaTypeNames.Text.Html or MediaTypeNames.Text.Plain)
           {
-            myLogger.Log(remoteServer.ValidateContentTypes ? LogLevel.Error : LogLevel.Warning,
+            myLogger.Log(remoteServer.ValidateContentTypes ? LogLevel.Error : LogLevel.Warning, Event.NotAllowedContentType,
               "{UpstreamUri} returned content type '{ResponseContentType}' which is possibly wrong for file extension '{RequestPathExtension}'",
               upstreamUri, responseContentType, requestPathExtension);
 
@@ -274,7 +273,7 @@ namespace JetBrains.CachingProxy
         var headersContentEncoding = response.Content.Headers.ContentEncoding;
         if (headersContentEncoding.Count > 1)
         {
-          myLogger.LogError("{UpstreamUri} returned multiple Content-Encoding which is not allowed: {ContentEncoding}",
+          myLogger.LogError(Event.MultipleContentTypes, "{UpstreamUri} returned multiple Content-Encoding which is not allowed: {ContentEncoding}",
             upstreamUri, string.Join(", ", headersContentEncoding));
           // return 503 Service Unavailable, since the client will most likely not retry it with 5xx error codes
           context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
@@ -287,7 +286,7 @@ namespace JetBrains.CachingProxy
         var contentEncoding = headersContentEncoding.Count == 0 ? null : headersContentEncoding.Single();
         if (contentEncoding != null && contentEncoding != "gzip")
         {
-          myLogger.LogError("{UpstreamUri} returned Content-Encoding '{ContentEncoding}' which is not supported",
+          myLogger.LogError(Event.NotSupportedContentType, "{UpstreamUri} returned Content-Encoding '{ContentEncoding}' which is not supported",
             upstreamUri, contentEncoding);
           // return 503 Service Unavailable, since the client will most likely not retry it with 5xx error codes
           context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
@@ -343,7 +342,7 @@ namespace JetBrains.CachingProxy
           var tempFileInfo = new FileInfo(tempFile);
           if (contentLength != null && tempFileInfo.Length != contentLength)
           {
-            myLogger.LogWarning("Expected {ContentLength} bytes from Content-Length, but downloaded {Length}: {UpstreamUri}",
+            myLogger.LogWarning(Event.NotMatchedContentLength, "Expected {ContentLength} bytes from Content-Length, but downloaded {Length}: {UpstreamUri}",
               contentLength, tempFileInfo.Length, upstreamUri);
             context.Abort();
             return;
