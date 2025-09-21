@@ -105,7 +105,8 @@ namespace JetBrains.CachingProxy
         ".sha1",
         ".sha256",
         ".sha512",
-        ".md5");
+        ".md5",
+        ".module");
 
     [SuppressMessage("ReSharper", "UnusedMember.Global")]
     public async Task InvokeAsync(HttpContext context)
