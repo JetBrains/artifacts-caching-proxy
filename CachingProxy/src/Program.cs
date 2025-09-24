@@ -63,7 +63,9 @@ public static class Program
   public static void ConfigureOurServices(IServiceCollection services)
   {
     services
+      .AddMemoryCache()
       .AddSingleton<CachingProxyMetrics>()
+      .AddSingleton<ResponseCache>()
       .AddHttpClient<ProxyHttpClient>((provider, client) =>
       {
         var config = provider.GetRequiredService<IOptions<CachingProxyConfig>>().Value;

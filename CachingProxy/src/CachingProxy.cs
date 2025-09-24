@@ -27,13 +27,13 @@ namespace JetBrains.CachingProxy
     private const int BUFFER_SIZE = 81920;
 
     [GeneratedRegex(@"^([\x20a-zA-Z_\-0-9./+@]|%20)+$", RegexOptions.Compiled)]
-    private partial Regex OurGoodPathChars { get; }
+    private static partial Regex OurGoodPathChars { get; }
     private static readonly StringValues ourEternalCachingHeader =
       new CacheControlHeaderValue { Public = true, MaxAge = TimeSpan.FromDays(365) }.ToString();
 
     private readonly Regex? myBlacklistRegex;
     private readonly Regex? myRedirectToRemoteUrlsRegex;
-    private readonly ResponseCache myResponseCache = new();
+    private readonly ResponseCache myResponseCache;
     private readonly ILogger myLogger;
     private readonly FileExtensionContentTypeProvider myContentTypeProvider;
     private readonly RequestDelegate myNext;
@@ -47,7 +47,7 @@ namespace JetBrains.CachingProxy
     private readonly long myMinimumFreeDiskSpaceMb;
 
     public CachingProxy(RequestDelegate next, IWebHostEnvironment hostingEnv, CachingProxyMetrics metrics,
-      ILoggerFactory loggerFactory, IOptions<CachingProxyConfig> config, ProxyHttpClient httpClient)
+      ILoggerFactory loggerFactory, IOptions<CachingProxyConfig> config, ProxyHttpClient httpClient, ResponseCache responseCache)
     {
       myLogger = loggerFactory.CreateLogger<CachingProxy>();
       myLogger.LogInformation("Initialising. Config:\n{CachingProxyConfig}", config.Value);
@@ -55,6 +55,7 @@ namespace JetBrains.CachingProxy
       myNext = next;
       myMetrics = metrics;
       myHttpClient = httpClient;
+      myResponseCache = responseCache;
 
       myMinimumFreeDiskSpaceMb = config.Value.MinimumFreeDiskSpaceMb;
       myLocalCachePath = config.Value.LocalCachePath;
