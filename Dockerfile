@@ -5,6 +5,7 @@ WORKDIR /app
 
 # Copy csproj and restore as distinct layers
 COPY CachingProxy/*.csproj ./
+COPY Directory.Packages.props ./
 RUN dotnet restore
 
 # Copy everything else and build
