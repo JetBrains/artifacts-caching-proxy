@@ -15,7 +15,7 @@ public class ResponseCache(IMemoryCache cache)
     var entry = new Entry(statusCode, lastModified, contentType, contentEncoding, contentLength);
     return cache.Set(cacheKey, entry, new MemoryCacheEntryOptions
     {
-      SlidingExpiration = entry.GetCacheTimeSpan(),
+      AbsoluteExpirationRelativeToNow = entry.GetCacheTimeSpan(),
     });
   }
 
