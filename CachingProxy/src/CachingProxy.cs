@@ -235,7 +235,10 @@ namespace JetBrains.CachingProxy
       {
         if (!response.IsSuccessStatusCode)
         {
-          myLogger.LogWarning(Event.NegativeMiss(response.StatusCode), "Non-success requesting {UpstreamUri}: {StatusCode}", upstreamUri, response.StatusCode);
+          if (response.StatusCode != HttpStatusCode.NotFound)
+          {
+            myLogger.LogWarning(Event.NegativeMiss(response.StatusCode), "Non-success requesting {UpstreamUri}: {StatusCode}", upstreamUri, response.StatusCode);
+          }
 
           var entry = myResponseCache.PutStatusCode(requestPath, response.StatusCode, lastModified: null, contentType: null, contentEncoding: null, contentLength: null);
 
