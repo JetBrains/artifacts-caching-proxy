@@ -100,16 +100,15 @@ namespace JetBrains.CachingProxy
 
     private static readonly FrozenSet<string> ourAllowedTextFileExtensions =
       FrozenSet.Create(StringComparer.OrdinalIgnoreCase,
+      [
+        ..CachingProxyConfig.CheckSumExtensions,
         ".htm",
         ".html",
         ".txt",
-        ".sha1",
-        ".sha256",
-        ".sha512",
-        ".md5",
-        ".module");
+        ".module"
+      ]);
 
-    [SuppressMessage("ReSharper", "UnusedMember.Global")]
+  [SuppressMessage("ReSharper", "UnusedMember.Global")]
     public async Task InvokeAsync(HttpContext context)
     {
       if (context.Request.Path == "/health")

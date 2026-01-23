@@ -1,4 +1,6 @@
 using System.IO;
+using System.Linq;
+using System.Text.RegularExpressions;
 
 namespace JetBrains.CachingProxy
 {
@@ -10,7 +12,9 @@ namespace JetBrains.CachingProxy
     public string? BlacklistUrlRegex { get; init; }
     public long MinimumFreeDiskSpaceMb { get; init; } = 2048;
     public long RequestTimeoutSec { get; init; } = 20;
-    public string RedirectToRemoteUrlsRegex { get; init; } = "^(.*-SNAPSHOT.*|.*maven-metadata\\.xml)$";
+    public string RedirectToRemoteUrlsRegex { get; init; } = $"^(.*-SNAPSHOT.*|.*maven-metadata\\.xml({string.Join('|', CheckSumExtensions.Select(Regex.Escape))})?)$";
+
+    public static readonly string[] CheckSumExtensions = [".sha1", ".sha256", ".sha512", ".md5"];
 
     public override string ToString()
     {

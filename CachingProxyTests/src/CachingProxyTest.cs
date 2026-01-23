@@ -360,10 +360,23 @@ namespace JetBrains.CachingProxy.Tests
     {
       await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/maven-metadata.xml",
         HttpStatusCode.TemporaryRedirect,
-        (message, bytes) =>
+        (message, _) =>
         {
           AssertStatusHeader(message, CachingProxyStatus.ALWAYS_REDIRECT);
           Assert.Equal("https://repo1.maven.org/maven2/org/apache/ant/ant-xz/maven-metadata.xml",
+            message.Headers.Location?.ToString());
+        });
+    }
+
+    [Fact]
+    public async Task Always_Redirect_MavenMetadataXmlChecksum()
+    {
+      await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/maven-metadata.xml.sha1",
+        HttpStatusCode.TemporaryRedirect,
+        (message, _) =>
+        {
+          AssertStatusHeader(message, CachingProxyStatus.ALWAYS_REDIRECT);
+          Assert.Equal("https://repo1.maven.org/maven2/org/apache/ant/ant-xz/maven-metadata.xml.sha1",
             message.Headers.Location?.ToString());
         });
     }
