@@ -39,8 +39,22 @@ public static class Program
       .AddOpenTelemetry()
       .ConfigureResource(resource => resource.AddService(builder.Environment.ApplicationName))
       .WithMetrics(metrics => metrics
-        .AddAspNetCoreInstrumentation()
         .AddRuntimeInstrumentation()
+        // explicit configuration of AspNetCoreInstrumentation
+        .AddMeter(
+          "Microsoft.AspNetCore.Hosting",
+          // "Microsoft.AspNetCore.Server.Kestrel",
+          "Microsoft.AspNetCore.Http.Connections",
+          "Microsoft.AspNetCore.Routing",
+          "Microsoft.AspNetCore.Diagnostics",
+          "Microsoft.AspNetCore.RateLimiting",
+          "Microsoft.AspNetCore.Components",
+          "Microsoft.AspNetCore.Components.Server.Circuits",
+          "Microsoft.AspNetCore.Components.Lifecycle",
+          "Microsoft.AspNetCore.Authorization",
+          "Microsoft.AspNetCore.Authentication",
+          "Microsoft.AspNetCore.Identity",
+          "Microsoft.AspNetCore.MemoryPool")
         .AddMeter(CachingProxyMetrics.MeterName)
         .AddPrometheusExporter()
         .AddOtlpExporter()
