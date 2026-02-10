@@ -9,6 +9,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
 using Xunit;
 using Xunit.Abstractions;
@@ -17,14 +18,14 @@ namespace JetBrains.CachingProxy.Tests
 {
   // TODO: Negative caching expiration per status code
   // TODO: Switch to real server in tests
-  public class CachingProxyTest : IDisposable, IClassFixture<CachingProxyFixture>
+  public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer>
   {
     private readonly ITestOutputHelper myOutput;
-    private readonly TestServer myServer;
+    private readonly IHost myServer;
     private readonly string myTempDirectory;
-    private readonly RealTestServer myRealTestServer;
+    private readonly UpstreamTestServer myUpstreamServer;
 
-    public CachingProxyTest(ITestOutputHelper output, CachingProxyFixture cachingProxyFixture)
+    public CachingProxyTest(ITestOutputHelper output, UpstreamTestServer upstreamServer)
     {
       myOutput = output;
       myTempDirectory = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
@@ -39,7 +40,7 @@ namespace JetBrains.CachingProxy.Tests
           "/198.51.100.9",
           "/plugins.gradle.org/m2",
           "/unknown_host.xyz",
-          $"/real={RealTestServer.Url}"
+          $"/real={upstreamServer.Url}"
         ],
         ContentTypeValidationPrefixes =
         [
@@ -48,18 +49,22 @@ namespace JetBrains.CachingProxy.Tests
         MinimumFreeDiskSpaceMb = 2,
       };
 
-      var builder = new WebHostBuilder()
-        .ConfigureServices(services =>
+      myServer = new HostBuilder()
+        .ConfigureWebHost(webHostBuilder =>
         {
-          services.Add(new ServiceDescriptor(typeof(IOptions<CachingProxyConfig>),
-            new OptionsWrapper<CachingProxyConfig>(config)));
-          Program.ConfigureOurServices(services);
+          webHostBuilder
+            .UseTestServer()
+            .ConfigureTestServices(services =>
+            {
+              services.Add(new ServiceDescriptor(typeof(IOptions<CachingProxyConfig>),
+                new OptionsWrapper<CachingProxyConfig>(config)));
+              Program.ConfigureOurServices(services);
+            })
+            .Configure(app => app.UseMiddleware<CachingProxy>());
         })
-        .Configure(app => { app.UseMiddleware<CachingProxy>(); }
-        );
+        .Build();
 
-      myServer = new TestServer(builder);
-      myRealTestServer = cachingProxyFixture.RealTestServer;
+      myUpstreamServer = upstreamServer;
     }
 
     [Fact]
@@ -212,7 +217,7 @@ namespace JetBrains.CachingProxy.Tests
     {
       await AssertGetResponse("/real/fakeBrEncoding.txt", HttpStatusCode.ServiceUnavailable, (message, bytes) =>
       {
-        Assert.Equal($"{RealTestServer.Url}/fakeBrEncoding.txt returned Content-Encoding 'br' which is not supported", Encoding.UTF8.GetString(bytes));
+        Assert.Equal($"{myUpstreamServer.Url}/fakeBrEncoding.txt returned Content-Encoding 'br' which is not supported", Encoding.UTF8.GetString(bytes));
       });
     }
 
@@ -221,7 +226,7 @@ namespace JetBrains.CachingProxy.Tests
     {
       await AssertGetResponse("/real/fakeMultipleEncodings.txt", HttpStatusCode.ServiceUnavailable, (message, bytes) =>
       {
-        Assert.Equal($"{RealTestServer.Url}/fakeMultipleEncodings.txt returned multiple Content-Encoding which is not allowed: deflate, gzip", Encoding.UTF8.GetString(bytes));
+        Assert.Equal($"{myUpstreamServer.Url}/fakeMultipleEncodings.txt returned multiple Content-Encoding which is not allowed: deflate, gzip", Encoding.UTF8.GetString(bytes));
       });
     }
 
@@ -249,7 +254,7 @@ namespace JetBrains.CachingProxy.Tests
     [Fact]
     public async Task Retry_After_500()
     {
-      myRealTestServer.Conditional500SendErrorOnce = true;
+      myUpstreamServer.Conditional500SendErrorOnce = true;
       await AssertGetResponse("/real/conditional-500.txt", HttpStatusCode.OK, (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.MISS));
     }
 
@@ -313,8 +318,8 @@ namespace JetBrains.CachingProxy.Tests
     {
       const string url = "/repo1.maven.org/maven2/org/apache/ant/ant-xz/1.10.5/ant-xz-1.10.5.jar";
 
-      var response1 = myServer.CreateClient().GetAsync(url);
-      var response2 = myServer.CreateClient().GetAsync(url);
+      using var response1 = myServer.GetTestClient().GetAsync(url);
+      using var response2 = myServer.GetTestClient().GetAsync(url);
 
       var result = await Task.WhenAll(response1, response2);
 
@@ -493,7 +498,7 @@ namespace JetBrains.CachingProxy.Tests
         (message, bytes) =>
         {
           var text = Encoding.UTF8.GetString(bytes);
-          Assert.Equal($"{RealTestServer.Url}/wrong-content-type.jar returned content type 'text/html' which is forbidden by content type validation for file extension '.jar'", text);
+          Assert.Equal($"{myUpstreamServer.Url}/wrong-content-type.jar returned content type 'text/html' which is forbidden by content type validation for file extension '.jar'", text);
         });
     }
 
@@ -508,7 +513,7 @@ namespace JetBrains.CachingProxy.Tests
       Action<HttpResponseMessage, byte[]> assertions)
     {
       myOutput.WriteLine("*** GET " + url);
-      using var response = await myServer.CreateClient().GetAsync(url);
+      using var response = await myServer.GetTestClient().GetAsync(url);
       var bytes = await response.Content.ReadAsByteArrayAsync();
 
       myOutput.WriteLine(response.ToString());
@@ -523,7 +528,7 @@ namespace JetBrains.CachingProxy.Tests
       Action<HttpResponseMessage> assertions)
     {
       myOutput.WriteLine("*** HEAD " + url);
-      using var response = await myServer.CreateClient().SendAsync(
+      using var response = await myServer.GetTestClient().SendAsync(
         new HttpRequestMessage(HttpMethod.Head, url), HttpCompletionOption.ResponseContentRead);
       myOutput.WriteLine(response.ToString());
       Assert.Equal(expectedCode, response.StatusCode);
@@ -564,9 +569,14 @@ namespace JetBrains.CachingProxy.Tests
       return string.Join("", hash.Select(b => b.ToString("x2")).ToArray());
     }
 
-    public void Dispose()
+    Task IAsyncLifetime.InitializeAsync()
     {
-      myServer?.Dispose();
+      return myServer.StartAsync();
+    }
+
+    async Task IAsyncLifetime.DisposeAsync()
+    {
+      await myServer.StopAsync();
       Directory.Delete(myTempDirectory, true);
     }
   }
