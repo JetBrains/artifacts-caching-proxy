@@ -238,6 +238,15 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
+    public async Task Path_With_Percent_Encoded_Slash()
+    {
+      // npm scoped packages use %2f in registry URLs (e.g. @types%2fserve-index)
+      // Kestrel preserves %2f in Request.Path, so use extensionless path to trigger ALWAYS_REDIRECT
+      await AssertGetResponse("/real/@scope%2fpackage", HttpStatusCode.TemporaryRedirect,
+        (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.ALWAYS_REDIRECT));
+    }
+
+    [Fact]
     public async Task Retry_After_500()
     {
       myRealTestServer.Conditional500SendErrorOnce = true;

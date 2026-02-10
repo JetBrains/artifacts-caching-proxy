@@ -26,7 +26,7 @@ namespace JetBrains.CachingProxy
   {
     private const int BUFFER_SIZE = 81920;
 
-    [GeneratedRegex(@"^([\x20a-zA-Z_\-0-9./+@]|%20)+$", RegexOptions.Compiled)]
+    [GeneratedRegex(@"^([\x20a-zA-Z_\-0-9./+@]|%[0-9a-fA-F]{2})+$", RegexOptions.Compiled)]
     private static partial Regex OurGoodPathChars { get; }
     private static readonly StringValues ourEternalCachingHeader =
       new CacheControlHeaderValue { Public = true, MaxAge = TimeSpan.FromDays(365) }.ToString();
