@@ -1,4 +1,6 @@
 ﻿using System;
+using System.Net.Http.Headers;
+using System.Reflection;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
@@ -14,6 +16,16 @@ namespace JetBrains.CachingProxy;
 
 public static class Program
 {
+  private static readonly ProductInfoHeaderValue ourUserAgent;
+
+  static Program()
+  {
+    var executingAssembly = Assembly.GetExecutingAssembly();
+    var name = executingAssembly.GetCustomAttribute<AssemblyProductAttribute>()?.Product ?? executingAssembly.GetName().Name!;
+    var version = executingAssembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion ?? executingAssembly.GetName().Version?.ToString();
+    ourUserAgent = new ProductInfoHeaderValue(name, version);
+  }
+
   public static Task Main(string[] args)
   {
     var builder = WebApplication.CreateBuilder(args);
@@ -80,18 +92,31 @@ public static class Program
       .AddMemoryCache()
       .AddSingleton<CachingProxyMetrics>()
       .AddSingleton<ResponseCache>()
-      .AddHttpClient<ProxyHttpClient>((provider, client) =>
+      .AddHttpClient<ProxyHttpClient>(static (provider, client) =>
       {
         var config = provider.GetRequiredService<IOptions<CachingProxyConfig>>().Value;
         client.Timeout = TimeSpan.FromSeconds(config.RequestTimeoutSec);
+        var userAgentHeader = client.DefaultRequestHeaders.UserAgent;
+        userAgentHeader.Add(ourUserAgent);
+        if (config.UserAgentComment is { Length: >0 } userAgentComment)
+        {
+          try
+          {
+            userAgentHeader.Add(new ProductInfoHeaderValue(userAgentComment));
+          }
+          catch (FormatException ex)
+          {
+            provider.GetService<ILogger>()?.LogError(ex, "An error occurred while parsing the user-agent comment.");
+          }
+        }
       })
-      .UseSocketsHttpHandler((handler, _) =>
+      .UseSocketsHttpHandler(static (handler, _) =>
       {
         // force reconnection (and DNS re-resolve) every two minutes
         handler.PooledConnectionLifetime = TimeSpan.FromMinutes(2);
         handler.UseCookies = false;
       })
-      .AddTransientHttpErrorPolicy(policyBuilder => policyBuilder.WaitAndRetryAsync(
+      .AddTransientHttpErrorPolicy(static policyBuilder => policyBuilder.WaitAndRetryAsync(
         4, retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt - 1))));
   }
 }

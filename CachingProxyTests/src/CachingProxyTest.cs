@@ -1,8 +1,10 @@
 using System;
+using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Reflection;
 using System.Text;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Builder;
@@ -18,12 +20,15 @@ namespace JetBrains.CachingProxy.Tests
 {
   // TODO: Negative caching expiration per status code
   // TODO: Switch to real server in tests
+  [SuppressMessage("ReSharper", "UnusedParameter.Local")]
   public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer>
   {
     private readonly ITestOutputHelper myOutput;
-    private readonly IHost myServer;
+    private readonly IHost myHost;
+    private readonly TestServer myServer;
     private readonly string myTempDirectory;
     private readonly UpstreamTestServer myUpstreamServer;
+    private readonly CachingProxyConfig myConfig;
 
     public CachingProxyTest(ITestOutputHelper output, UpstreamTestServer upstreamServer)
     {
@@ -31,7 +36,7 @@ namespace JetBrains.CachingProxy.Tests
       myTempDirectory = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
       Directory.CreateDirectory(myTempDirectory);
 
-      var config = new CachingProxyConfig
+      myConfig = new CachingProxyConfig
       {
         LocalCachePath = myTempDirectory,
         Prefixes =
@@ -43,9 +48,10 @@ namespace JetBrains.CachingProxy.Tests
           $"/real={upstreamServer.Url}"
         ],
         MinimumFreeDiskSpaceMb = 2,
+        UserAgentComment = "(+mailto:cache-redirector@jetbrains.com)"
       };
 
-      myServer = new HostBuilder()
+      myHost = new HostBuilder()
         .ConfigureWebHost(webHostBuilder =>
         {
           webHostBuilder
@@ -53,12 +59,13 @@ namespace JetBrains.CachingProxy.Tests
             .ConfigureTestServices(services =>
             {
               services.Add(new ServiceDescriptor(typeof(IOptions<CachingProxyConfig>),
-                new OptionsWrapper<CachingProxyConfig>(config)));
+                new OptionsWrapper<CachingProxyConfig>(myConfig)));
               Program.ConfigureOurServices(services);
             })
             .Configure(app => app.UseMiddleware<CachingProxy>());
         })
         .Build();
+      myServer = myHost.GetTestServer();
 
       myUpstreamServer = upstreamServer;
     }
@@ -314,8 +321,8 @@ namespace JetBrains.CachingProxy.Tests
     {
       const string url = "/repo1.maven.org/maven2/org/apache/ant/ant-xz/1.10.5/ant-xz-1.10.5.jar";
 
-      using var response1 = myServer.GetTestClient().GetAsync(url);
-      using var response2 = myServer.GetTestClient().GetAsync(url);
+      using var response1 = myServer.CreateRequest(url).GetAsync();
+      using var response2 = myServer.CreateRequest(url).GetAsync();
 
       var result = await Task.WhenAll(response1, response2);
 
@@ -494,11 +501,20 @@ namespace JetBrains.CachingProxy.Tests
         (message, bytes) => { AssertNoStatusHeader(message); });
     }
 
-    private async Task AssertGetResponse(string url, HttpStatusCode expectedCode,
-      Action<HttpResponseMessage, byte[]> assertions)
+    [Fact]
+    public async Task UserAgent()
+    {
+      await myServer.CreateRequest("/real/a.html").GetAsync();
+      var agent = myUpstreamServer.LastUserAgent;
+      myOutput.WriteLine("*** UserAgent: " + agent);
+      Assert.StartsWith(typeof(ProxyHttpClient).Assembly.GetCustomAttribute<AssemblyProductAttribute>()!.Product, agent);
+      Assert.EndsWith(myConfig.UserAgentComment, agent);
+    }
+
+    private async Task AssertGetResponse(string url, HttpStatusCode expectedCode, Action<HttpResponseMessage, byte[]> assertions)
     {
       myOutput.WriteLine("*** GET " + url);
-      using var response = await myServer.GetTestClient().GetAsync(url);
+      using var response = await myServer.CreateRequest(url).GetAsync();
       var bytes = await response.Content.ReadAsByteArrayAsync();
 
       myOutput.WriteLine(response.ToString());
@@ -509,12 +525,10 @@ namespace JetBrains.CachingProxy.Tests
       assertions(response, bytes);
     }
 
-    private async Task AssertHeadResponse(string url, HttpStatusCode expectedCode,
-      Action<HttpResponseMessage> assertions)
+    private async Task AssertHeadResponse(string url, HttpStatusCode expectedCode, Action<HttpResponseMessage> assertions)
     {
       myOutput.WriteLine("*** HEAD " + url);
-      using var response = await myServer.GetTestClient().SendAsync(
-        new HttpRequestMessage(HttpMethod.Head, url), HttpCompletionOption.ResponseContentRead);
+      using var response = await myServer.CreateRequest(url).SendAsync(HttpMethod.Head.Method);
       myOutput.WriteLine(response.ToString());
       Assert.Equal(expectedCode, response.StatusCode);
       assertions(response);
@@ -550,18 +564,15 @@ namespace JetBrains.CachingProxy.Tests
     // ReSharper disable once InconsistentNaming
     private static string SHA256(byte[] input)
     {
-      var hash = System.Security.Cryptography.SHA256.Create().ComputeHash(input);
+      var hash = System.Security.Cryptography.SHA256.HashData(input);
       return string.Join("", hash.Select(b => b.ToString("x2")).ToArray());
     }
 
-    Task IAsyncLifetime.InitializeAsync()
-    {
-      return myServer.StartAsync();
-    }
+    Task IAsyncLifetime.InitializeAsync() => myHost.StartAsync();
 
     async Task IAsyncLifetime.DisposeAsync()
     {
-      await myServer.StopAsync();
+      await myHost.StopAsync();
       Directory.Delete(myTempDirectory, true);
     }
   }

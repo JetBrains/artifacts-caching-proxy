@@ -15,6 +15,8 @@ namespace JetBrains.CachingProxy
 
     public static readonly string[] CheckSumExtensions = [".sha1", ".sha256", ".sha512", ".md5"];
 
+    public string? UserAgentComment { get; init; }
+
     public override string ToString()
     {
       return $"{nameof(Prefixes)}: {string.Join(", ", Prefixes)},\n" +
@@ -22,6 +24,7 @@ namespace JetBrains.CachingProxy
              $"{nameof(BlacklistUrlRegex)}: {BlacklistUrlRegex},\n" +
              $"{nameof(MinimumFreeDiskSpaceMb)}: {MinimumFreeDiskSpaceMb},\n" +
              $"{nameof(RequestTimeoutSec)}: {RequestTimeoutSec},\n" +
+             $"{nameof(UserAgentComment)}: {UserAgentComment},\n" +
              $"{nameof(RedirectToRemoteUrlsRegex)}: {RedirectToRemoteUrlsRegex}";
     }
   }

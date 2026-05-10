@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
@@ -15,12 +16,15 @@ using Xunit;
 
 namespace JetBrains.CachingProxy.Tests;
 
-// ReSharper disable once ClassNeverInstantiated.Global
+[SuppressMessage("ReSharper", "UnusedParameter.Local")]
+[SuppressMessage("ReSharper", "ClassNeverInstantiated.Global")]
 public class UpstreamTestServer : IAsyncLifetime
 {
   public string Url => myWebApp
     .Services.GetRequiredService<IServer>()
     .Features.Get<IServerAddressesFeature>().Addresses.Single();
+
+  public string LastUserAgent { get; private set; }
 
   private readonly WebApplication myWebApp;
   public volatile bool Conditional500SendErrorOnce;
@@ -31,7 +35,13 @@ public class UpstreamTestServer : IAsyncLifetime
     builder.WebHost.UseKestrel(options => options.Listen(IPAddress.Loopback, 0));
     myWebApp = builder.Build();
 
-    myWebApp.UseRouter(router => router
+    myWebApp
+      .Use((context, next) =>
+      {
+        LastUserAgent = context.Request.Headers.UserAgent.ToString();
+        return next(context);
+      })
+      .UseRouter(router => router
       .MapGet("conditional-500.txt", (req, res, data) =>
       {
         if (Conditional500SendErrorOnce)
@@ -82,6 +92,7 @@ public class UpstreamTestServer : IAsyncLifetime
         {
           res.Headers.ContentLength = buffer.Count;
         }
+
         return Task.CompletedTask;
       })
       .MapGet("fakeBrEncoding.txt", (req, res, data) =>
