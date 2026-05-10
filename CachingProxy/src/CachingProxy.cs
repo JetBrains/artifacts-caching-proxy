@@ -1,6 +1,5 @@
 using System;
 using System.Buffers;
-using System.Collections.Frozen;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Linq;
@@ -64,7 +63,7 @@ namespace JetBrains.CachingProxy
       if (!Directory.Exists(myLocalCachePath))
         throw new ArgumentException("LocalCachePath doesn't exist: " + myLocalCachePath);
 
-      myRemoteServers = new RemoteServers(config.Value.Prefixes.ToList(), config.Value.ContentTypeValidationPrefixes.ToList());
+      myRemoteServers = new RemoteServers(config.Value.Prefixes.ToList());
 
       myContentTypeProvider = new FileExtensionContentTypeProvider();
       myCacheFileProvider = new CacheFileProvider(myLocalCachePath);
@@ -97,16 +96,6 @@ namespace JetBrains.CachingProxy
         ? new Regex(config.Value.RedirectToRemoteUrlsRegex, RegexOptions.Compiled)
         : null;
     }
-
-    private static readonly FrozenSet<string> ourAllowedTextFileExtensions =
-      FrozenSet.Create(StringComparer.OrdinalIgnoreCase,
-      [
-        ..CachingProxyConfig.CheckSumExtensions,
-        ".htm",
-        ".html",
-        ".txt",
-        ".module"
-      ]);
 
   [SuppressMessage("ReSharper", "UnusedMember.Global")]
     public async Task InvokeAsync(HttpContext context)
@@ -244,29 +233,6 @@ namespace JetBrains.CachingProxy
           SetCachedResponseHeader(context, entry);
           await SetStatus(context, CachingProxyStatus.NEGATIVE_MISS, HttpStatusCode.NotFound);
           return;
-        }
-
-        // If content type validation is enabled, only specified files may have text/* content type
-        // This prevents, e.g., caching of error pages with 200 OK code (jcenter)
-        var responseContentType = response.Content.Headers.ContentType?.MediaType;
-        if (!ourAllowedTextFileExtensions.Contains(requestPathExtension))
-        {
-          if (responseContentType is MediaTypeNames.Text.Html or MediaTypeNames.Text.Plain)
-          {
-            myLogger.Log(remoteServer.ValidateContentTypes ? LogLevel.Error : LogLevel.Warning, Event.NotAllowedContentType,
-              "{UpstreamUri} returned content type '{ResponseContentType}' which is possibly wrong for file extension '{RequestPathExtension}'",
-              upstreamUri, responseContentType, requestPathExtension);
-
-            if (remoteServer.ValidateContentTypes)
-            {
-              // return 503 Service Unavailable, since the client will most likely not retry it with 5xx error codes
-              context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
-              context.Response.ContentType = MediaTypeNames.Text.Plain;
-              await context.Response.WriteAsync(
-                $"{upstreamUri} returned content type '{responseContentType}' which is forbidden by content type validation for file extension '{requestPathExtension}'");
-              return;
-            }
-          }
         }
 
         var contentLength = response.Content.Headers.ContentLength;

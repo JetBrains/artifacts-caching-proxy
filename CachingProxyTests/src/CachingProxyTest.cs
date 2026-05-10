@@ -42,10 +42,6 @@ namespace JetBrains.CachingProxy.Tests
           "/unknown_host.xyz",
           $"/real={upstreamServer.Url}"
         ],
-        ContentTypeValidationPrefixes =
-        [
-          "/real"
-        ],
         MinimumFreeDiskSpaceMb = 2,
       };
 
@@ -488,17 +484,6 @@ namespace JetBrains.CachingProxy.Tests
           AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_HIT);
           AssertCachedStatusHeader(message, HttpStatusCode.InternalServerError);
           Assert.Null(message.Headers.CacheControl);
-        });
-    }
-
-    [Fact]
-    public async Task Remote_WrongContentType()
-    {
-      await AssertGetResponse("/real/wrong-content-type.jar", HttpStatusCode.ServiceUnavailable,
-        (message, bytes) =>
-        {
-          var text = Encoding.UTF8.GetString(bytes);
-          Assert.Equal($"{myUpstreamServer.Url}/wrong-content-type.jar returned content type 'text/html' which is forbidden by content type validation for file extension '.jar'", text);
         });
     }
 

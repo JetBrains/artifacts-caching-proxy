@@ -7,7 +7,6 @@ namespace JetBrains.CachingProxy
   public class CachingProxyConfig
   {
     public string[] Prefixes { get; init; } = [];
-    public string[] ContentTypeValidationPrefixes { get; init; } = [];
     public string LocalCachePath { get; init; } = Path.Combine(Path.GetTempPath(), "artifacts-caching-proxy");
     public string? BlacklistUrlRegex { get; init; }
     public long MinimumFreeDiskSpaceMb { get; init; } = 2048;
@@ -19,7 +18,6 @@ namespace JetBrains.CachingProxy
     public override string ToString()
     {
       return $"{nameof(Prefixes)}: {string.Join(", ", Prefixes)},\n" +
-             $"{nameof(ContentTypeValidationPrefixes)}: {string.Join(", ", ContentTypeValidationPrefixes)},\n" +
              $"{nameof(LocalCachePath)}: {LocalCachePath},\n" +
              $"{nameof(BlacklistUrlRegex)}: {BlacklistUrlRegex},\n" +
              $"{nameof(MinimumFreeDiskSpaceMb)}: {MinimumFreeDiskSpaceMb},\n" +
