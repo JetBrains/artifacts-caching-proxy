@@ -1,3 +1,4 @@
+using System;
 using System.IO;
 using System.Linq;
 using System.Text.RegularExpressions;
@@ -17,6 +18,9 @@ namespace JetBrains.CachingProxy
 
     public string? UserAgentComment { get; init; }
 
+    public string? CleanupInterval { get; init; }
+    public TimeSpan CleanupPeriod { get; init; } = TimeSpan.FromDays(7);
+
     public override string ToString()
     {
       return $"{nameof(Prefixes)}: {string.Join(", ", Prefixes)},\n" +
@@ -25,7 +29,9 @@ namespace JetBrains.CachingProxy
              $"{nameof(MinimumFreeDiskSpaceMb)}: {MinimumFreeDiskSpaceMb},\n" +
              $"{nameof(RequestTimeoutSec)}: {RequestTimeoutSec},\n" +
              $"{nameof(UserAgentComment)}: {UserAgentComment},\n" +
-             $"{nameof(RedirectToRemoteUrlsRegex)}: {RedirectToRemoteUrlsRegex}";
+             $"{nameof(RedirectToRemoteUrlsRegex)}: {RedirectToRemoteUrlsRegex},\n" +
+             $"{nameof(CleanupInterval)}: {CleanupInterval},\n" +
+             $"{nameof(CleanupPeriod)}: {CleanupPeriod}";
     }
   }
 }

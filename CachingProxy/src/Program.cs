@@ -88,9 +88,12 @@ public static class Program
 
   public static void ConfigureOurServices(IServiceCollection services)
   {
+    var timeProvider = TimeProvider.System;
     services
-      .AddMemoryCache()
+      .AddSingleton(timeProvider)
+      .AddMemoryCache(options => options.Clock = new TimeProviderClock(timeProvider))
       .AddSingleton<CachingProxyMetrics>()
+      .AddHostedService<CleanupService>()
       .AddSingleton<ResponseCache>()
       .AddHttpClient<ProxyHttpClient>(static (provider, client) =>
       {

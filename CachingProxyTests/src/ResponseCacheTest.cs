@@ -1,7 +1,6 @@
 using System;
 using System.Net;
 using Microsoft.Extensions.Caching.Memory;
-using Microsoft.Extensions.Internal;
 using Microsoft.Extensions.Time.Testing;
 using Xunit;
 
@@ -9,12 +8,6 @@ namespace JetBrains.CachingProxy.Tests;
 
 public class ResponseCacheTest
 {
-  // Adapter to bridge FakeTimeProvider to ISystemClock (used by MemoryCache)
-  private class FakeSystemClock(FakeTimeProvider timeProvider) : ISystemClock
-  {
-    public DateTimeOffset UtcNow => timeProvider.GetUtcNow();
-  }
-
   private readonly FakeTimeProvider _timeProvider = new();
   private readonly ResponseCache _cache;
 
@@ -22,7 +15,7 @@ public class ResponseCacheTest
   {
     var memoryCache = new MemoryCache(new MemoryCacheOptions
     {
-      Clock = new FakeSystemClock(_timeProvider)
+      Clock = new TimeProviderClock(_timeProvider)
     });
     _cache = new ResponseCache(memoryCache);
   }

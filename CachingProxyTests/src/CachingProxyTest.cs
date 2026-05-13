@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Linq;
@@ -11,8 +12,10 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Time.Testing;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -29,6 +32,7 @@ namespace JetBrains.CachingProxy.Tests
     private readonly string myTempDirectory;
     private readonly UpstreamTestServer myUpstreamServer;
     private readonly CachingProxyConfig myConfig;
+    private readonly FakeTimeProvider myTimeProvider;
 
     public CachingProxyTest(ITestOutputHelper output, UpstreamTestServer upstreamServer)
     {
@@ -48,9 +52,12 @@ namespace JetBrains.CachingProxy.Tests
           $"/real={upstreamServer.Url}"
         ],
         MinimumFreeDiskSpaceMb = 2,
-        UserAgentComment = "(+mailto:cache-redirector@jetbrains.com)"
+        UserAgentComment = "(+mailto:cache-redirector@jetbrains.com)",
+        CleanupInterval = "* 0 * * *",
+        CleanupPeriod =  TimeSpan.FromDays(1)
       };
 
+      myTimeProvider = new FakeTimeProvider();
       myHost = new HostBuilder()
         .ConfigureWebHost(webHostBuilder =>
         {
@@ -61,6 +68,7 @@ namespace JetBrains.CachingProxy.Tests
               services.Add(new ServiceDescriptor(typeof(IOptions<CachingProxyConfig>),
                 new OptionsWrapper<CachingProxyConfig>(myConfig)));
               Program.ConfigureOurServices(services);
+              services.Replace(ServiceDescriptor.Singleton<TimeProvider>(myTimeProvider));
             })
             .Configure(app => app.UseMiddleware<CachingProxy>());
         })
@@ -509,6 +517,26 @@ namespace JetBrains.CachingProxy.Tests
       myOutput.WriteLine("*** UserAgent: " + agent);
       Assert.StartsWith(typeof(ProxyHttpClient).Assembly.GetCustomAttribute<AssemblyProductAttribute>()!.Product, agent);
       Assert.EndsWith(myConfig.UserAgentComment, agent);
+    }
+
+    [Fact]
+    public async Task CleanupService()
+    {
+      foreach (var directory in Directory.EnumerateDirectories(myConfig.LocalCachePath, "*", SearchOption.TopDirectoryOnly))
+      {
+        Directory.Delete(directory, true);
+      }
+      await myServer.CreateRequest("/real/a.jar").GetAsync();
+      var cachedFile = Assert.Single(GetFiles());
+      File.SetLastAccessTimeUtc(cachedFile, myTimeProvider.Start.UtcDateTime);
+      myTimeProvider.Advance(myConfig.CleanupPeriod / 2);
+      Assert.Single(GetFiles());
+      myTimeProvider.Advance(myConfig.CleanupPeriod / 2 + TimeSpan.FromSeconds(1));
+      await Task.Delay(TimeSpan.FromSeconds(1)); // wait for file deletion
+      Assert.Empty(GetFiles());
+      return;
+      IEnumerable<string> GetFiles() =>
+        Directory.EnumerateFiles(myConfig.LocalCachePath, "*", SearchOption.AllDirectories);
     }
 
     private async Task AssertGetResponse(string url, HttpStatusCode expectedCode, Action<HttpResponseMessage, byte[]> assertions)

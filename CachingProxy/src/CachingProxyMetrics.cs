@@ -11,9 +11,11 @@ public class CachingProxyMetrics
 
   public CachingProxyMetrics(IMeterFactory meterFactory)
   {
-    var meter = meterFactory.Create(MeterName);
-    myRequestsCounter = meter.CreateCounter<long>("caching_requests");
+    Meter = meterFactory.Create(MeterName);
+    myRequestsCounter = Meter.CreateCounter<long>("caching_requests");
   }
+
+  public Meter Meter { get; }
 
   public void IncrementRequests(CachingProxyStatus status)
   {
