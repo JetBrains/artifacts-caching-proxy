@@ -49,7 +49,12 @@ namespace JetBrains.CachingProxy.Tests
           "/198.51.100.9",
           "/plugins.gradle.org/m2",
           "/unknown_host.xyz",
-          $"/real={upstreamServer.Url}"
+          $"/real={upstreamServer.Url}",
+          new CachingProxyPrefix($"/real-custom-ttl={upstreamServer.Url}", new CacheDuration
+          {
+            [HttpStatusCode.OK] = TimeSpan.FromMinutes(30),
+            [HttpStatusCode.NotFound] = TimeSpan.FromMinutes(15),
+          })
         ],
         MinimumFreeDiskSpaceMb = 2,
         UserAgentComment = "(+mailto:cache-redirector@jetbrains.com)",
@@ -520,6 +525,80 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
+    public async Task Custom_Cache_Duration_Prefix_Extends_Head_Positive_Cache()
+    {
+      // Custom OK duration on this prefix is 30 minutes (default for OK is 5 minutes).
+      // HEAD is used because GET would persist the file to disk and StaticFiles would
+      // serve subsequent requests regardless of the in-memory cache state.
+      const string url = "/real-custom-ttl/gzipEncoding.txt";
+      var customOkDuration = TimeSpan.FromMinutes(30);
+
+      await AssertHeadResponse(url, HttpStatusCode.OK,
+        message =>
+        {
+          AssertStatusHeader(message, CachingProxyStatus.MISS);
+          AssertCachedStatusHeader(message, HttpStatusCode.OK);
+          AssertCachedUntilHeader(message, myTimeProvider.GetUtcNow() + customOkDuration);
+        });
+
+      // Past the 5-minute default but still within the custom 30-minute window.
+      myTimeProvider.Advance(TimeSpan.FromMinutes(10));
+      await AssertHeadResponse(url, HttpStatusCode.OK,
+        message =>
+        {
+          AssertStatusHeader(message, CachingProxyStatus.HIT);
+          AssertCachedStatusHeader(message, HttpStatusCode.OK);
+          AssertCachedUntilHeader(message, myTimeProvider.GetUtcNow() + customOkDuration);
+        });
+
+      // Past the 30-minute custom window — entry should be evicted.
+      myTimeProvider.Advance(TimeSpan.FromMinutes(25));
+      await AssertHeadResponse(url, HttpStatusCode.OK,
+        message =>
+        {
+          AssertStatusHeader(message, CachingProxyStatus.MISS);
+          AssertCachedStatusHeader(message, HttpStatusCode.OK);
+          AssertCachedUntilHeader(message, myTimeProvider.GetUtcNow() + customOkDuration);
+        });
+    }
+
+    [Fact]
+    public async Task Custom_Cache_Duration_Prefix_Extends_Negative_Cache()
+    {
+      // Custom NotFound duration on this prefix is 15 minutes (default is 5 minutes).
+      const string url = "/real-custom-ttl/not_found.txt";
+      var customNotFoundDuration = TimeSpan.FromMinutes(15);
+
+      await AssertGetResponse(url, HttpStatusCode.NotFound,
+        (message, bytes) =>
+        {
+          AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_MISS);
+          AssertCachedStatusHeader(message, HttpStatusCode.NotFound);
+          AssertCachedUntilHeader(message, myTimeProvider.GetUtcNow() + customNotFoundDuration);
+        });
+
+      // Past the 5-minute default but within the custom 15-minute window.
+      myTimeProvider.Advance(TimeSpan.FromMinutes(10));
+      await AssertGetResponse(url, HttpStatusCode.NotFound,
+        (message, bytes) =>
+        {
+          AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_HIT);
+          AssertCachedStatusHeader(message, HttpStatusCode.NotFound);
+          AssertCachedUntilHeader(message, myTimeProvider.GetUtcNow() + customNotFoundDuration);
+        });
+
+      // Past the 15-minute custom window — negative cache entry should be evicted.
+      myTimeProvider.Advance(TimeSpan.FromMinutes(10));
+      await AssertGetResponse(url, HttpStatusCode.NotFound,
+        (message, bytes) =>
+        {
+          AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_MISS);
+          AssertCachedStatusHeader(message, HttpStatusCode.NotFound);
+          AssertCachedUntilHeader(message, myTimeProvider.GetUtcNow() + customNotFoundDuration);
+        });
+    }
+
+    [Fact]
     public async Task CleanupService()
     {
       foreach (var directory in Directory.EnumerateDirectories(myConfig.LocalCachePath, "*", SearchOption.TopDirectoryOnly))
@@ -579,6 +658,12 @@ namespace JetBrains.CachingProxy.Tests
     {
       var statusHeader = response.Headers.GetValues(CachingProxyConstants.CachedStatusHeader).FirstOrDefault();
       Assert.Equal(((int) status).ToString(), statusHeader);
+    }
+
+    private static void AssertCachedUntilHeader(HttpResponseMessage response, DateTimeOffset expected)
+    {
+      var untilHeader = response.Headers.GetValues(CachingProxyConstants.CachedUntilHeader).FirstOrDefault();
+      Assert.Equal(expected.ToString("R"), untilHeader);
     }
 
     private static void AssertNoStatusHeader(HttpResponseMessage response)

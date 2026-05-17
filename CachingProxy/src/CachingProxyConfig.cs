@@ -7,7 +7,7 @@ namespace JetBrains.CachingProxy
 {
   public class CachingProxyConfig
   {
-    public string[] Prefixes { get; init; } = [];
+    public CachingProxyPrefix[] Prefixes { get; init; } = [];
     public string LocalCachePath { get; init; } = Path.Combine(Path.GetTempPath(), "artifacts-caching-proxy");
     public string? BlacklistUrlRegex { get; init; }
     public long MinimumFreeDiskSpaceMb { get; init; } = 2048;

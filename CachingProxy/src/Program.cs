@@ -4,6 +4,7 @@ using System.Reflection;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -88,13 +89,15 @@ public static class Program
 
   public static void ConfigureOurServices(IServiceCollection services)
   {
-    var timeProvider = TimeProvider.System;
     services
-      .AddSingleton(timeProvider)
-      .AddMemoryCache(options => options.Clock = new TimeProviderClock(timeProvider))
+      .AddSingleton(TimeProvider.System)
       .AddSingleton<CachingProxyMetrics>()
       .AddHostedService<CleanupService>()
       .AddSingleton<ResponseCache>()
+      .AddMemoryCache()
+      .AddOptions<MemoryCacheOptions>()
+      .Configure<TimeProvider>((options, tp) => options.Clock = new TimeProviderClock(tp));
+    services
       .AddHttpClient<ProxyHttpClient>(static (provider, client) =>
       {
         var config = provider.GetRequiredService<IOptions<CachingProxyConfig>>().Value;

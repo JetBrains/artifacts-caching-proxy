@@ -21,6 +21,7 @@ using Microsoft.Net.Http.Headers;
 
 namespace JetBrains.CachingProxy
 {
+  [SuppressMessage("ReSharper", "UnusedMember.Global")]
   public partial class CachingProxy
   {
     private const int BUFFER_SIZE = 81920;
@@ -37,6 +38,7 @@ namespace JetBrains.CachingProxy
     private readonly FileExtensionContentTypeProvider myContentTypeProvider;
     private readonly RequestDelegate myNext;
     private readonly CachingProxyMetrics myMetrics;
+    private readonly TimeProvider myTimeProvider;
     private readonly ProxyHttpClient myHttpClient;
     private readonly RemoteServers myRemoteServers;
     private readonly StaticFileMiddleware myStaticFileMiddleware;
@@ -45,7 +47,7 @@ namespace JetBrains.CachingProxy
     private readonly string myLocalCachePath;
     private readonly long myMinimumFreeDiskSpaceMb;
 
-    public CachingProxy(RequestDelegate next, IWebHostEnvironment hostingEnv, CachingProxyMetrics metrics,
+    public CachingProxy(RequestDelegate next, IWebHostEnvironment hostingEnv, CachingProxyMetrics metrics, TimeProvider timeProvider,
       ILoggerFactory loggerFactory, IOptions<CachingProxyConfig> config, ProxyHttpClient httpClient, ResponseCache responseCache)
     {
       myLogger = loggerFactory.CreateLogger<CachingProxy>();
@@ -53,6 +55,7 @@ namespace JetBrains.CachingProxy
 
       myNext = next;
       myMetrics = metrics;
+      myTimeProvider = timeProvider;
       myHttpClient = httpClient;
       myResponseCache = responseCache;
 
@@ -203,7 +206,7 @@ namespace JetBrains.CachingProxy
 
         myLogger.LogWarning(Event.Timeout, "Timeout requesting {UpstreamUri}", upstreamUri);
 
-        var entry = myResponseCache.PutStatusCode(requestPath, HttpStatusCode.GatewayTimeout, lastModified: null, contentType: null, contentEncoding: null, contentLength: null);
+        var entry = myResponseCache.PutStatusCode(requestPath, HttpStatusCode.GatewayTimeout, remoteServer.CacheDuration);
 
         SetCachedResponseHeader(context, entry);
         await SetStatus(context, CachingProxyStatus.NEGATIVE_MISS, HttpStatusCode.NotFound);
@@ -213,7 +216,7 @@ namespace JetBrains.CachingProxy
       {
         myLogger.LogWarning(e, "Exception requesting {UpstreamUri}: {Message}", upstreamUri, e.Message);
 
-        var entry = myResponseCache.PutStatusCode(requestPath, HttpStatusCode.ServiceUnavailable, lastModified: null, contentType: null, contentEncoding: null, contentLength: null);
+        var entry = myResponseCache.PutStatusCode(requestPath, HttpStatusCode.ServiceUnavailable, remoteServer.CacheDuration);
         SetCachedResponseHeader(context, entry);
         await SetStatus(context, CachingProxyStatus.NEGATIVE_MISS, HttpStatusCode.NotFound);
         return;
@@ -228,7 +231,7 @@ namespace JetBrains.CachingProxy
             myLogger.LogWarning(Event.NegativeMiss(response.StatusCode), "Non-success requesting {UpstreamUri}: {StatusCode}", upstreamUri, response.StatusCode);
           }
 
-          var entry = myResponseCache.PutStatusCode(requestPath, response.StatusCode, lastModified: null, contentType: null, contentEncoding: null, contentLength: null);
+          var entry = myResponseCache.PutStatusCode(requestPath, response.StatusCode, remoteServer.CacheDuration);
 
           SetCachedResponseHeader(context, entry);
           await SetStatus(context, CachingProxyStatus.NEGATIVE_MISS, HttpStatusCode.NotFound);
@@ -277,7 +280,7 @@ namespace JetBrains.CachingProxy
         if (isHead)
         {
           var entry = myResponseCache.PutStatusCode(
-            requestPath, response.StatusCode,
+            requestPath, response.StatusCode, remoteServer.CacheDuration,
             lastModified: contentLastModified, contentType: contentType, contentEncoding: contentEncoding, contentLength: contentLength);
           SetCachedResponseHeader(context, entry);
           await SetStatus(context, CachingProxyStatus.MISS, HttpStatusCode.OK);
@@ -387,10 +390,10 @@ namespace JetBrains.CachingProxy
       myMetrics.IncrementRequests(status);
     }
 
-    private static void SetCachedResponseHeader(HttpContext context, ResponseCache.Entry entry)
+    private void SetCachedResponseHeader(HttpContext context, ResponseCache.Entry entry)
     {
       context.Response.Headers[CachingProxyConstants.CachedStatusHeader] = ((int) entry.StatusCode).ToString();
-      context.Response.Headers[CachingProxyConstants.CachedUntilHeader] = entry.CacheUntil.ToString("R");
+      context.Response.Headers[CachingProxyConstants.CachedUntilHeader] = (myTimeProvider.GetUtcNow() + entry.GetCacheTimeSpan()) .ToString("R");
 
       // Cache successful responses indefinitely
       // as we assume content won't be changed under a fixed url
