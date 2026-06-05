@@ -65,7 +65,10 @@ namespace JetBrains.CachingProxy
         throw new ArgumentNullException(nameof(myLocalCachePath), "LocalCachePath could not be null");
       if (!Directory.Exists(myLocalCachePath))
       {
-        throw new ArgumentException("LocalCachePath doesn't exist: " + myLocalCachePath);
+        if (myLocalCachePath.StartsWith(Path.GetTempPath()))
+          Directory.CreateDirectory(myLocalCachePath);
+        else
+          throw new ArgumentException("LocalCachePath doesn't exist: " + myLocalCachePath);
       }
 
       myRemoteServers = new RemoteServers([.. config.Value.Prefixes]);
