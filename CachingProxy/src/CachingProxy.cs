@@ -61,12 +61,17 @@ namespace JetBrains.CachingProxy
 
       myMinimumFreeDiskSpaceMb = config.Value.MinimumFreeDiskSpaceMb;
       myLocalCachePath = config.Value.LocalCachePath;
-      if (myLocalCachePath == null)
+      if (string.IsNullOrEmpty(myLocalCachePath))
         throw new ArgumentNullException(nameof(myLocalCachePath), "LocalCachePath could not be null");
       if (!Directory.Exists(myLocalCachePath))
-        throw new ArgumentException("LocalCachePath doesn't exist: " + myLocalCachePath);
+      {
+        if (myLocalCachePath.StartsWith(Path.GetTempPath()))
+          Directory.CreateDirectory(myLocalCachePath);
+        else
+          throw new ArgumentException("LocalCachePath doesn't exist: " + myLocalCachePath);
+      }
 
-      myRemoteServers = new RemoteServers(config.Value.Prefixes.ToList());
+      myRemoteServers = new RemoteServers([.. config.Value.Prefixes]);
 
       myContentTypeProvider = new FileExtensionContentTypeProvider();
       myCacheFileProvider = new CacheFileProvider(myLocalCachePath);
