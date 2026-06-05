@@ -9,8 +9,6 @@
       "environmentVariables": {
         "ASPNETCORE_ENVIRONMENT": "Development",
         "UserAgentComment": "(+Development)",
-        "Prefixes__3__Prefix": "assa",
-        "Prefixes__3__CacheDuration__200": "00:30:00"
       }
     }
   }
