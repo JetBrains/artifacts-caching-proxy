@@ -94,6 +94,7 @@ public static class Program
       .AddSingleton<CachingProxyMetrics>()
       .AddHostedService<CleanupService>()
       .AddSingleton<ResponseCache>()
+      .AddSingleton<RemoteProxy>()
       .AddMemoryCache()
       .AddOptions<MemoryCacheOptions>()
       .Configure<TimeProvider>((options, tp) => options.Clock = new TimeProviderClock(tp));
