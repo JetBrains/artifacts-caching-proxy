@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Net.Mime;
 using System.Reflection;
 using System.Text;
 using System.Threading.Tasks;
@@ -261,10 +262,60 @@ namespace JetBrains.CachingProxy.Tests
     [Fact]
     public async Task Path_With_Percent_Encoded_Slash()
     {
-      // npm scoped packages use %2f in registry URLs (e.g. @types%2fserve-index)
-      // Kestrel preserves %2f in Request.Path, so use extensionless path to trigger ALWAYS_REDIRECT
-      await AssertGetResponse("/real/@scope%2fpackage", HttpStatusCode.TemporaryRedirect,
-        (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.ALWAYS_REDIRECT));
+      // npm scoped packages use %2f in registry URLs (e.g. @types%2fserve-index).
+      // The %2f must be accepted (not rejected as BAD_REQUEST) and proxied to the upstream.
+      await AssertGetResponse("/real/@scope%2fpackage", HttpStatusCode.OK,
+        (message, bytes) =>
+        {
+          AssertStatusHeader(message, CachingProxyStatus.MISS);
+          Assert.Equal("scoped-package-content", Encoding.UTF8.GetString(bytes));
+        });
+    }
+
+    [Fact]
+    public async Task Empty_File_Extension_Is_Cached()
+    {
+      // MRI-4508: extensionless paths are no longer redirected to the remote;
+      // they are cached and served with the default content type.
+      await AssertGetResponse("/real/extensionless", HttpStatusCode.OK,
+        (message, bytes) =>
+        {
+          AssertStatusHeader(message, CachingProxyStatus.MISS);
+          Assert.Equal(MediaTypeNames.Application.Octet, message.Content.Headers.ContentType?.ToString());
+          Assert.Equal("no-extension-content", Encoding.UTF8.GetString(bytes));
+          Assert.Equal("public, max-age=31536000", message.Headers.CacheControl?.ToString());
+        });
+
+      await AssertGetResponse("/real/extensionless", HttpStatusCode.OK,
+        (message, bytes) =>
+        {
+          AssertStatusHeader(message, CachingProxyStatus.HIT);
+          Assert.Equal(MediaTypeNames.Application.Octet, message.Content.Headers.ContentType?.ToString());
+          Assert.Equal("no-extension-content", Encoding.UTF8.GetString(bytes));
+          Assert.Equal("public, max-age=31536000", message.Headers.CacheControl?.ToString());
+        });
+    }
+
+    [Fact]
+    public async Task Empty_File_Extension_Head_Is_Cached()
+    {
+      // MRI-4508: HEAD on an extensionless path is served with the default content type
+      // (instead of being redirected) and is cached in-memory for subsequent HEAD requests.
+      await AssertHeadResponse("/real/extensionless", HttpStatusCode.OK,
+        message =>
+        {
+          AssertStatusHeader(message, CachingProxyStatus.MISS);
+          Assert.Equal(MediaTypeNames.Application.Octet, message.Content.Headers.ContentType?.ToString());
+        });
+
+      // Second HEAD is served from the in-memory positive cache and must carry
+      // the same default content type as the MISS above.
+      await AssertHeadResponse("/real/extensionless", HttpStatusCode.OK,
+        message =>
+        {
+          AssertStatusHeader(message, CachingProxyStatus.HIT);
+          Assert.Equal(MediaTypeNames.Application.Octet, message.Content.Headers.ContentType?.ToString());
+        });
     }
 
     [Fact]
@@ -363,12 +414,10 @@ namespace JetBrains.CachingProxy.Tests
     public async Task Always_Redirect_Directory_Index()
     {
       await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/",
-        HttpStatusCode.TemporaryRedirect,
-        (message, bytes) =>
+        HttpStatusCode.OK, (message, bytes) =>
         {
-          AssertStatusHeader(message, CachingProxyStatus.ALWAYS_REDIRECT);
-          Assert.Equal("https://repo1.maven.org/maven2/org/apache/ant/ant-xz/",
-            message.Headers.Location?.ToString());
+          AssertStatusHeader(message, CachingProxyStatus.MISS);
+          Assert.Equal(MediaTypeNames.Application.Octet, message.Content.Headers.ContentType?.ToString());
         });
     }
 
@@ -376,12 +425,10 @@ namespace JetBrains.CachingProxy.Tests
     public async Task Always_Redirect_Directory_Index_No_Trailing_Slash()
     {
       await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz",
-        HttpStatusCode.TemporaryRedirect,
-        (message, bytes) =>
+        HttpStatusCode.OK, (message, bytes) =>
         {
-          AssertStatusHeader(message, CachingProxyStatus.ALWAYS_REDIRECT);
-          Assert.Equal("https://repo1.maven.org/maven2/org/apache/ant/ant-xz",
-            message.Headers.Location?.ToString());
+          AssertStatusHeader(message, CachingProxyStatus.MISS);
+          Assert.Equal(MediaTypeNames.Application.Octet, message.Content.Headers.ContentType?.ToString());
         });
     }
 

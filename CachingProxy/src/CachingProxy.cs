@@ -79,7 +79,7 @@ namespace JetBrains.CachingProxy
       {
         FileProvider = myCacheFileProvider,
         ServeUnknownFileTypes = true,
-        DefaultContentType = "application/octet-stream",
+        DefaultContentType = MediaTypeNames.Application.Octet,
         HttpsCompression = HttpsCompressionMode.DoNotCompress,
         ContentTypeProvider = new FileExtensionContentTypeProvider(),
         OnPrepareResponse = ctx =>
@@ -277,8 +277,10 @@ namespace JetBrains.CachingProxy
         if (contentEncoding != null)
           context.Response.Headers.ContentEncoding = contentEncoding;
 
-        context.Response.ContentType = myStaticFileOptions.ContentTypeProvider
-          .TryGetContentType(requestPath, out var contentType) ? contentType : myStaticFileOptions.DefaultContentType;
+        var contentType = myStaticFileOptions.ContentTypeProvider.TryGetContentType(requestPath, out var resolvedContentType)
+          ? resolvedContentType
+          : myStaticFileOptions.DefaultContentType;
+        context.Response.ContentType = contentType;
 
         if (isHead)
         {

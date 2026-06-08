@@ -105,6 +105,9 @@ public class UpstreamTestServer : IAsyncLifetime
         res.Headers.ContentEncoding = "deflate, gzip";
         return res.WriteAsync("garbage");
       })
+      .MapGet("extensionless", (req, res, data) => res.WriteAsync("no-extension-content"))
+      .MapVerb(HttpMethods.Head, "extensionless", (req, res, data) => Task.CompletedTask)
+      .MapGet("@scope%2fpackage", (req, res, data) => res.WriteAsync("scoped-package-content"))
       .MapGet("name with spaces.jar", (req, res, data) => res.WriteAsync("zzz.jar"))
       .MapGet("name+with+plus.jar", (req, res, data) => res.WriteAsync("zzz.jar"))
       .MapGet("@username/package/-/package-3.1.2.tgz", (req, res, data) => res.WriteAsync("package-3.1.2.tgz"))
