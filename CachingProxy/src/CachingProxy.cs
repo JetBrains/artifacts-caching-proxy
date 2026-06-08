@@ -142,15 +142,18 @@ namespace JetBrains.CachingProxy
       if (!isHead && !isGet) return;
       if (context.Response.StatusCode != StatusCodes.Status404NotFound) return;
 
-      var requestPath = context.Request.Path.ToString().Replace('\\', '/').TrimStart('/');
-      if (requestPath.Contains("..", StringComparison.Ordinal) ||
-          !OurGoodPathChars.IsMatch(requestPath))
+      var requestPath = context.Request.Path.Value ?? "";
+      if (requestPath.Contains("..", StringComparison.Ordinal) || !OurGoodPathChars.IsMatch(requestPath))
       {
         await SetStatus(context, CachingProxyStatus.BAD_REQUEST, HttpStatusCode.BadRequest, "Invalid request path");
         return;
       }
 
-      var upstreamUri = new Uri(remoteServer.RemoteUri, remainingPath.ToString().TrimStart('/'));
+      var upstreamUri = remoteServer.RemoteUri;
+      if (remainingPath != PathString.Empty)
+      {
+        upstreamUri = new Uri(upstreamUri, remainingPath.Value.AsSpan(remainingPath.Value?[0] == '/' ? 1 : 0).ToString());
+      }
 
       if (myBlacklistRegex != null && myBlacklistRegex.IsMatch(requestPath))
       {
@@ -312,8 +315,8 @@ namespace JetBrains.CachingProxy
           Directory.CreateDirectory(parent!.FullName);
 
           await using (var stream = new FileStream(
-            tempFile, FileMode.CreateNew, FileAccess.Write, FileShare.None, BUFFER_SIZE,
-            FileOptions.Asynchronous))
+                         tempFile, FileMode.CreateNew, FileAccess.Write, FileShare.None, BUFFER_SIZE,
+                         FileOptions.Asynchronous))
           {
             await using (var sourceStream = await response.Content.ReadAsStreamAsync())
               await CopyToTwoStreamsAsync(sourceStream, context.Response.Body, stream, context.RequestAborted);
@@ -322,7 +325,8 @@ namespace JetBrains.CachingProxy
           var tempFileInfo = new FileInfo(tempFile);
           if (contentLength != null && tempFileInfo.Length != contentLength)
           {
-            myLogger.LogWarning(Event.NotMatchedContentLength, "Expected {ContentLength} bytes from Content-Length, but downloaded {Length}: {UpstreamUri}",
+            myLogger.LogWarning(Event.NotMatchedContentLength,
+              "Expected {ContentLength} bytes from Content-Length, but downloaded {Length}: {UpstreamUri}",
               contentLength, tempFileInfo.Length, upstreamUri);
             context.Abort();
             return;

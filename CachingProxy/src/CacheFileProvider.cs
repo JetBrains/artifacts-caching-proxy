@@ -1,4 +1,8 @@
 using System;
+using System.Buffers;
+using System.IO;
+using System.Security.Cryptography;
+using System.Text;
 using Microsoft.Extensions.FileProviders;
 using Microsoft.Extensions.Primitives;
 
@@ -16,42 +20,47 @@ namespace JetBrains.CachingProxy
       if (withGzipSuffix.Exists)
         return withGzipSuffix;
 
-      var withoutGzipSuffix = myPhysicalFileProvider.GetFileInfo(ManglePath(subpath, ""));
+      var withoutGzipSuffix = myPhysicalFileProvider.GetFileInfo(ManglePath(subpath));
       return withoutGzipSuffix;
     }
 
-    public IDirectoryContents GetDirectoryContents(string subpath)
-    {
-      return myPhysicalFileProvider.GetDirectoryContents(ManglePath(subpath, ""));
-    }
+    public IDirectoryContents GetDirectoryContents(string subpath) => throw new NotSupportedException();
 
-    public string? GetFutureCacheFileLocation(string subpath, string? contentEncoding)
-    {
-      var fileInfo = myPhysicalFileProvider.GetFileInfo(ManglePath(subpath, GetContentEncodingCacheFileSuffix(contentEncoding)));
-      return fileInfo.PhysicalPath;
-    }
+    public string? GetFutureCacheFileLocation(string subpath, string? contentEncoding) =>
+      myPhysicalFileProvider.GetFileInfo(ManglePath(subpath, GetContentEncodingCacheFileSuffix(contentEncoding))).PhysicalPath;
 
-    public string? GetContentEncoding(IFileInfo fileInfo)
-    {
-      return fileInfo.PhysicalPath?.EndsWith(ourGzippedContentSuffix) ?? false ? "gzip" : null;
-    }
+    public string? GetContentEncoding(IFileInfo fileInfo) =>
+      fileInfo.PhysicalPath?.EndsWith(ourGzippedContentSuffix) ?? false ? "gzip" : null;
 
-    public IChangeToken Watch(string filter)
-    {
-      throw new NotSupportedException();
-    }
+    public IChangeToken Watch(string filter) => throw new NotSupportedException();
 
     /// <summary>
     /// Change sub-path upon converting to a local file system path to handle hierarchy-conflicts like
-    /// caching both a/a.jar and a/b/c/c.jar
+    /// caching both a/a.jar and a/b/c/c.jar, or a and a/b.jar
     /// </summary>
-    private static string ManglePath(string subpath, string contentEncodingSuffix)
+    private static string ManglePath(string subpath, string? contentEncodingSuffix = null)
     {
-      var trimmed = subpath.Replace('\\', '/').TrimEnd('/');
-      var lastSeparator = trimmed.LastIndexOf('/');
-      return lastSeparator < 0
-        ? $"cache-{trimmed}"
-        : $"{trimmed[..(lastSeparator + 1)]}cache-{trimmed[(lastSeparator + 1)..]}{contentEncodingSuffix}";
+      var maxBytes = Encoding.UTF8.GetMaxByteCount(subpath.Length);
+
+      byte[]? rented = null;
+      var buffer = maxBytes <= 512
+        ? stackalloc byte[512]
+        : rented = ArrayPool<byte>.Shared.Rent(maxBytes);
+
+      try
+      {
+        var written = Encoding.UTF8.GetBytes(subpath, buffer);
+        // lowercase in-place
+        for (var i = 0; i < written; i++)
+          if ((uint)(buffer[i] - 'A') < 26u) buffer[i] |= 0x20;
+        var hash = Convert.ToHexStringLower(SHA256.HashData(buffer[..written]));
+        return $"{hash[..2]}/{hash[2..4]}/{hash}{Path.GetExtension(subpath)}{contentEncodingSuffix}";
+      }
+      finally
+      {
+        if (rented != null)
+          ArrayPool<byte>.Shared.Return(rented);
+      }
     }
 
     private static string GetContentEncodingCacheFileSuffix(string? contentEncoding) =>

@@ -122,7 +122,7 @@ namespace JetBrains.CachingProxy.Tests
         });
 
       Assert.Equal(11541, new FileInfo(
-        Path.Combine(myTempDirectory, "repo1.maven.org/maven2/org/apache/ant/ant-xz/1.10.5/cache-ant-xz-1.10.5.jar")).Length);
+        Path.Combine(myTempDirectory, "a1/8a/a18af857577c7f565795f2866ced49713aade459dafe8ca7ed0811d04a026382.jar")).Length);
     }
 
     [Fact]

@@ -37,7 +37,7 @@ namespace JetBrains.CachingProxy
           return server;
       }
 
-      remainingPart = null;
+      remainingPart = PathString.Empty;
       return null;
     }
 
