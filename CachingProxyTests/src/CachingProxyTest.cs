@@ -49,6 +49,7 @@ namespace JetBrains.CachingProxy.Tests
           "/repo1.maven.org/maven2",
           "/198.51.100.9",
           "/plugins.gradle.org/m2",
+          "/registry.npmjs.org",
           "/unknown_host.xyz",
           $"/real={upstreamServer.Url}",
           new CachingProxyPrefix($"/real-custom-ttl={upstreamServer.Url}", new CacheDuration
@@ -401,7 +402,7 @@ namespace JetBrains.CachingProxy.Tests
     public async Task Always_Redirect_Snapshots()
     {
       await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/1.0-SNAPSHOT/ant-xz-1.0-SNAPSHOT.jar",
-        HttpStatusCode.TemporaryRedirect,
+        HttpStatusCode.RedirectKeepVerb,
         (message, bytes) =>
         {
           AssertStatusHeader(message, CachingProxyStatus.ALWAYS_REDIRECT);
@@ -411,7 +412,20 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
-    public async Task Always_Redirect_Directory_Index()
+    public async Task Always_Redirect_Npm_Security_Check()
+    {
+      await AssertGetResponse("/registry.npmjs.org/-/npm/v1/security/audits/quick",
+        HttpStatusCode.RedirectKeepVerb,
+        (message, bytes) =>
+        {
+          AssertStatusHeader(message, CachingProxyStatus.ALWAYS_REDIRECT);
+          Assert.Equal("https://registry.npmjs.org/-/npm/v1/security/audits/quick",
+            message.Headers.Location?.ToString());
+        });
+    }
+
+    [Fact]
+    public async Task Always_Cache_Directory_Index()
     {
       await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/",
         HttpStatusCode.OK, (message, bytes) =>
@@ -422,7 +436,7 @@ namespace JetBrains.CachingProxy.Tests
     }
 
     [Fact]
-    public async Task Always_Redirect_Directory_Index_No_Trailing_Slash()
+    public async Task Always_Cache_Directory_Index_No_Trailing_Slash()
     {
       await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz",
         HttpStatusCode.OK, (message, bytes) =>
@@ -436,7 +450,7 @@ namespace JetBrains.CachingProxy.Tests
     public async Task Always_Redirect_MavenMetadataXml()
     {
       await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/maven-metadata.xml",
-        HttpStatusCode.TemporaryRedirect,
+        HttpStatusCode.RedirectKeepVerb,
         (message, _) =>
         {
           AssertStatusHeader(message, CachingProxyStatus.ALWAYS_REDIRECT);
@@ -449,7 +463,7 @@ namespace JetBrains.CachingProxy.Tests
     public async Task Always_Redirect_MavenMetadataXmlChecksum()
     {
       await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/maven-metadata.xml.sha1",
-        HttpStatusCode.TemporaryRedirect,
+        HttpStatusCode.RedirectKeepVerb,
         (message, _) =>
         {
           AssertStatusHeader(message, CachingProxyStatus.ALWAYS_REDIRECT);

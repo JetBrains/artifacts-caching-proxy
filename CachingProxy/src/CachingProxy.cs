@@ -164,7 +164,7 @@ namespace JetBrains.CachingProxy
       var isRedirectToRemoteUrl = myRedirectToRemoteUrlsRegex != null && myRedirectToRemoteUrlsRegex.IsMatch(requestPath);
       if (isRedirectToRemoteUrl)
       {
-        await SetStatus(context, CachingProxyStatus.ALWAYS_REDIRECT, HttpStatusCode.TemporaryRedirect);
+        await SetStatus(context, CachingProxyStatus.ALWAYS_REDIRECT, HttpStatusCode.RedirectKeepVerb);
         context.Response.GetTypedHeaders().Location = upstreamUri;
         return;
       }
