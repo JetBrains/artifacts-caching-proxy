@@ -50,9 +50,18 @@ namespace JetBrains.CachingProxy
       try
       {
         var written = Encoding.UTF8.GetBytes(subpath, buffer);
-        // lowercase in-place
+        // normalize in-place: lowercase ASCII letters and force forward-slash delimiter
         for (var i = 0; i < written; i++)
-          if ((uint)(buffer[i] - 'A') < 26u) buffer[i] |= 0x20;
+        {
+          if (Path.DirectorySeparatorChar != Path.AltDirectorySeparatorChar && buffer[i] == (byte)Path.DirectorySeparatorChar)
+          {
+            buffer[i] = (byte)Path.AltDirectorySeparatorChar;
+          }
+          else if ((uint)(buffer[i] - 'A') < 26u)
+          {
+            buffer[i] |= 0x20;
+          }
+        }
         var hash = Convert.ToHexStringLower(SHA256.HashData(buffer[..written]));
         return $"{hash[..2]}/{hash[2..4]}/{hash}{Path.GetExtension(subpath)}{contentEncodingSuffix}";
       }
