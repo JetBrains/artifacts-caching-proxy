@@ -35,13 +35,13 @@ namespace JetBrains.CachingProxy
     private readonly Regex? myRedirectToRemoteUrlsRegex;
     private readonly ResponseCache myResponseCache;
     private readonly ILogger myLogger;
-    private readonly FileExtensionContentTypeProvider myContentTypeProvider;
     private readonly RequestDelegate myNext;
     private readonly CachingProxyMetrics myMetrics;
     private readonly TimeProvider myTimeProvider;
     private readonly ProxyHttpClient myHttpClient;
     private readonly RemoteServers myRemoteServers;
     private readonly StaticFileMiddleware myStaticFileMiddleware;
+    private readonly StaticFileOptions myStaticFileOptions;
 
     private readonly CacheFileProvider myCacheFileProvider;
     private readonly string myLocalCachePath;
@@ -73,15 +73,15 @@ namespace JetBrains.CachingProxy
 
       myRemoteServers = new RemoteServers([.. config.Value.Prefixes]);
 
-      myContentTypeProvider = new FileExtensionContentTypeProvider();
       myCacheFileProvider = new CacheFileProvider(myLocalCachePath);
 
-      var staticFileOptions = new StaticFileOptions
+      myStaticFileOptions = new StaticFileOptions
       {
         FileProvider = myCacheFileProvider,
         ServeUnknownFileTypes = true,
+        DefaultContentType = "application/octet-stream",
         HttpsCompression = HttpsCompressionMode.DoNotCompress,
-        ContentTypeProvider = myContentTypeProvider,
+        ContentTypeProvider = new FileExtensionContentTypeProvider(),
         OnPrepareResponse = ctx =>
         {
           var contentEncoding = myCacheFileProvider.GetContentEncoding(ctx.File);
@@ -94,7 +94,7 @@ namespace JetBrains.CachingProxy
       };
 
       myStaticFileMiddleware =
-        new StaticFileMiddleware(next, hostingEnv, Options.Create(staticFileOptions), loggerFactory);
+        new StaticFileMiddleware(next, hostingEnv, Options.Create(myStaticFileOptions), loggerFactory);
 
       myBlacklistRegex = !string.IsNullOrWhiteSpace(config.Value.BlacklistUrlRegex)
         ? new Regex(config.Value.BlacklistUrlRegex, RegexOptions.Compiled)
@@ -159,9 +159,7 @@ namespace JetBrains.CachingProxy
       }
 
       var isRedirectToRemoteUrl = myRedirectToRemoteUrlsRegex != null && myRedirectToRemoteUrlsRegex.IsMatch(requestPath);
-      var requestPathExtension = Path.GetExtension(requestPath);
-      var emptyFileExtension = requestPathExtension.Length == 0;
-      if (isRedirectToRemoteUrl || emptyFileExtension)
+      if (isRedirectToRemoteUrl)
       {
         await SetStatus(context, CachingProxyStatus.ALWAYS_REDIRECT, HttpStatusCode.TemporaryRedirect);
         context.Response.GetTypedHeaders().Location = upstreamUri;
@@ -279,8 +277,8 @@ namespace JetBrains.CachingProxy
         if (contentEncoding != null)
           context.Response.Headers.ContentEncoding = contentEncoding;
 
-        if (myContentTypeProvider.TryGetContentType(requestPath, out var contentType))
-          context.Response.ContentType = contentType;
+        context.Response.ContentType = myStaticFileOptions.ContentTypeProvider
+          .TryGetContentType(requestPath, out var contentType) ? contentType : myStaticFileOptions.DefaultContentType;
 
         if (isHead)
         {
