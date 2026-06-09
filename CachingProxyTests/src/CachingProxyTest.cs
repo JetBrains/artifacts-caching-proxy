@@ -9,13 +9,11 @@ using System.Net.Mime;
 using System.Reflection;
 using System.Text;
 using System.Threading.Tasks;
-using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Options;
 using Microsoft.Extensions.Time.Testing;
 using Xunit;
 using Xunit.Abstractions;
@@ -72,12 +70,11 @@ namespace JetBrains.CachingProxy.Tests
             .UseTestServer()
             .ConfigureTestServices(services =>
             {
-              services.Add(new ServiceDescriptor(typeof(IOptions<CachingProxyConfig>),
-                new OptionsWrapper<CachingProxyConfig>(myConfig)));
+              services.AddSingleton(myConfig);
               Program.ConfigureOurServices(services);
               services.Replace(ServiceDescriptor.Singleton<TimeProvider>(myTimeProvider));
             })
-            .Configure(app => app.UseMiddleware<CachingProxy>());
+            .Configure(Program.ConfigureOurApp);
         })
         .Build();
       myServer = myHost.GetTestServer();
@@ -91,7 +88,7 @@ namespace JetBrains.CachingProxy.Tests
       await AssertGetResponse("/health", HttpStatusCode.OK,
         (message, bytes) =>
         {
-          Assert.Equal("OK", Encoding.UTF8.GetString(bytes));
+          Assert.Equal("Healthy", Encoding.UTF8.GetString(bytes));
         });
     }
 
@@ -324,6 +321,16 @@ namespace JetBrains.CachingProxy.Tests
     {
       myUpstreamServer.Conditional500SendErrorOnce = true;
       await AssertGetResponse("/real/conditional-500.txt", HttpStatusCode.OK, (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.MISS));
+    }
+
+    [Fact]
+    public async Task Post()
+    {
+      await AssertPostResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/1.10.5/ant-xz-1.10.5.jar", HttpStatusCode.MethodNotAllowed,
+      message =>
+      {
+
+      });
     }
 
     [Fact]
@@ -697,6 +704,15 @@ namespace JetBrains.CachingProxy.Tests
     {
       myOutput.WriteLine("*** HEAD " + url);
       using var response = await myServer.CreateRequest(url).SendAsync(HttpMethod.Head.Method);
+      myOutput.WriteLine(response.ToString());
+      Assert.Equal(expectedCode, response.StatusCode);
+      assertions(response);
+    }
+
+    private async Task AssertPostResponse(string url, HttpStatusCode expectedCode, Action<HttpResponseMessage> assertions)
+    {
+      myOutput.WriteLine("*** POST " + url);
+      using var response = await myServer.CreateRequest(url).SendAsync(HttpMethod.Post.Method);
       myOutput.WriteLine(response.ToString());
       Assert.Equal(expectedCode, response.StatusCode);
       assertions(response);

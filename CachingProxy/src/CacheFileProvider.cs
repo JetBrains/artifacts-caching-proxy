@@ -8,11 +8,27 @@ using Microsoft.Extensions.Primitives;
 
 namespace JetBrains.CachingProxy
 {
-  public class CacheFileProvider(string cacheDirectory) : IFileProvider
+  public class CacheFileProvider : IFileProvider
   {
     private static readonly string ourGzippedContentSuffix = "-gzip-Ege4dHyCEA7IM";
 
-    private readonly PhysicalFileProvider myPhysicalFileProvider = new(cacheDirectory);
+    private readonly PhysicalFileProvider myPhysicalFileProvider;
+
+    public CacheFileProvider(CachingProxyConfig config)
+    {
+      var localCachePath = config.LocalCachePath;
+      if (string.IsNullOrEmpty(localCachePath))
+        throw new ArgumentNullException(nameof(localCachePath), "LocalCachePath could not be null");
+      if (!Directory.Exists(localCachePath))
+      {
+        if (localCachePath.StartsWith(Path.GetTempPath()))
+          Directory.CreateDirectory(localCachePath);
+        else
+          throw new ArgumentException("LocalCachePath doesn't exist: " + localCachePath);
+      }
+
+      myPhysicalFileProvider = new PhysicalFileProvider(localCachePath);
+    }
 
     public IFileInfo GetFileInfo(string subpath)
     {

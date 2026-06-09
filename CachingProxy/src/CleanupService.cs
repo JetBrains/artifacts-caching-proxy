@@ -8,12 +8,11 @@ using System.Threading.Tasks;
 using Cronos;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
 
 namespace JetBrains.CachingProxy;
 
 [SuppressMessage("ReSharper", "ClassNeverInstantiated.Global")]
-public class CleanupService(TimeProvider timeProvider, IOptions<CachingProxyConfig> options, CachingProxyMetrics metrics, ILogger<CleanupService> logger) : BackgroundService
+public class CleanupService(TimeProvider timeProvider, CachingProxyConfig config, CachingProxyMetrics metrics, ILogger<CleanupService> logger) : BackgroundService
 {
   private readonly Counter<long> myFilesDeletedCounter = metrics.Meter.CreateCounter<long>(
     "file_cleanup_deleted_files_total", "files", "Total number of files deleted by cleanup");
@@ -26,7 +25,7 @@ public class CleanupService(TimeProvider timeProvider, IOptions<CachingProxyConf
 
   protected override async Task ExecuteAsync(CancellationToken stoppingToken)
   {
-    if (options.Value.CleanupInterval is not { Length: > 0 } cleanupInterval)
+    if (config.CleanupInterval is not { Length: > 0 } cleanupInterval)
     {
       logger.LogInformation("File cleanup interval is not configured.");
       return;
@@ -59,14 +58,14 @@ public class CleanupService(TimeProvider timeProvider, IOptions<CachingProxyConf
 
   private Task CleanupOnceAsync(CancellationToken cancellationToken)
   {
-    var localCachePath = options.Value.LocalCachePath;
+    var localCachePath = config.LocalCachePath;
     if (string.IsNullOrWhiteSpace(localCachePath) || !Directory.Exists(localCachePath))
     {
       logger.LogWarning("Cleanup root path '{RootPath}' does not exist", localCachePath);
       return Task.CompletedTask;
     }
 
-    var cutoffUtc = timeProvider.GetUtcNow() - options.Value.CleanupPeriod;
+    var cutoffUtc = timeProvider.GetUtcNow() - config.CleanupPeriod;
     logger.LogInformation("File cleanup started. Deleted files older than {Cutoff}", cutoffUtc);
 
     var stopwatch = Stopwatch.StartNew();

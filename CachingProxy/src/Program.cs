@@ -44,7 +44,9 @@ public static class Program
     }
 
     // Bind CachingProxyConfig from configuration
-    builder.Services.Configure<CachingProxyConfig>(builder.Configuration);
+    builder.Services
+      .Configure<CachingProxyConfig>(builder.Configuration)
+      .AddSingleton(sp => sp.GetRequiredService<IOptions<CachingProxyConfig>>().Value);
 
     ConfigureOurServices(builder.Services);
 
@@ -82,7 +84,7 @@ public static class Program
 
     app.UseOpenTelemetryPrometheusScrapingEndpoint();
 
-    app.UseMiddleware<CachingProxy>();
+    ConfigureOurApp(app);
 
     return app.RunAsync();
   }
@@ -95,13 +97,20 @@ public static class Program
       .AddHostedService<CleanupService>()
       .AddSingleton<ResponseCache>()
       .AddSingleton<RemoteProxy>()
+      .AddSingleton<CacheFileProvider>()
+      .ConfigureOptions<ConfigureStaticFileMiddleware>()
       .AddMemoryCache()
       .AddOptions<MemoryCacheOptions>()
       .Configure<TimeProvider>((options, tp) => options.Clock = new TimeProviderClock(tp));
     services
+      .AddSingleton(sp => sp.GetRequiredService<IOptions<StaticFileOptions>>().Value)
+      .AddScoped<CachingProxy>()
+      .AddHealthChecks()
+      .AddCheck<CachingProxy>(nameof(CachingProxy));
+    services
       .AddHttpClient<ProxyHttpClient>(static (provider, client) =>
       {
-        var config = provider.GetRequiredService<IOptions<CachingProxyConfig>>().Value;
+        var config = provider.GetRequiredService<CachingProxyConfig>();
         client.Timeout = TimeSpan.FromSeconds(config.RequestTimeoutSec);
         var userAgentHeader = client.DefaultRequestHeaders.UserAgent;
         userAgentHeader.Add(ourUserAgent);
@@ -125,5 +134,13 @@ public static class Program
       })
       .AddTransientHttpErrorPolicy(static policyBuilder => policyBuilder.WaitAndRetryAsync(
         4, retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt - 1))));
+  }
+
+  public static void ConfigureOurApp(IApplicationBuilder app)
+  {
+    app
+      .UseHealthChecks("/health")
+      .UseStaticFiles()
+      .UseMiddleware<CachingProxy>();
   }
 }
