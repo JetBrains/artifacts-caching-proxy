@@ -106,7 +106,7 @@ public static class Program
       .AddOptions<MemoryCacheOptions>()
       .Configure<TimeProvider>((options, tp) => options.Clock = new TimeProviderClock(tp));
 
-    if (configuration.Get<CachingProxyConfig>()?.S3?.BucketName  is not null)
+    if (UseS3(configuration))
     {
       // AWSOptions resolves the configured profile (including SSO) into credentials when the client is
       // created, so a named profile and the default credential chain go through the same registration.
@@ -159,7 +159,7 @@ public static class Program
   public static void ConfigureOurApp(IApplicationBuilder app, IConfiguration configuration)
   {
     app.UseHealthChecks("/health");
-    if (configuration.Get<CachingProxyConfig>()?.S3?.BucketName is not null)
+    if (UseS3(configuration))
     {
       app.UseMiddleware<S3CachingMiddleware>();
     }
@@ -170,4 +170,9 @@ public static class Program
         .UseMiddleware<CachingProxy>();
     }
   }
+
+  // Single source of truth for the backend choice, so service registration and the request pipeline
+  // never disagree about whether S3 is enabled.
+  private static bool UseS3(IConfiguration configuration) =>
+    configuration.Get<CachingProxyConfig>()?.S3?.BucketName is not null;
 }

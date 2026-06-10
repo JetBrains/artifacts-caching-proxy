@@ -222,6 +222,21 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   }
 
   [Fact]
+  public async Task Forbidden_Probe_Falls_Through_To_Upstream()
+  {
+    // A bucket without s3:ListBucket answers a missing key with 403, not 404. That must be treated
+    // as a cache miss (fetch + store from upstream), not surfaced to the client as a 503.
+    myS3.MissStatusCode = HttpStatusCode.Forbidden;
+
+    var server = CreateServer(signedLinks: true);
+    using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
+
+    Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
+    AssertStatusHeader(response, CachingProxyStatus.MISS);
+    Assert.Equal(1, myS3.PutObjectCalls);
+  }
+
+  [Fact]
   public async Task Upstream_NotFound_Is_Negatively_Cached_Not_Uploaded()
   {
     var server = CreateServer(signedLinks: true);
@@ -256,6 +271,9 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     public int PutObjectCalls;
     public HttpVerb? LastPresignVerb;
 
+    // Status a metadata probe throws for a missing key. Buckets without s3:ListBucket answer 403.
+    public HttpStatusCode MissStatusCode = HttpStatusCode.NotFound;
+
     public override Task<string> GetPreSignedURLAsync(GetPreSignedUrlRequest request)
     {
       LastPresignVerb = request.Verb;
@@ -267,7 +285,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
       Interlocked.Increment(ref GetObjectMetadataCalls);
       if (Objects.ContainsKey(key))
         return Task.FromResult(new GetObjectMetadataResponse { HttpStatusCode = HttpStatusCode.OK });
-      throw new AmazonS3Exception("Not Found") { StatusCode = HttpStatusCode.NotFound };
+      throw new AmazonS3Exception(MissStatusCode.ToString()) { StatusCode = MissStatusCode };
     }
 
     public override async Task<PutObjectResponse> PutObjectAsync(PutObjectRequest request, CancellationToken cancellationToken = default)

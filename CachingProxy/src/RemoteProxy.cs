@@ -173,36 +173,21 @@ public partial class RemoteProxy(
 
       var headersContentEncoding = response.Content.Headers.ContentEncoding;
       if (headersContentEncoding.Count > 1)
-      {
-        logger.LogError(Event.MultipleContentTypes, "{UpstreamUri} returned multiple Content-Encoding which is not allowed: {ContentEncoding}",
-          upstreamUri, string.Join(", ", headersContentEncoding));
-        // return 503 Service Unavailable, since the client will most likely not retry it with 5xx error codes
-        context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
-        context.Response.ContentType = MediaTypeNames.Text.Plain;
-        await context.Response.WriteAsync(
+        return await RejectUpstreamEncoding(context, Event.MultipleContentTypes,
           $"{upstreamUri} returned multiple Content-Encoding which is not allowed: {string.Join(", ", headersContentEncoding)}");
-        return null;
-      }
 
       var contentEncoding = headersContentEncoding.Count == 0 ? null : headersContentEncoding.Single();
       if (contentEncoding != null && contentEncoding != "gzip")
-      {
-        logger.LogError(Event.NotSupportedContentType, "{UpstreamUri} returned Content-Encoding '{ContentEncoding}' which is not supported",
-          upstreamUri, contentEncoding);
-        // return 503 Service Unavailable, since the client will most likely not retry it with 5xx error codes
-        context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
-        context.Response.ContentType = MediaTypeNames.Text.Plain;
-        await context.Response.WriteAsync(
+        return await RejectUpstreamEncoding(context, Event.NotSupportedContentType,
           $"{upstreamUri} returned Content-Encoding '{contentEncoding}' which is not supported");
-        return null;
-      }
 
       IHeaderDictionary headers = new HeaderDictionary();
       headers.LastModified = response.Content.Headers.LastModified?.ToString("R");
       headers.ContentLength = response.Content.Headers.ContentLength;
       headers.ContentType = getContentType?.Invoke(response) ?? response.Content.Headers.ContentType?.MediaType;
       headers.ContentEncoding = contentEncoding;
-      headers.CacheControl = response.StatusCode is >= HttpStatusCode.OK and < HttpStatusCode.MultipleChoices ? OurEternalCachingHeader : default;
+      // Only successful (2xx) responses reach here, so the response is always eternally cacheable.
+      headers.CacheControl = OurEternalCachingHeader;
 
       var responseEntry = new CachedResponse(response.StatusCode, headers);
 
@@ -260,5 +245,15 @@ public partial class RemoteProxy(
     {
       context.Response.Headers[key] = value;
     }
+  }
+
+  private async Task<HttpResponseMessage?> RejectUpstreamEncoding(HttpContext context, EventId eventId, string message)
+  {
+    logger.LogError(eventId, "{Message}", message);
+    // return 503 Service Unavailable, since the client will most likely not retry it with 5xx error codes
+    context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+    context.Response.ContentType = MediaTypeNames.Text.Plain;
+    await context.Response.WriteAsync(message);
+    return null;
   }
 }

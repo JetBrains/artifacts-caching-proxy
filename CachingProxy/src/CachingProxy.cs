@@ -142,16 +142,16 @@ public class CachingProxy(
 
   Task<HealthCheckResult> IHealthCheck.CheckHealthAsync(HealthCheckContext context, CancellationToken cancellationToken)
   {
-    var myLocalCachePath = config.LocalCachePath;
-    var myMinimumFreeDiskSpaceMb = config.MinimumFreeDiskSpaceMb;
-    var availableFreeSpaceMb = new DriveInfo(myLocalCachePath).AvailableFreeSpace / (1024 * 1024);
-    if (availableFreeSpaceMb < myMinimumFreeDiskSpaceMb)
+    var localCachePath = config.LocalCachePath;
+    var minimumFreeDiskSpaceMb = config.MinimumFreeDiskSpaceMb;
+    var availableFreeSpaceMb = new DriveInfo(localCachePath).AvailableFreeSpace / (1024 * 1024);
+    if (availableFreeSpaceMb < minimumFreeDiskSpaceMb)
     {
       logger.LogError(Event.NotEnoughFreeDiskSpace,
         "Not Enough Free Disk Space. {AvailableFreeSpaceMb} MB is free at {LocalCachePath}, but minimum is {MinimumFreeDiskSpaceMb} MB",
-        availableFreeSpaceMb, myLocalCachePath, myMinimumFreeDiskSpaceMb);
+        availableFreeSpaceMb, localCachePath, minimumFreeDiskSpaceMb);
       return Task.FromResult(HealthCheckResult.Unhealthy(
-        $"Not Enough Free Disk Space. {availableFreeSpaceMb} MB is free at {myLocalCachePath}, but minimum is {myMinimumFreeDiskSpaceMb} MB"));
+        $"Not Enough Free Disk Space. {availableFreeSpaceMb} MB is free at {localCachePath}, but minimum is {minimumFreeDiskSpaceMb} MB"));
     }
 
     return Task.FromResult(HealthCheckResult.Healthy());

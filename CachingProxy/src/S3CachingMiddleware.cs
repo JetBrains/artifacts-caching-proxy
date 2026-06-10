@@ -47,7 +47,9 @@ public class S3CachingMiddleware(IAmazonS3 amazonS3, CachingProxyConfig config, 
           await RedirectToBucket(CachingProxyStatus.MISS);
           return;
         }
-        catch (AmazonServiceException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+        // A locked-down bucket (no s3:ListBucket) answers a missing key with 403 Forbidden rather
+        // than 404, so treat both as "not in the bucket" and fall through to fetch from upstream.
+        catch (AmazonServiceException ex) when (ex.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.Forbidden)
         {
         }
       }
@@ -77,7 +79,10 @@ public class S3CachingMiddleware(IAmazonS3 amazonS3, CachingProxyConfig config, 
     }
     catch (Exception e)
     {
-      logger.LogError(e, "Failed to cache response");
+      // The artifact exists upstream; we just failed to store or redirect it. Respond 503 (and do
+      // NOT cache a negative result) so the client retries and a transient S3 problem recovers on
+      // the next request, instead of serving a "not found" for an artifact that is actually available.
+      logger.LogError(Event.FailedToCacheInS3, e, "Failed to cache {RequestPath} in S3", requestPath);
       context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
       context.Response.ContentType = MediaTypeNames.Text.Plain;
       await context.Response.WriteAsync("Failed to cache response");

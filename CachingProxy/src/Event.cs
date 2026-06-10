@@ -12,6 +12,7 @@ public static class Event
   public static readonly EventId NotAllowedContentType = new(4, nameof(NotAllowedContentType));
   public static readonly EventId NotMatchedContentLength = new(5, nameof(NotMatchedContentLength));
   public static readonly EventId Timeout = new(6, nameof(Timeout));
+  public static readonly EventId FailedToCacheInS3 = new(7, nameof(FailedToCacheInS3));
 
   private static readonly ConcurrentDictionary<HttpStatusCode, EventId> ourNegativeHitEventIDs = new();
   public static EventId NegativeMiss(HttpStatusCode httpStatusCode) =>
