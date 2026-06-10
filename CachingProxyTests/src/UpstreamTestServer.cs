@@ -22,9 +22,9 @@ public class UpstreamTestServer : IAsyncLifetime
 {
   public string Url => myWebApp
     .Services.GetRequiredService<IServer>()
-    .Features.Get<IServerAddressesFeature>().Addresses.Single();
+    .Features.Get<IServerAddressesFeature>()!.Addresses.Single();
 
-  public string LastUserAgent { get; private set; }
+  public string LastUserAgent { get; private set; } = "";
 
   private readonly WebApplication myWebApp;
   public volatile bool Conditional500SendErrorOnce;

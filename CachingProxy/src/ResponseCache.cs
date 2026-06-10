@@ -1,23 +1,28 @@
 using System;
 using System.Net;
-using System.Runtime.CompilerServices;
-using Microsoft.AspNetCore.Http.Features;
+using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Caching.Memory;
 
 namespace JetBrains.CachingProxy;
 
+/// <summary>
+/// A cached response head: the status code to replay and the response headers to copy back
+/// (representation headers such as Content-Type/Content-Length plus the proxy bookkeeping headers).
+/// </summary>
+public sealed record CachedResponse(HttpStatusCode StatusCode, IHeaderDictionary Headers);
+
 public class ResponseCache(IMemoryCache cache, TimeProvider timeProvider)
 {
-  public IHttpResponseFeature? GetCachedStatusCode(string cacheKey) =>
-    cache.TryGetValue<IHttpResponseFeature>(cacheKey, out var entry) ? entry : null;
+  public CachedResponse? GetCachedStatusCode(string cacheKey) =>
+    cache.TryGetValue<CachedResponse>(cacheKey, out var entry) ? entry : null;
 
-  public IHttpResponseFeature PutStatusCode(string cacheKey, HttpStatusCode statusCode, CacheDuration? cacheDuration = null) =>
-    PutStatusCode(cacheKey, cacheDuration, new HttpResponseFeature { StatusCode = (int)statusCode });
+  public CachedResponse PutStatusCode(string cacheKey, HttpStatusCode statusCode, CacheDuration? cacheDuration = null) =>
+    PutStatusCode(cacheKey, cacheDuration, new CachedResponse(statusCode, new HeaderDictionary()));
 
-  public IHttpResponseFeature PutStatusCode(string cacheKey, CacheDuration? cacheDuration, IHttpResponseFeature entry)
+  public CachedResponse PutStatusCode(string cacheKey, CacheDuration? cacheDuration, CachedResponse entry)
   {
-    var cachingTime = GetCacheDuration(cacheDuration, (HttpStatusCode)entry.StatusCode);
-    entry.Headers[CachingProxyConstants.CachedStatusHeader] = entry.StatusCode.ToString();
+    var cachingTime = GetCacheDuration(cacheDuration, entry.StatusCode);
+    entry.Headers[CachingProxyConstants.CachedStatusHeader] = entry.StatusCode.ToString("D");
     entry.Headers[CachingProxyConstants.CachedUntilHeader] = (timeProvider.GetUtcNow() + cachingTime).ToString("R");
 
     return cache.Set(cacheKey, entry, new MemoryCacheEntryOptions

@@ -10,7 +10,6 @@ using Amazon.Runtime.Endpoints;
 using Amazon.S3;
 using Amazon.S3.Model;
 using Microsoft.AspNetCore.Http;
-using Microsoft.AspNetCore.Http.Features;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Logging;
 
@@ -27,6 +26,10 @@ public class S3CachingMiddleware(IAmazonS3 amazonS3, CachingProxyConfig config, 
       await next(context);
       return;
     }
+
+    // Validate method/path before probing S3 or the in-memory cache, so an invalid path or a
+    // non-GET/HEAD method can't be redirected to the bucket unchecked.
+    if (!await remoteProxy.ValidateRequestAsync(context)) return;
 
     var requestPath = context.Request.Path.Value!;
     var s3Key = requestPath[1..];
@@ -53,7 +56,7 @@ public class S3CachingMiddleware(IAmazonS3 amazonS3, CachingProxyConfig config, 
 
       context.Response.Clear();
 
-      var resp = await amazonS3.PutObjectAsync(new PutObjectRequest
+      await amazonS3.PutObjectAsync(new PutObjectRequest
       {
         BucketName = config.S3!.BucketName,
         Key = s3Key,
@@ -107,14 +110,9 @@ public class S3CachingMiddleware(IAmazonS3 amazonS3, CachingProxyConfig config, 
         location = endpoint.URL + s3Key;
       }
 
-      IHttpResponseFeature cachingResponse = new HttpResponseFeature
-      {
-        StatusCode = (int)HttpStatusCode.RedirectKeepVerb,
-        Headers =
-        {
-          Location = location
-        }
-      };
+      IHeaderDictionary headers = new HeaderDictionary();
+      headers.Location = location;
+      var cachingResponse = new CachedResponse(HttpStatusCode.RedirectKeepVerb, headers);
       remoteProxy.SetStatus(context, CachingProxyStatus.MISS,
         responseCache.PutStatusCode(requestPath, remoteServer.CacheDuration, cachingResponse));
     }
