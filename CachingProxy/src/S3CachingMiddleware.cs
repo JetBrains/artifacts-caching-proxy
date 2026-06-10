@@ -35,16 +35,18 @@ public class S3CachingMiddleware(IAmazonS3 amazonS3, CachingProxyConfig config, 
 
     var requestPath = context.Request.Path.Value!;
     var s3Key = requestPath[1..];
+    // The cache key includes the HTTP method: a presigned redirect is signed for a specific verb, so
+    // HEAD and GET each cache (and replay) their own correctly-signed redirect under separate keys.
+    var cacheKey = ResponseCache.CacheKey(context.Request.Method, requestPath);
 
     try
     {
-      var cached = responseCache.GetCachedStatusCode(requestPath);
-      if (cached == null)
+      if (responseCache.GetCachedStatusCode(cacheKey) == null)
       {
         try
         {
           await amazonS3.GetObjectMetadataAsync(config.S3!.BucketName, s3Key, context.RequestAborted);
-          await RedirectToBucket(CachingProxyStatus.MISS);
+          await RedirectToBucket();
           return;
         }
         // A locked-down bucket (no s3:ListBucket) answers a missing key with 403 Forbidden rather
@@ -52,14 +54,6 @@ public class S3CachingMiddleware(IAmazonS3 amazonS3, CachingProxyConfig config, 
         catch (AmazonServiceException ex) when (ex.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.Forbidden)
         {
         }
-      }
-      else if (cached.StatusCode == HttpStatusCode.RedirectKeepVerb)
-      {
-        // The object is known to be in the bucket. Regenerate the redirect for the current request's
-        // method instead of replaying the cached one: a presigned URL is signed for a specific verb,
-        // so replaying a GET-signed URL for a HEAD (or vice versa) would be rejected by S3.
-        await RedirectToBucket(CachingProxyStatus.HIT);
-        return;
       }
 
       using var response = await remoteProxy.ProcessAsync(context, remoteServer, remainingPath);
@@ -71,7 +65,7 @@ public class S3CachingMiddleware(IAmazonS3 amazonS3, CachingProxyConfig config, 
 
       await StoreInBucketAsync(s3Key, response, context.RequestAborted);
 
-      await RedirectToBucket(CachingProxyStatus.MISS);
+      await RedirectToBucket();
     }
     catch (OperationCanceledException)
     {
@@ -90,7 +84,7 @@ public class S3CachingMiddleware(IAmazonS3 amazonS3, CachingProxyConfig config, 
 
     return;
 
-    async ValueTask RedirectToBucket(CachingProxyStatus status)
+    async ValueTask RedirectToBucket()
     {
       string location;
       if (config.S3!.SignedLinks)
@@ -121,8 +115,8 @@ public class S3CachingMiddleware(IAmazonS3 amazonS3, CachingProxyConfig config, 
       IHeaderDictionary headers = new HeaderDictionary();
       headers.Location = location;
       var cachingResponse = new CachedResponse(HttpStatusCode.RedirectKeepVerb, headers);
-      remoteProxy.SetStatus(context, status,
-        responseCache.PutStatusCode(requestPath, remoteServer.CacheDuration, cachingResponse));
+      remoteProxy.SetStatus(context, CachingProxyStatus.MISS,
+        responseCache.PutStatusCode(cacheKey, remoteServer.CacheDuration, cachingResponse));
     }
   }
 

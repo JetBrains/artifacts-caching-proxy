@@ -163,11 +163,11 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   }
 
   [Fact]
-  public async Task Get_After_Head_Regenerates_Verb_Correct_Redirect()
+  public async Task Get_And_Head_Use_Separate_Verb_Signed_Redirects()
   {
-    // Regression: a presigned URL is signed for a specific verb. A HEAD caches a HEAD-signed
-    // redirect; a following GET must regenerate a GET-signed redirect rather than replaying the
-    // cached HEAD-signed one (which S3 would reject as SignatureDoesNotMatch).
+    // A presigned URL is signed for a specific verb. Because the cache key includes the method, a
+    // HEAD caches a HEAD-signed redirect and a GET caches its own GET-signed redirect; neither is
+    // ever served for the other method (which S3 would reject as SignatureDoesNotMatch).
     myS3.Objects["real/a.jar"] = (Encoding.UTF8.GetBytes("a.jar"), null);
 
     var server = CreateServer(signedLinks: true);
@@ -176,10 +176,29 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
       Assert.Equal(HttpStatusCode.RedirectKeepVerb, head.StatusCode);
     Assert.Equal(HttpVerb.HEAD, myS3.LastPresignVerb);
 
+    // The GET is a distinct cache entry: it probes S3 again and signs the redirect for GET.
     using var get = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
     Assert.Equal(HttpStatusCode.RedirectKeepVerb, get.StatusCode);
-    AssertStatusHeader(get, CachingProxyStatus.HIT);
+    AssertStatusHeader(get, CachingProxyStatus.MISS);
     Assert.Equal(HttpVerb.GET, myS3.LastPresignVerb);
+    Assert.Equal(2, myS3.GetObjectMetadataCalls);
+  }
+
+  [Fact]
+  public async Task Second_Head_Is_Served_From_Memory_Cache()
+  {
+    // Same verb twice: the second HEAD replays the cached HEAD-signed redirect without re-probing.
+    myS3.Objects["real/a.jar"] = (Encoding.UTF8.GetBytes("a.jar"), null);
+
+    var server = CreateServer(signedLinks: true);
+
+    using (var first = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Head.Method))
+      AssertStatusHeader(first, CachingProxyStatus.MISS);
+
+    using var second = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Head.Method);
+    Assert.Equal(HttpStatusCode.RedirectKeepVerb, second.StatusCode);
+    AssertStatusHeader(second, CachingProxyStatus.HIT);
+    Assert.Equal(1, myS3.GetObjectMetadataCalls); // probed once, replayed from memory the second time
   }
 
   [Fact]

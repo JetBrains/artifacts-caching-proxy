@@ -85,19 +85,19 @@ public partial class RemoteProxy(
 
     var isHead = HttpMethods.IsHead(context.Request.Method);
     var requestPath = context.Request.Path.Value!;
+    var cacheKey = ResponseCache.CacheKey(context.Request.Method, requestPath);
 
-    var cachedResponse = responseCache.GetCachedStatusCode(requestPath);
+    var cachedResponse = responseCache.GetCachedStatusCode(cacheKey);
     switch (cachedResponse?.StatusCode)
     {
       case >= HttpStatusCode.BadRequest:
         SetStatus(context, CachingProxyStatus.NEGATIVE_HIT, HttpStatusCode.NotFound, cachedResponse.Headers);
         return null;
 
-      // Cached redirects (3xx) replay for any method. Positive 2xx replays only for HEAD: GET
-      // populates the on-disk cache and is served by the static-file middleware, while a HEAD has
-      // no body to persist so its positive result is cached in memory here instead. (A HEAD whose
-      // file already exists on disk from a prior GET is served earlier by the static-file
-      // middleware and never reaches this layer.)
+      // Entries are keyed by HTTP method (see ResponseCache.CacheKey), so an entry only ever replays
+      // for the same verb it was stored under — which keeps a verb-specific presigned redirect from
+      // being served to the wrong method. A 2xx only ever originates from a HEAD: a GET body is not
+      // cached in memory but persisted to disk or S3 and served from there.
       case >= HttpStatusCode.MultipleChoices:
       case >= HttpStatusCode.OK when isHead:
         SetStatus(context, CachingProxyStatus.HIT, cachedResponse);
@@ -143,7 +143,7 @@ public partial class RemoteProxy(
 
       logger.LogWarning(Event.Timeout, "Timeout requesting {UpstreamUri}", upstreamUri);
 
-      var entry = responseCache.PutStatusCode(requestPath, HttpStatusCode.GatewayTimeout, remoteServer.CacheDuration);
+      var entry = responseCache.PutStatusCode(cacheKey, HttpStatusCode.GatewayTimeout, remoteServer.CacheDuration);
       SetStatus(context, CachingProxyStatus.NEGATIVE_MISS, HttpStatusCode.NotFound, entry.Headers);
       return null;
     }
@@ -151,7 +151,7 @@ public partial class RemoteProxy(
     {
       logger.LogWarning(e, "Exception requesting {UpstreamUri}: {Message}", upstreamUri, e.Message);
 
-      var entry = responseCache.PutStatusCode(requestPath, HttpStatusCode.ServiceUnavailable, remoteServer.CacheDuration);
+      var entry = responseCache.PutStatusCode(cacheKey, HttpStatusCode.ServiceUnavailable, remoteServer.CacheDuration);
       SetStatus(context, CachingProxyStatus.NEGATIVE_MISS, HttpStatusCode.NotFound, entry.Headers);
       return null;
     }
@@ -166,7 +166,7 @@ public partial class RemoteProxy(
           logger.LogWarning(Event.NegativeMiss(response.StatusCode), "Non-success requesting {UpstreamUri}: {StatusCode}", upstreamUri, response.StatusCode);
         }
 
-        var entry = responseCache.PutStatusCode(requestPath, response.StatusCode, remoteServer.CacheDuration);
+        var entry = responseCache.PutStatusCode(cacheKey, response.StatusCode, remoteServer.CacheDuration);
         SetStatus(context, CachingProxyStatus.NEGATIVE_MISS, HttpStatusCode.NotFound, entry.Headers);
         return null;
       }
@@ -193,7 +193,7 @@ public partial class RemoteProxy(
 
       if (isHead)
       {
-        responseCache.PutStatusCode(requestPath, remoteServer.CacheDuration, responseEntry);
+        responseCache.PutStatusCode(cacheKey, remoteServer.CacheDuration, responseEntry);
         SetStatus(context, CachingProxyStatus.MISS, responseEntry);
         return null;
       }
