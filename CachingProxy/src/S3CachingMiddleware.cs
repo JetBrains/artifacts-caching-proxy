@@ -38,17 +38,26 @@ public class S3CachingMiddleware(IAmazonS3 amazonS3, CachingProxyConfig config, 
 
     try
     {
-      if (responseCache.GetCachedStatusCode(requestPath) == null)
+      var cached = responseCache.GetCachedStatusCode(requestPath);
+      if (cached == null)
       {
         try
         {
           await amazonS3.GetObjectMetadataAsync(config.S3!.BucketName, s3Key, context.RequestAborted);
-          await RedirectToBucket();
+          await RedirectToBucket(CachingProxyStatus.MISS);
           return;
         }
         catch (AmazonServiceException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
         {
         }
+      }
+      else if (cached.StatusCode == HttpStatusCode.RedirectKeepVerb)
+      {
+        // The object is known to be in the bucket. Regenerate the redirect for the current request's
+        // method instead of replaying the cached one: a presigned URL is signed for a specific verb,
+        // so replaying a GET-signed URL for a HEAD (or vice versa) would be rejected by S3.
+        await RedirectToBucket(CachingProxyStatus.HIT);
+        return;
       }
 
       using var response = await remoteProxy.ProcessAsync(context, remoteServer, remainingPath);
@@ -60,7 +69,7 @@ public class S3CachingMiddleware(IAmazonS3 amazonS3, CachingProxyConfig config, 
 
       await StoreInBucketAsync(s3Key, response, context.RequestAborted);
 
-      await RedirectToBucket();
+      await RedirectToBucket(CachingProxyStatus.MISS);
     }
     catch (OperationCanceledException)
     {
@@ -76,7 +85,7 @@ public class S3CachingMiddleware(IAmazonS3 amazonS3, CachingProxyConfig config, 
 
     return;
 
-    async ValueTask RedirectToBucket()
+    async ValueTask RedirectToBucket(CachingProxyStatus status)
     {
       string location;
       if (config.S3!.SignedLinks)
@@ -98,13 +107,16 @@ public class S3CachingMiddleware(IAmazonS3 amazonS3, CachingProxyConfig config, 
             BucketName = config.S3.BucketName,
             Key = s3Key,
           }));
-        location = endpoint.URL + s3Key;
+        // Join with exactly one '/' and percent-encode each key segment (the path may contain
+        // spaces or other reserved characters), keeping the '/' separators intact.
+        var baseUrl = endpoint.URL.EndsWith('/') ? endpoint.URL : endpoint.URL + "/";
+        location = baseUrl + string.Join('/', s3Key.Split('/').Select(Uri.EscapeDataString));
       }
 
       IHeaderDictionary headers = new HeaderDictionary();
       headers.Location = location;
       var cachingResponse = new CachedResponse(HttpStatusCode.RedirectKeepVerb, headers);
-      remoteProxy.SetStatus(context, CachingProxyStatus.MISS,
+      remoteProxy.SetStatus(context, status,
         responseCache.PutStatusCode(requestPath, remoteServer.CacheDuration, cachingResponse));
     }
   }

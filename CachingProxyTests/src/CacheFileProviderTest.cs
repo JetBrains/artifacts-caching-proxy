@@ -40,4 +40,14 @@ public class CacheFileProviderTest
       Path.Combine(Path.GetTempPath(), "0c", "fd", "0cfd1c96cbc0c0e025888750a8b75d7d507ab83eaef58650f1023579f03ca306"),
       provider.GetFileInfo(Path.Combine("..", "..")).PhysicalPath);
   }
+
+  [Fact]
+  public void ManglePath_IsCaseSensitive()
+  {
+    // Upstreams are case-sensitive, so paths differing only in case must map to distinct cache files.
+    var provider = new CacheFileProvider(new CachingProxyConfig { LocalCachePath = Path.GetTempPath() });
+    Assert.NotEqual(
+      provider.GetFileInfo(Path.Combine("a", "Foo.jar")).PhysicalPath,
+      provider.GetFileInfo(Path.Combine("a", "foo.jar")).PhysicalPath);
+  }
 }

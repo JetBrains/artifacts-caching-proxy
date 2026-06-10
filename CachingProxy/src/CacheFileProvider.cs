@@ -66,16 +66,15 @@ namespace JetBrains.CachingProxy
       try
       {
         var written = Encoding.UTF8.GetBytes(subpath, buffer);
-        // normalize in-place: lowercase ASCII letters and force forward-slash delimiter
-        for (var i = 0; i < written; i++)
+        // Normalize the path delimiter to '/' so the same logical path hashes identically on every
+        // platform. Do NOT case-fold: upstreams like Maven Central and npm are case-sensitive, so
+        // e.g. 'Foo.jar' and 'foo.jar' are distinct artifacts and must map to distinct cache files.
+        if (Path.DirectorySeparatorChar != Path.AltDirectorySeparatorChar)
         {
-          if (Path.DirectorySeparatorChar != Path.AltDirectorySeparatorChar && buffer[i] == (byte)Path.DirectorySeparatorChar)
+          for (var i = 0; i < written; i++)
           {
-            buffer[i] = (byte)Path.AltDirectorySeparatorChar;
-          }
-          else if ((uint)(buffer[i] - 'A') < 26u)
-          {
-            buffer[i] |= 0x20;
+            if (buffer[i] == (byte)Path.DirectorySeparatorChar)
+              buffer[i] = (byte)Path.AltDirectorySeparatorChar;
           }
         }
         var hash = Convert.ToHexStringLower(SHA256.HashData(buffer[..written]));

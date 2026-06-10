@@ -163,6 +163,26 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   }
 
   [Fact]
+  public async Task Get_After_Head_Regenerates_Verb_Correct_Redirect()
+  {
+    // Regression: a presigned URL is signed for a specific verb. A HEAD caches a HEAD-signed
+    // redirect; a following GET must regenerate a GET-signed redirect rather than replaying the
+    // cached HEAD-signed one (which S3 would reject as SignatureDoesNotMatch).
+    myS3.Objects["real/a.jar"] = (Encoding.UTF8.GetBytes("a.jar"), null);
+
+    var server = CreateServer(signedLinks: true);
+
+    using (var head = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Head.Method))
+      Assert.Equal(HttpStatusCode.RedirectKeepVerb, head.StatusCode);
+    Assert.Equal(HttpVerb.HEAD, myS3.LastPresignVerb);
+
+    using var get = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
+    Assert.Equal(HttpStatusCode.RedirectKeepVerb, get.StatusCode);
+    AssertStatusHeader(get, CachingProxyStatus.HIT);
+    Assert.Equal(HttpVerb.GET, myS3.LastPresignVerb);
+  }
+
+  [Fact]
   public async Task Unsigned_Links_Redirect_To_Bucket_Endpoint()
   {
     var server = CreateServer(signedLinks: false);
@@ -234,6 +254,13 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     public readonly Dictionary<string, (byte[] Body, string? ContentType)> Objects = new();
     public int GetObjectMetadataCalls;
     public int PutObjectCalls;
+    public HttpVerb? LastPresignVerb;
+
+    public override Task<string> GetPreSignedURLAsync(GetPreSignedUrlRequest request)
+    {
+      LastPresignVerb = request.Verb;
+      return base.GetPreSignedURLAsync(request);
+    }
 
     public override Task<GetObjectMetadataResponse> GetObjectMetadataAsync(string bucketName, string key, CancellationToken cancellationToken = default)
     {
