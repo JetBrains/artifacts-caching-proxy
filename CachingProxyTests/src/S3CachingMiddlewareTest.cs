@@ -100,6 +100,20 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   }
 
   [Fact]
+  public async Task Get_Without_Content_Length_Is_Spooled_And_Uploaded()
+  {
+    // Upstream responds chunked (no Content-Length). The body must still land in the bucket intact,
+    // spooled via a temp file rather than buffered whole in memory.
+    var server = CreateServer(signedLinks: true);
+    using var response = await server.CreateRequest("/real/chunked.bin").SendAsync(HttpMethod.Get.Method);
+
+    Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
+    AssertStatusHeader(response, CachingProxyStatus.MISS);
+    Assert.True(myS3.Objects.TryGetValue("real/chunked.bin", out var stored));
+    Assert.Equal("chunk1chunk2", Encoding.UTF8.GetString(stored.Body));
+  }
+
+  [Fact]
   public async Task Head_Miss_Returns_Upstream_Metadata_Without_Upload()
   {
     // A HEAD has no body to store, so on a miss it is answered with the upstream metadata

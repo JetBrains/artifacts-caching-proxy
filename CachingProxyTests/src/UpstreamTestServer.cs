@@ -63,6 +63,13 @@ public class UpstreamTestServer : IAsyncLifetime
         return res.WriteAsync("not too much");
       })
       .MapGet("a.jar", (req, res, data) => res.WriteAsync("a.jar"))
+      .MapGet("chunked.bin", async (req, res, data) =>
+      {
+        // Flush after the first write so the response is sent chunked, with no Content-Length.
+        await res.WriteAsync("chunk1");
+        await res.Body.FlushAsync();
+        await res.WriteAsync("chunk2");
+      })
       .MapGet("gzipEncoding.txt", (req, res, data) =>
       {
         res.Headers.ContentEncoding = "gzip";

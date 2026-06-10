@@ -1,7 +1,9 @@
 ﻿using System;
 using System.Diagnostics.CodeAnalysis;
+using System.IO;
 using System.Linq;
 using System.Net;
+using System.Net.Http;
 using System.Net.Mime;
 using System.Threading;
 using System.Threading.Tasks;
@@ -56,18 +58,7 @@ public class S3CachingMiddleware(IAmazonS3 amazonS3, CachingProxyConfig config, 
 
       context.Response.Clear();
 
-      await amazonS3.PutObjectAsync(new PutObjectRequest
-      {
-        BucketName = config.S3!.BucketName,
-        Key = s3Key,
-        Headers =
-        {
-          ContentType = response.Content.Headers.ContentType?.ToString(),
-          ContentEncoding = response.Content.Headers.ContentEncoding.FirstOrDefault(),
-          ContentLength = response.Content.Headers.ContentLength ?? -1
-        },
-        InputStream = await response.Content.ReadAsStreamAsync(),
-      }, context.RequestAborted);
+      await StoreInBucketAsync(s3Key, response, context.RequestAborted);
 
       await RedirectToBucket();
     }
@@ -88,7 +79,7 @@ public class S3CachingMiddleware(IAmazonS3 amazonS3, CachingProxyConfig config, 
     async ValueTask RedirectToBucket()
     {
       string location;
-      if (config.S3.SignedLinks)
+      if (config.S3!.SignedLinks)
       {
         location = await amazonS3.GetPreSignedURLAsync(new GetPreSignedUrlRequest
         {
@@ -115,6 +106,52 @@ public class S3CachingMiddleware(IAmazonS3 amazonS3, CachingProxyConfig config, 
       var cachingResponse = new CachedResponse(HttpStatusCode.RedirectKeepVerb, headers);
       remoteProxy.SetStatus(context, CachingProxyStatus.MISS,
         responseCache.PutStatusCode(requestPath, remoteServer.CacheDuration, cachingResponse));
+    }
+  }
+
+  /// <summary>
+  /// Streams the upstream response body into the bucket. S3 PutObject needs a definite
+  /// Content-Length: when the upstream declared one we stream the (non-seekable) body straight
+  /// through; when it did not (e.g. chunked transfer) we first spool the body to a temp file so the
+  /// SDK gets a real length and does not buffer the whole body in memory.
+  /// </summary>
+  private async Task StoreInBucketAsync(string s3Key, HttpResponseMessage response, CancellationToken cancellationToken)
+  {
+    await using var body = await response.Content.ReadAsStreamAsync(cancellationToken);
+    var contentLength = response.Content.Headers.ContentLength;
+
+    string? spoolPath = null;
+    FileStream? spooled = null;
+    try
+    {
+      var uploadStream = body;
+      if (contentLength is null)
+      {
+        spoolPath = Path.Combine(Path.GetTempPath(), "s3-upload-" + Guid.NewGuid());
+        spooled = new FileStream(spoolPath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, 81920, FileOptions.Asynchronous);
+        await body.CopyToAsync(spooled, cancellationToken);
+        spooled.Position = 0;
+        contentLength = spooled.Length;
+        uploadStream = spooled;
+      }
+
+      await amazonS3.PutObjectAsync(new PutObjectRequest
+      {
+        BucketName = config.S3!.BucketName,
+        Key = s3Key,
+        Headers =
+        {
+          ContentType = response.Content.Headers.ContentType?.ToString(),
+          ContentEncoding = response.Content.Headers.ContentEncoding.FirstOrDefault(),
+          ContentLength = contentLength.Value
+        },
+        InputStream = uploadStream,
+      }, cancellationToken);
+    }
+    finally
+    {
+      if (spooled != null) await spooled.DisposeAsync();
+      if (spoolPath != null) File.Delete(spoolPath);
     }
   }
 
