@@ -52,14 +52,14 @@ public partial class RemoteProxy(
   {
     if (!HttpMethods.IsHead(context.Request.Method) && !HttpMethods.IsGet(context.Request.Method))
     {
-      await SetStatus(context, CachingProxyStatus.BAD_REQUEST, HttpStatusCode.MethodNotAllowed);
+      await SetStatusAsync(context, CachingProxyStatus.BAD_REQUEST, HttpStatusCode.MethodNotAllowed);
       return false;
     }
 
     var requestPath = context.Request.Path.Value!;
     if (requestPath.Contains("..", StringComparison.Ordinal) || !OurGoodPathChars.IsMatch(requestPath))
     {
-      await SetStatus(context, CachingProxyStatus.BAD_REQUEST, HttpStatusCode.BadRequest, "Invalid request path");
+      await SetStatusAsync(context, CachingProxyStatus.BAD_REQUEST, HttpStatusCode.BadRequest, "Invalid request path");
       return false;
     }
 
@@ -106,7 +106,7 @@ public partial class RemoteProxy(
 
     if (myBlacklistRegex != null && myBlacklistRegex.IsMatch(requestPath))
     {
-      await SetStatus(context, CachingProxyStatus.BLACKLISTED, HttpStatusCode.NotFound, "Blacklisted");
+      await SetStatusAsync(context, CachingProxyStatus.BLACKLISTED, HttpStatusCode.NotFound, "Blacklisted");
       return null;
     }
 
@@ -227,7 +227,7 @@ public partial class RemoteProxy(
   public static readonly StringValues OurEternalCachingHeader =
     new CacheControlHeaderValue { Public = true, MaxAge = TimeSpan.FromDays(365) }.ToString();
 
-  public async ValueTask SetStatus(HttpContext context, CachingProxyStatus status, HttpStatusCode? httpCode = null, string? responseString = null)
+  public async ValueTask SetStatusAsync(HttpContext context, CachingProxyStatus status, HttpStatusCode? httpCode = null, string? responseString = null)
   {
     SetStatusHeader(context, status);
 
