@@ -1,34 +1,32 @@
 using System;
 using System.Net;
+using System.Runtime.CompilerServices;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.Extensions.Caching.Memory;
 
 namespace JetBrains.CachingProxy;
 
-public class ResponseCache(IMemoryCache cache)
+public class ResponseCache(IMemoryCache cache, TimeProvider timeProvider)
 {
-  public Entry? GetCachedStatusCode(string cacheKey) =>
-    cache.TryGetValue<Entry>(cacheKey, out var entry) ? entry : null;
+  public IHttpResponseFeature? GetCachedStatusCode(string cacheKey) =>
+    cache.TryGetValue<IHttpResponseFeature>(cacheKey, out var entry) ? entry : null;
 
-  public Entry PutStatusCode(string cacheKey, HttpStatusCode statusCode, CacheDuration? cacheDuration, DateTimeOffset? lastModified = null,
-    string? contentType = null, string? contentEncoding = null, long? contentLength = null)
+  public IHttpResponseFeature PutStatusCode(string cacheKey, HttpStatusCode statusCode, CacheDuration? cacheDuration = null) =>
+    PutStatusCode(cacheKey, cacheDuration, new HttpResponseFeature { StatusCode = (int)statusCode });
+
+  public IHttpResponseFeature PutStatusCode(string cacheKey, CacheDuration? cacheDuration, IHttpResponseFeature entry)
   {
-    var entry = new Entry(statusCode, cacheDuration, lastModified, contentType, contentEncoding, contentLength);
+    var cachingTime = GetCacheDuration(cacheDuration, (HttpStatusCode)entry.StatusCode);
+    entry.Headers[CachingProxyConstants.CachedStatusHeader] = entry.StatusCode.ToString();
+    entry.Headers[CachingProxyConstants.CachedUntilHeader] = (timeProvider.GetUtcNow() + cachingTime).ToString("R");
+
     return cache.Set(cacheKey, entry, new MemoryCacheEntryOptions
     {
-      AbsoluteExpirationRelativeToNow = entry.GetCacheTimeSpan(),
+      AbsoluteExpirationRelativeToNow = cachingTime,
     });
   }
 
-  public record Entry(
-    HttpStatusCode StatusCode,
-    CacheDuration? CacheDuration,
-    DateTimeOffset? LastModified,
-    string? ContentType,
-    string? ContentEncoding,
-    long? ContentLength)
-  {
-    public TimeSpan GetCacheTimeSpan() =>
-      CacheDuration?.TryGetValue(StatusCode, out var timeSpan) ?? false ? timeSpan :
-        CacheDuration.Default.TryGetValue(StatusCode, out timeSpan) ? timeSpan : CacheDuration.DefaultDuration;
-  }
+  public static TimeSpan GetCacheDuration(CacheDuration? cacheDuration, HttpStatusCode statusCode) =>
+    cacheDuration?.TryGetValue(statusCode, out var timeSpan) ?? false ? timeSpan :
+    CacheDuration.Default.TryGetValue(statusCode, out timeSpan) ? timeSpan : CacheDuration.DefaultDuration;
 }

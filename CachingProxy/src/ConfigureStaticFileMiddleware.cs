@@ -21,8 +21,8 @@ public class ConfigureStaticFileMiddleware(CacheFileProvider cacheFileProvider, 
       if (contentEncoding != null)
         ctx.Context.Response.Headers.ContentEncoding = contentEncoding;
 
-      remoteProxy.MarkStatus(ctx.Context, CachingProxyStatus.HIT);
-      remoteProxy.AddEternalCachingControl(ctx.Context);
+      remoteProxy.SetStatusHeader(ctx.Context, CachingProxyStatus.HIT);
+      ctx.Context.Response.Headers.CacheControl = RemoteProxy.OurEternalCachingHeader;
     };
   }
 }

@@ -11,6 +11,10 @@
     <PackageVersion Include="OpenTelemetry.Extensions.Hosting" Version="1.15.3" />
     <PackageVersion Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.15.2" />
     <PackageVersion Include="OpenTelemetry.Instrumentation.Runtime" Version="1.15.1" />
+    <PackageVersion Include="AWSSDK.Extensions.NETCore.Setup" Version="4.0.4.4" />
+    <PackageVersion Include="AWSSDK.S3" Version="4.0.13.1" />
+    <PackageVersion Include="AWSSDK.SSO" Version="4.0.3.1" />
+    <PackageVersion Include="AWSSDK.SSOOIDC" Version="4.0.4.3" />
     <PackageVersion Include="Sentry.AspNetCore" Version="6.5.0" />
     <!-- Test packages -->
     <PackageVersion Include="Microsoft.AspNetCore.TestHost" Version="10.0.7" />

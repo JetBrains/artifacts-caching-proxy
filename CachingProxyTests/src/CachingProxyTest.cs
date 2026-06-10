@@ -8,9 +8,11 @@ using System.Net.Http;
 using System.Net.Mime;
 using System.Reflection;
 using System.Text;
+using System.Text.Json;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.TestHost;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
@@ -66,15 +68,17 @@ namespace JetBrains.CachingProxy.Tests
       myHost = new HostBuilder()
         .ConfigureWebHost(webHostBuilder =>
         {
+          using var json = new MemoryStream(JsonSerializer.SerializeToUtf8Bytes(myConfig));
+          var configuration = new ConfigurationBuilder().AddJsonStream(json).Build();
           webHostBuilder
             .UseTestServer()
             .ConfigureTestServices(services =>
             {
               services.AddSingleton(myConfig);
-              Program.ConfigureOurServices(services);
+              Program.ConfigureOurServices(services, configuration);
               services.Replace(ServiceDescriptor.Singleton<TimeProvider>(myTimeProvider));
             })
-            .Configure(Program.ConfigureOurApp);
+            .Configure((context, builder) => Program.ConfigureOurApp(builder, context.Configuration));
         })
         .Build();
       myServer = myHost.GetTestServer();
@@ -601,6 +605,8 @@ namespace JetBrains.CachingProxy.Tests
       const string url = "/real-custom-ttl/gzipEncoding.txt";
       var customOkDuration = TimeSpan.FromMinutes(30);
 
+      myTimeProvider.AdjustTime(myTimeProvider.Start);
+
       await AssertHeadResponse(url, HttpStatusCode.OK,
         message =>
         {
@@ -610,13 +616,14 @@ namespace JetBrains.CachingProxy.Tests
         });
 
       // Past the 5-minute default but still within the custom 30-minute window.
+      // Cached-Until reflects the original MISS time (Start), not the time of this HIT.
       myTimeProvider.Advance(TimeSpan.FromMinutes(10));
       await AssertHeadResponse(url, HttpStatusCode.OK,
         message =>
         {
           AssertStatusHeader(message, CachingProxyStatus.HIT);
           AssertCachedStatusHeader(message, HttpStatusCode.OK);
-          AssertCachedUntilHeader(message, myTimeProvider.GetUtcNow() + customOkDuration);
+          AssertCachedUntilHeader(message, myTimeProvider.Start + customOkDuration);
         });
 
       // Past the 30-minute custom window — entry should be evicted.
@@ -637,6 +644,8 @@ namespace JetBrains.CachingProxy.Tests
       const string url = "/real-custom-ttl/not_found.txt";
       var customNotFoundDuration = TimeSpan.FromMinutes(15);
 
+      myTimeProvider.AdjustTime(myTimeProvider.Start);
+
       await AssertGetResponse(url, HttpStatusCode.NotFound,
         (message, bytes) =>
         {
@@ -646,13 +655,14 @@ namespace JetBrains.CachingProxy.Tests
         });
 
       // Past the 5-minute default but within the custom 15-minute window.
+      // Cached-Until reflects the original MISS time (Start), not the time of this HIT.
       myTimeProvider.Advance(TimeSpan.FromMinutes(10));
       await AssertGetResponse(url, HttpStatusCode.NotFound,
         (message, bytes) =>
         {
           AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_HIT);
           AssertCachedStatusHeader(message, HttpStatusCode.NotFound);
-          AssertCachedUntilHeader(message, myTimeProvider.GetUtcNow() + customNotFoundDuration);
+          AssertCachedUntilHeader(message, myTimeProvider.Start + customNotFoundDuration);
         });
 
       // Past the 15-minute custom window — negative cache entry should be evicted.
@@ -669,6 +679,8 @@ namespace JetBrains.CachingProxy.Tests
     [Fact]
     public async Task CleanupService()
     {
+      myTimeProvider.AdjustTime(myTimeProvider.Start);
+
       foreach (var directory in Directory.EnumerateDirectories(myConfig.LocalCachePath, "*", SearchOption.TopDirectoryOnly))
       {
         Directory.Delete(directory, true);

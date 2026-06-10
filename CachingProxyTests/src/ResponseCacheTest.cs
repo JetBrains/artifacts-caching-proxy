@@ -17,14 +17,14 @@ public class ResponseCacheTest
     {
       Clock = new TimeProviderClock(_timeProvider)
     });
-    _cache = new ResponseCache(memoryCache);
+    _cache = new ResponseCache(memoryCache, _timeProvider);
   }
 
   [Fact]
   public void CacheEntry_ExpiresAfterAbsoluteTime()
   {
     const string key = "test-key";
-    _cache.PutStatusCode(key, HttpStatusCode.OK, null, null, null, null);
+    _cache.PutStatusCode(key, HttpStatusCode.OK);
 
     // Entry should exist immediately
     Assert.NotNull(_cache.GetCachedStatusCode(key));
@@ -40,7 +40,7 @@ public class ResponseCacheTest
   public void CacheEntry_AccessDoesNotExtendExpiration()
   {
     const string key = "test-key";
-    _cache.PutStatusCode(key, HttpStatusCode.OK, null, null, null, null);
+    _cache.PutStatusCode(key, HttpStatusCode.OK);
 
     // Simulate high-load access pattern: access every 30 seconds
     // With sliding expiration, these repeated accesses would keep extending the entry
@@ -64,7 +64,7 @@ public class ResponseCacheTest
   public void CacheEntry_OkAndNotFound_ExpireAfter5Minutes(HttpStatusCode statusCode)
   {
     const string key = "test-key";
-    _cache.PutStatusCode(key, statusCode, null, null, null, null);
+    _cache.PutStatusCode(key, statusCode);
 
     // Should exist at 4:59
     _timeProvider.Advance(TimeSpan.FromMinutes(5) - TimeSpan.FromSeconds(1));
@@ -82,7 +82,7 @@ public class ResponseCacheTest
   public void CacheEntry_OtherStatusCodes_ExpireAfter1Minute(HttpStatusCode statusCode)
   {
     const string key = "test-key";
-    _cache.PutStatusCode(key, statusCode, null, null, null, null);
+    _cache.PutStatusCode(key, statusCode);
 
     // Should exist at 0:59
     _timeProvider.Advance(TimeSpan.FromSeconds(59));

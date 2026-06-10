@@ -41,8 +41,6 @@ namespace JetBrains.CachingProxy
       return null;
     }
 
-    public IReadOnlyList<RemoteServer> Servers => myServers;
-
     public class RemoteServer
     {
       internal RemoteServer(PathString prefix, Uri remoteUri, CacheDuration? cacheDuration)

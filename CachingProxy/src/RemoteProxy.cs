@@ -3,13 +3,14 @@ using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Net.Mime;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Primitives;
-using Microsoft.Net.Http.Headers;
 
 namespace JetBrains.CachingProxy;
 
@@ -21,14 +22,16 @@ namespace JetBrains.CachingProxy;
 /// streamed and persisted elsewhere.
 /// </summary>
 [SuppressMessage("ReSharper", "ClassNeverInstantiated.Global")]
-public class RemoteProxy(
+public partial class RemoteProxy(
   CachingProxyConfig config,
   ProxyHttpClient httpClient,
   ResponseCache responseCache,
   CachingProxyMetrics metrics,
-  TimeProvider timeProvider,
   ILogger<RemoteProxy> logger)
 {
+  [GeneratedRegex(@"^([\x20a-zA-Z_\-0-9./+@]|%[0-9a-fA-F]{2})+$", RegexOptions.Compiled)]
+  private static partial Regex OurGoodPathChars { get; }
+
   private readonly Regex? myBlacklistRegex = !string.IsNullOrWhiteSpace(config.BlacklistUrlRegex) ?
     new Regex(config.BlacklistUrlRegex, RegexOptions.Compiled) : null;
 
@@ -45,21 +48,50 @@ public class RemoteProxy(
   /// hits, the upstream request and its validation (including Content-Encoding). Writes the full
   /// response head — status, metadata headers (Content-Length, Last-Modified), representation
   /// headers (Content-Type, Content-Encoding) and the proxy bookkeeping headers — to
-  /// <paramref name="context"/>. The <paramref name="contentType"/> is supplied by the caller
-  /// (this layer does not derive it): it is applied to the response and stored in the in-memory
-  /// cache so later HEAD cache hits report the same type. The <paramref name="requestPath"/> is
-  /// assumed to be already validated and safe by the caller. For a successful GET the open
+  /// <paramref name="context"/>. The <paramref name="getContentType"/> is supplied by the caller
+  /// (this layer could derive it): it is applied to the response and stored in the in-memory
+  /// cache so later HEAD cache hits report the same type. For a successful GET the open
   /// upstream response is returned so the caller can stream and persist the body (reading its
   /// Content-Encoding off the response) and must dispose it; in every other case the request is
   /// fully handled, the response (if any) is disposed internally, and <c>null</c> is returned.
   /// </summary>
-  public async Task<HttpResponseMessage?> ProcessAsync(HttpContext context, RemoteServers.RemoteServer remoteServer,
-    PathString remainingPath, string requestPath, bool isHead, string? contentType)
+  public async Task<HttpResponseMessage?> ProcessAsync(HttpContext context, RemoteServers.RemoteServer remoteServer, PathString remainingPath,
+    Func<HttpResponseMessage, string?>? getContentType = null)
   {
-    var upstreamUri = remoteServer.RemoteUri;
-    if (remainingPath != PathString.Empty)
+    var isHead = HttpMethods.IsHead(context.Request.Method);
+    var isGet = HttpMethods.IsGet(context.Request.Method);
+
+    if (!isHead && !isGet)
     {
-      upstreamUri = new Uri(upstreamUri, remainingPath.Value.AsSpan(remainingPath.Value?[0] == '/' ? 1 : 0).ToString());
+      context.Response.StatusCode = (int) HttpStatusCode.MethodNotAllowed;
+      return null;
+    }
+
+    var requestPath = context.Request.Path.Value!;
+    if (requestPath.Contains("..", StringComparison.Ordinal) || !OurGoodPathChars.IsMatch(requestPath))
+    {
+      await SetStatus(context, CachingProxyStatus.BAD_REQUEST, HttpStatusCode.BadRequest, "Invalid request path");
+      return null;
+    }
+
+    var cachedResponse = responseCache.GetCachedStatusCode(requestPath);
+    switch ((HttpStatusCode?)cachedResponse?.StatusCode)
+    {
+      case >= HttpStatusCode.BadRequest:
+        SetStatus(context, CachingProxyStatus.NEGATIVE_HIT, HttpStatusCode.NotFound, cachedResponse.Headers);
+        return null;
+
+      // GET populates the on-disk cache, so a repeated GET is served by the static-file middleware.
+      // A HEAD has no body to persist, so its positive result is cached in memory here instead.
+      // (A HEAD whose file already exists on disk from a prior GET is served earlier by the
+      // static-file middleware and never reaches this layer.)
+      case >= HttpStatusCode.OK and < HttpStatusCode.MultipleChoices when isHead:
+        SetStatus(context, CachingProxyStatus.HIT, cachedResponse);
+        return null;
+
+      case >= HttpStatusCode.MultipleChoices:
+        SetStatus(context, CachingProxyStatus.HIT, cachedResponse);
+        return null;
     }
 
     if (myBlacklistRegex != null && myBlacklistRegex.IsMatch(requestPath))
@@ -68,39 +100,24 @@ public class RemoteProxy(
       return null;
     }
 
+    var upstreamUri = remoteServer.RemoteUri;
+    if (remainingPath != PathString.Empty)
+    {
+      upstreamUri = new Uri(upstreamUri, remainingPath.Value.AsSpan(remainingPath.Value?[0] == '/' ? 1 : 0).ToString());
+    }
+
     var isRedirectToRemoteUrl = myRedirectToRemoteUrlsRegex != null && myRedirectToRemoteUrlsRegex.IsMatch(requestPath);
     if (isRedirectToRemoteUrl)
     {
-      await SetStatus(context, CachingProxyStatus.ALWAYS_REDIRECT, HttpStatusCode.RedirectKeepVerb);
-      context.Response.GetTypedHeaders().Location = upstreamUri;
-      return null;
-    }
-
-    var cachedResponse = responseCache.GetCachedStatusCode(requestPath);
-    if (cachedResponse != null && !cachedResponse.StatusCode.IsSuccessStatusCode())
-    {
-      SetCachedResponseHeader(context, cachedResponse);
-      await SetStatus(context, CachingProxyStatus.NEGATIVE_HIT, HttpStatusCode.NotFound);
-      return null;
-    }
-
-    // GET populates the on-disk cache, so a repeated GET is served by the static-file middleware.
-    // A HEAD has no body to persist, so its positive result is cached in memory here instead.
-    // (A HEAD whose file already exists on disk from a prior GET is served earlier by the
-    // static-file middleware and never reaches this layer.)
-    if (cachedResponse != null && cachedResponse.StatusCode.IsSuccessStatusCode() && isHead)
-    {
-      var responseHeaders = context.Response.GetTypedHeaders();
-
-      responseHeaders.LastModified = cachedResponse.LastModified;
-      responseHeaders.ContentLength = cachedResponse.ContentLength;
-      context.Response.Headers.ContentType = cachedResponse.ContentType;
-
-      if (cachedResponse.ContentEncoding != null)
-        context.Response.Headers.ContentEncoding = cachedResponse.ContentEncoding;
-
-      SetCachedResponseHeader(context, cachedResponse);
-      await SetStatus(context, CachingProxyStatus.HIT, HttpStatusCode.OK);
+      cachedResponse = new HttpResponseFeature
+      {
+        StatusCode = (int)HttpStatusCode.RedirectKeepVerb,
+        Headers =
+        {
+          Location = upstreamUri.ToString()
+        }
+      };
+      SetStatus(context, CachingProxyStatus.ALWAYS_REDIRECT, cachedResponse);
       return null;
     }
 
@@ -122,9 +139,7 @@ public class RemoteProxy(
       logger.LogWarning(Event.Timeout, "Timeout requesting {UpstreamUri}", upstreamUri);
 
       var entry = responseCache.PutStatusCode(requestPath, HttpStatusCode.GatewayTimeout, remoteServer.CacheDuration);
-
-      SetCachedResponseHeader(context, entry);
-      await SetStatus(context, CachingProxyStatus.NEGATIVE_MISS, HttpStatusCode.NotFound);
+      SetStatus(context, CachingProxyStatus.NEGATIVE_MISS, HttpStatusCode.NotFound, entry.Headers);
       return null;
     }
     catch (Exception e)
@@ -132,8 +147,7 @@ public class RemoteProxy(
       logger.LogWarning(e, "Exception requesting {UpstreamUri}: {Message}", upstreamUri, e.Message);
 
       var entry = responseCache.PutStatusCode(requestPath, HttpStatusCode.ServiceUnavailable, remoteServer.CacheDuration);
-      SetCachedResponseHeader(context, entry);
-      await SetStatus(context, CachingProxyStatus.NEGATIVE_MISS, HttpStatusCode.NotFound);
+      SetStatus(context, CachingProxyStatus.NEGATIVE_MISS, HttpStatusCode.NotFound, entry.Headers);
       return null;
     }
 
@@ -148,18 +162,9 @@ public class RemoteProxy(
         }
 
         var entry = responseCache.PutStatusCode(requestPath, response.StatusCode, remoteServer.CacheDuration);
-
-        SetCachedResponseHeader(context, entry);
-        await SetStatus(context, CachingProxyStatus.NEGATIVE_MISS, HttpStatusCode.NotFound);
+        SetStatus(context, CachingProxyStatus.NEGATIVE_MISS, HttpStatusCode.NotFound, entry.Headers);
         return null;
       }
-
-      var contentLength = response.Content.Headers.ContentLength;
-      context.Response.ContentLength = contentLength;
-
-      var contentLastModified = response.Content.Headers.LastModified;
-      if (contentLastModified != null)
-        context.Response.GetTypedHeaders().LastModified = contentLastModified;
 
       var headersContentEncoding = response.Content.Headers.ContentEncoding;
       if (headersContentEncoding.Count > 1)
@@ -187,24 +192,27 @@ public class RemoteProxy(
         return null;
       }
 
-      if (contentEncoding != null)
-        context.Response.Headers.ContentEncoding = contentEncoding;
-
-      if (contentType != null)
-        context.Response.ContentType = contentType;
+      var responseEntry = new HttpResponseFeature
+      {
+        StatusCode = (int)response.StatusCode,
+        Headers =
+        {
+          LastModified = response.Content.Headers.LastModified?.ToString("R"),
+          ContentLength = response.Content.Headers.ContentLength,
+          ContentType = getContentType?.Invoke(response) ?? response.Content.Headers.ContentType?.MediaType,
+          ContentEncoding = contentEncoding,
+          CacheControl = response.StatusCode is >= HttpStatusCode.OK and < HttpStatusCode.MultipleChoices ? OurEternalCachingHeader : default
+        }
+      };
 
       if (isHead)
       {
-        var entry = responseCache.PutStatusCode(
-          requestPath, response.StatusCode, remoteServer.CacheDuration,
-          lastModified: contentLastModified, contentType: contentType, contentEncoding: contentEncoding, contentLength: contentLength);
-        SetCachedResponseHeader(context, entry);
-        await SetStatus(context, CachingProxyStatus.MISS, HttpStatusCode.OK);
+        responseCache.PutStatusCode(requestPath, remoteServer.CacheDuration, responseEntry);
+        SetStatus(context, CachingProxyStatus.MISS, responseEntry);
         return null;
       }
 
-      await SetStatus(context, CachingProxyStatus.MISS, HttpStatusCode.OK);
-
+      SetStatus(context, CachingProxyStatus.MISS, responseEntry);
       transferOwnership = true;
       return response;
     }
@@ -214,9 +222,11 @@ public class RemoteProxy(
     }
   }
 
-  public void MarkStatus(HttpContext context, CachingProxyStatus status) => SetStatusHeader(context, status);
 
-  private async Task SetStatus(HttpContext context, CachingProxyStatus status, HttpStatusCode? httpCode = null, string? responseString = null)
+  public static readonly StringValues OurEternalCachingHeader =
+    new CacheControlHeaderValue { Public = true, MaxAge = TimeSpan.FromDays(365) }.ToString();
+
+  public async ValueTask SetStatus(HttpContext context, CachingProxyStatus status, HttpStatusCode? httpCode = null, string? responseString = null)
   {
     SetStatusHeader(context, status);
 
@@ -227,21 +237,27 @@ public class RemoteProxy(
       await context.Response.WriteAsync(responseString);
   }
 
-  private void SetStatusHeader(HttpContext context, CachingProxyStatus status)
+  public void SetStatus(HttpContext context, CachingProxyStatus status, IHttpResponseFeature response) =>
+    SetStatus(context, status, (HttpStatusCode)response.StatusCode, response.Headers);
+
+  private void SetStatus(HttpContext context, CachingProxyStatus status, HttpStatusCode statusCode, IHeaderDictionary headers)
+  {
+    SetStatusHeader(context, status);
+    context.Response.StatusCode = (int)statusCode;
+    SetCachedResponseHeader(context, headers);
+  }
+
+  public void SetStatusHeader(HttpContext context, CachingProxyStatus status)
   {
     context.Response.Headers[CachingProxyConstants.StatusHeader] = status.ToString();
     metrics.IncrementRequests(status);
   }
 
-  private void SetCachedResponseHeader(HttpContext context, ResponseCache.Entry entry)
+  private static void SetCachedResponseHeader(HttpContext context, IHeaderDictionary headers)
   {
-    context.Response.Headers[CachingProxyConstants.CachedStatusHeader] = ((int) entry.StatusCode).ToString();
-    context.Response.Headers[CachingProxyConstants.CachedUntilHeader] = (timeProvider.GetUtcNow() + entry.GetCacheTimeSpan()) .ToString("R");
+    foreach (var (key, value) in headers)
+    {
+      context.Response.Headers[key] = value;
+    }
   }
-
-  private static readonly StringValues ourEternalCachingHeader =
-    new CacheControlHeaderValue { Public = true, MaxAge = TimeSpan.FromDays(365) }.ToString();
-
-  public void AddEternalCachingControl(HttpContext context) =>
-    context.Response.Headers.CacheControl = ourEternalCachingHeader;
 }

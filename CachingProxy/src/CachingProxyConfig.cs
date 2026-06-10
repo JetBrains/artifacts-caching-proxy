@@ -7,7 +7,10 @@ namespace JetBrains.CachingProxy
 {
   public class CachingProxyConfig
   {
+    public record S3Config(string? BucketName, bool SignedLinks);
+
     public CachingProxyPrefix[] Prefixes { get; init; } = [];
+    public S3Config? S3 { get; init; }
     public string LocalCachePath { get; init; } = Path.Combine(Path.GetTempPath(), "artifacts-caching-proxy");
     public string? BlacklistUrlRegex { get; init; }
     public long MinimumFreeDiskSpaceMb { get; init; } = 2048;

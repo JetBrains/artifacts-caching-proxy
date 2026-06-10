@@ -15,6 +15,7 @@ public class CacheDuration : Dictionary<HttpStatusCode, TimeSpan>
   };
 
   public static readonly TimeSpan DefaultDuration = TimeSpan.FromMinutes(1);
+  public static readonly TimeSpan CacheOffsetDuration = TimeSpan.FromSeconds(5);
 
   public override string ToString() =>
     $"{{ {string.Join(", ", this.Select(kvp => $"{kvp.Key}={kvp.Value}"))} }}";

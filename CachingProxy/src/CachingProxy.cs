@@ -6,7 +6,6 @@ using System.Linq;
 using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Text.RegularExpressions;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
@@ -15,7 +14,7 @@ using Microsoft.Extensions.Logging;
 namespace JetBrains.CachingProxy;
 
 [SuppressMessage("ReSharper", "UnusedMember.Global")]
-public partial class CachingProxy(
+public class CachingProxy(
   CacheFileProvider cacheFileProvider,
   ILogger<CachingProxy> logger,
   CachingProxyConfig config,
@@ -25,46 +24,19 @@ public partial class CachingProxy(
 {
   private const int BUFFER_SIZE = 81920;
 
-  [GeneratedRegex(@"^([\x20a-zA-Z_\-0-9./+@]|%[0-9a-fA-F]{2})+$", RegexOptions.Compiled)]
-  private static partial Regex OurGoodPathChars { get; }
-
   public async Task InvokeAsync(HttpContext context, RequestDelegate next)
   {
-    var remoteServer = remoteProxy.LookupRemoteServer(context.Request.Path, out var remainingPath);
+    var requestPath = context.Request.Path;
+    var remoteServer = remoteProxy.LookupRemoteServer(requestPath, out var remainingPath);
     if (remoteServer == null)
     {
       await next(context);
       return;
     }
 
-    var isHead = HttpMethods.IsHead(context.Request.Method);
-    var isGet = HttpMethods.IsGet(context.Request.Method);
-
-    if (!isHead && !isGet)
-    {
-      context.Response.StatusCode = (int) HttpStatusCode.MethodNotAllowed;
-      return;
-    }
-
-    var requestPath = context.Request.Path.Value ?? "";
-    if (requestPath.Contains("..", StringComparison.Ordinal) || !OurGoodPathChars.IsMatch(requestPath))
-    {
-      remoteProxy.MarkStatus(context, CachingProxyStatus.BAD_REQUEST);
-      context.Response.StatusCode = (int) HttpStatusCode.BadRequest;
-      await context.Response.WriteAsync("Invalid request path");
-      return;
-    }
-
-    var contentType = options.ContentTypeProvider.TryGetContentType(requestPath, out var resolvedContentType) ?
-      resolvedContentType : options.DefaultContentType;
-
-    using var response = await remoteProxy.ProcessAsync(context, remoteServer, remainingPath, requestPath, isHead, contentType);
-
-    // Every 200 OK we emit is a successfully resolved immutable artifact (HEAD cache hit/miss or
-    // GET MISS body), so it may be cached forever; non-2xx outcomes (redirect, negative, errors)
-    // are left uncached.
-    if (context.Response.StatusCode == StatusCodes.Status200OK)
-      remoteProxy.AddEternalCachingControl(context);
+    using var response = await remoteProxy.ProcessAsync(context, remoteServer, remainingPath, response =>
+      options.ContentTypeProvider.TryGetContentType(response.RequestMessage?.RequestUri?.LocalPath ?? "", out var resolvedContentType) ?
+        resolvedContentType : options.DefaultContentType);
 
     // A non-null response is a GET MISS body for us to stream and persist; otherwise it is handled.
     if (response == null) return;
@@ -76,9 +48,7 @@ public partial class CachingProxy(
     var cachePath = cacheFileProvider.GetFutureCacheFileLocation(requestPath, contentEncoding);
     if (cachePath == null)
     {
-      remoteProxy.MarkStatus(context, CachingProxyStatus.BAD_REQUEST);
-      context.Response.StatusCode = (int) HttpStatusCode.BadRequest;
-      await context.Response.WriteAsync("Invalid cache path");
+      await remoteProxy.SetStatus(context, CachingProxyStatus.BAD_REQUEST, HttpStatusCode.BadRequest, "Invalid cache path");
       return;
     }
 
@@ -105,7 +75,8 @@ public partial class CachingProxy(
         return;
       }
 
-      if (contentLastModified.HasValue) File.SetLastWriteTimeUtc(tempFile, contentLastModified.Value.UtcDateTime);
+      if (contentLastModified.HasValue)
+        File.SetLastWriteTimeUtc(tempFile, contentLastModified.Value.UtcDateTime);
 
       try
       {
@@ -183,6 +154,6 @@ public partial class CachingProxy(
         $"Not Enough Free Disk Space. {availableFreeSpaceMb} MB is free at {myLocalCachePath}, but minimum is {myMinimumFreeDiskSpaceMb} MB"));
     }
 
-    return Task.FromResult(HealthCheckResult.Healthy("OK"));
+    return Task.FromResult(HealthCheckResult.Healthy());
   }
 }

@@ -11,6 +11,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="AWSSDK.Extensions.NETCore.Setup" />
+    <PackageReference Include="AWSSDK.S3" />
+    <PackageReference Include="AWSSDK.SSO" />
+    <PackageReference Include="AWSSDK.SSOOIDC" />
     <PackageReference Include="Cronos" />
     <PackageReference Include="Microsoft.Extensions.Http.Polly" />
     <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" />

@@ -2,9 +2,11 @@
 using System.Net.Http.Headers;
 using System.Reflection;
 using System.Threading.Tasks;
+using Amazon.S3;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -36,6 +38,8 @@ public static class Program
     if (builder.Environment.IsDevelopment())
     {
       builder.Logging.AddSimpleConsole();
+      builder.Configuration
+        .AddJsonFile("appsettings.Development.user.json", optional: true, reloadOnChange: true);
     }
     else
     {
@@ -48,7 +52,7 @@ public static class Program
       .Configure<CachingProxyConfig>(builder.Configuration)
       .AddSingleton(sp => sp.GetRequiredService<IOptions<CachingProxyConfig>>().Value);
 
-    ConfigureOurServices(builder.Services);
+    ConfigureOurServices(builder.Services, builder.Configuration);
 
     builder.Services
       .AddOpenTelemetry()
@@ -84,17 +88,16 @@ public static class Program
 
     app.UseOpenTelemetryPrometheusScrapingEndpoint();
 
-    ConfigureOurApp(app);
+    ConfigureOurApp(app, app.Configuration);
 
     return app.RunAsync();
   }
 
-  public static void ConfigureOurServices(IServiceCollection services)
+  public static void ConfigureOurServices(IServiceCollection services, IConfiguration configuration)
   {
     services
       .AddSingleton(TimeProvider.System)
       .AddSingleton<CachingProxyMetrics>()
-      .AddHostedService<CleanupService>()
       .AddSingleton<ResponseCache>()
       .AddSingleton<RemoteProxy>()
       .AddSingleton<CacheFileProvider>()
@@ -102,11 +105,28 @@ public static class Program
       .AddMemoryCache()
       .AddOptions<MemoryCacheOptions>()
       .Configure<TimeProvider>((options, tp) => options.Clock = new TimeProviderClock(tp));
-    services
-      .AddSingleton(sp => sp.GetRequiredService<IOptions<StaticFileOptions>>().Value)
-      .AddScoped<CachingProxy>()
-      .AddHealthChecks()
-      .AddCheck<CachingProxy>(nameof(CachingProxy));
+
+    if (configuration.Get<CachingProxyConfig>()?.S3?.BucketName  is not null)
+    {
+      // AWSOptions resolves the configured profile (including SSO) into credentials when the client is
+      // created, so a named profile and the default credential chain go through the same registration.
+      services
+        .AddDefaultAWSOptions(configuration.GetAWSOptions())
+        .AddAWSService<IAmazonS3>()
+        .AddSingleton<S3CachingMiddleware>()
+        .AddHealthChecks()
+        .AddCheck<S3CachingMiddleware>(nameof(S3CachingMiddleware));
+    }
+    else
+    {
+      services
+        .AddSingleton(sp => sp.GetRequiredService<IOptions<StaticFileOptions>>().Value)
+        .AddScoped<CachingProxy>()
+        .AddHostedService<CleanupService>()
+        .AddHealthChecks()
+        .AddCheck<CachingProxy>(nameof(CachingProxy));
+    }
+
     services
       .AddHttpClient<ProxyHttpClient>(static (provider, client) =>
       {
@@ -136,11 +156,18 @@ public static class Program
         4, retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt - 1))));
   }
 
-  public static void ConfigureOurApp(IApplicationBuilder app)
+  public static void ConfigureOurApp(IApplicationBuilder app, IConfiguration configuration)
   {
-    app
-      .UseHealthChecks("/health")
-      .UseStaticFiles()
-      .UseMiddleware<CachingProxy>();
+    app.UseHealthChecks("/health");
+    if (configuration.Get<CachingProxyConfig>()?.S3?.BucketName is not null)
+    {
+      app.UseMiddleware<S3CachingMiddleware>();
+    }
+    else
+    {
+      app
+        .UseStaticFiles()
+        .UseMiddleware<CachingProxy>();
+    }
   }
 }
