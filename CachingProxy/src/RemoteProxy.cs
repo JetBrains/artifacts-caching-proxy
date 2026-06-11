@@ -71,9 +71,9 @@ public partial class RemoteProxy(
   /// hits, the upstream request and its validation (including Content-Encoding). Writes the full
   /// response head — status, metadata headers (Content-Length, Last-Modified), representation
   /// headers (Content-Type, Content-Encoding) and the proxy bookkeeping headers — to
-  /// <paramref name="context"/>. The <paramref name="getContentType"/> is supplied by the caller
-  /// (this layer could derive it): it is applied to the response and stored in the in-memory
-  /// cache so later HEAD cache hits report the same type. For a successful GET the open
+  /// <paramref name="context"/>. The Content-Type is the upstream's own when it declared one;
+  /// <paramref name="getContentType"/>, supplied by the caller, is only the fallback used when the
+  /// upstream omitted it (and is stored in the in-memory cache so later HEAD hits agree). For a successful GET the open
   /// upstream response is returned so the caller can stream and persist the body (reading its
   /// Content-Encoding off the response) and must dispose it; in every other case the request is
   /// fully handled, the response (if any) is disposed internally, and <c>null</c> is returned.
@@ -184,7 +184,9 @@ public partial class RemoteProxy(
       IHeaderDictionary headers = new HeaderDictionary();
       headers.LastModified = response.Content.Headers.LastModified?.ToString("R");
       headers.ContentLength = response.Content.Headers.ContentLength;
-      headers.ContentType = getContentType?.Invoke(response) ?? response.Content.Headers.ContentType?.MediaType;
+      // Prefer the upstream's own Content-Type; the caller's resolver (extension-based) is only a
+      // fallback for when the upstream didn't declare one.
+      headers.ContentType = response.Content.Headers.ContentType?.ToString() ?? getContentType?.Invoke(response);
       headers.ContentEncoding = contentEncoding;
       // Only successful (2xx) responses reach here, so the response is always eternally cacheable.
       headers.CacheControl = OurEternalCachingHeader;

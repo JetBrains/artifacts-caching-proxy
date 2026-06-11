@@ -47,6 +47,28 @@ namespace JetBrains.CachingProxy
     public string? GetContentEncoding(IFileInfo fileInfo) =>
       fileInfo.PhysicalPath?.EndsWith(ourGzippedContentSuffix) ?? false ? "gzip" : null;
 
+    // Sidecar file holding the upstream Content-Type next to a cached artifact. Persisting it lets a
+    // HIT serve the original type verbatim instead of guessing from the file extension.
+    private const string ourContentTypeSidecarSuffix = ".content-type";
+
+    public string GetContentTypeSidecarPath(string cacheFilePath) => cacheFilePath + ourContentTypeSidecarSuffix;
+
+    public string? GetStoredContentType(IFileInfo fileInfo)
+    {
+      var physicalPath = fileInfo.PhysicalPath;
+      if (physicalPath == null)
+        return null;
+      try
+      {
+        var sidecar = physicalPath + ourContentTypeSidecarSuffix;
+        return File.Exists(sidecar) ? File.ReadAllText(sidecar) : null;
+      }
+      catch (IOException)
+      {
+        return null;
+      }
+    }
+
     public IChangeToken Watch(string filter) => throw new NotSupportedException();
 
     /// <summary>

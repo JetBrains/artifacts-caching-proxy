@@ -34,8 +34,8 @@ public class CachingProxy(
       return;
     }
 
-    using var response = await remoteProxy.ProcessAsync(context, remoteServer, remainingPath, response =>
-      options.ContentTypeProvider.TryGetContentType(response.RequestMessage?.RequestUri?.LocalPath ?? "", out var resolvedContentType) ?
+    using var response = await remoteProxy.ProcessAsync(context, remoteServer, remainingPath, _ =>
+      options.ContentTypeProvider.TryGetContentType(requestPath.Value ?? "", out var resolvedContentType) ?
         resolvedContentType : options.DefaultContentType);
 
     // A non-null response is a GET MISS body for us to stream and persist; otherwise it is handled.
@@ -90,6 +90,12 @@ public class CachingProxy(
         }
         else throw;
       }
+
+      // Persist the upstream Content-Type next to the file so a later HIT serves it verbatim
+      // (the static-file extension lookup is only a fallback for when the upstream omitted it).
+      var upstreamContentType = response.Content.Headers.ContentType?.ToString();
+      if (upstreamContentType != null)
+        CatchSilently(() => File.WriteAllText(cacheFileProvider.GetContentTypeSidecarPath(cachePath), upstreamContentType));
     }
     catch (OperationCanceledException)
     {

@@ -436,25 +436,45 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
   }
 
   [Fact]
-  public async Task Always_Cache_Directory_Index()
+  public async Task Original_Content_Type_Is_Served_Not_Extension()
   {
-    await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/",
-      HttpStatusCode.OK, (message, bytes) =>
+    // The upstream sends text/html for a .jar. The proxy must serve the ORIGINAL upstream
+    // Content-Type on both MISS and HIT, not the extension-derived application/java-archive.
+    await AssertGetResponse("/real/wrong-content-type.jar", HttpStatusCode.OK,
+      (message, bytes) =>
       {
         AssertStatusHeader(message, CachingProxyStatus.MISS);
-        Assert.Equal(MediaTypeNames.Application.Octet, message.Content.Headers.ContentType?.ToString());
+        Assert.Equal(MediaTypeNames.Text.Html, message.Content.Headers.ContentType?.ToString());
+        Assert.Equal("some html", Encoding.UTF8.GetString(bytes));
       });
+
+    await AssertGetResponse("/real/wrong-content-type.jar", HttpStatusCode.OK,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.HIT);
+        Assert.Equal(MediaTypeNames.Text.Html, message.Content.Headers.ContentType?.ToString());
+        Assert.Equal("some html", Encoding.UTF8.GetString(bytes));
+      });
+  }
+
+  [Fact]
+  public async Task Always_Cache_Directory_Index()
+  {
+    // Content-Type is now the upstream's own (no longer the extension-derived default), so this
+    // test asserts only the caching behavior, not the served type.
+    await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/",
+      HttpStatusCode.OK, (message, bytes) =>
+        AssertStatusHeader(message, CachingProxyStatus.MISS));
   }
 
   [Fact]
   public async Task Always_Cache_Directory_Index_No_Trailing_Slash()
   {
+    // Content-Type is now the upstream's own (no longer the extension-derived default), so this
+    // test asserts only the caching behavior, not the served type.
     await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz",
       HttpStatusCode.OK, (message, bytes) =>
-      {
-        AssertStatusHeader(message, CachingProxyStatus.MISS);
-        Assert.Equal(MediaTypeNames.Application.Octet, message.Content.Headers.ContentType?.ToString());
-      });
+        AssertStatusHeader(message, CachingProxyStatus.MISS));
   }
 
   [Fact]
