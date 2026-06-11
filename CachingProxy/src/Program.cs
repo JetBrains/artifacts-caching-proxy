@@ -100,8 +100,6 @@ public static class Program
       .AddSingleton<CachingProxyMetrics>()
       .AddSingleton<ResponseCache>()
       .AddSingleton<RemoteProxy>()
-      .AddSingleton<CacheFileProvider>()
-      .ConfigureOptions<ConfigureStaticFileMiddleware>()
       .AddMemoryCache()
       .AddOptions<MemoryCacheOptions>()
       .Configure<TimeProvider>((options, tp) => options.Clock = new TimeProviderClock(tp));
@@ -119,7 +117,11 @@ public static class Program
     }
     else
     {
+      // Disk-only services: CacheFileProvider validates/creates LocalCachePath in its constructor, so
+      // it (and the static-file options that depend on it) must not be registered in S3 mode.
       services
+        .AddSingleton<CacheFileProvider>()
+        .ConfigureOptions<ConfigureStaticFileMiddleware>()
         .AddSingleton(sp => sp.GetRequiredService<IOptions<StaticFileOptions>>().Value)
         .AddScoped<CachingProxy>()
         .AddHostedService<CleanupService>()
