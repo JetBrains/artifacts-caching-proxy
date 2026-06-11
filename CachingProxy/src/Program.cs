@@ -52,7 +52,8 @@ public static class Program
       .Configure<CachingProxyConfig>(builder.Configuration)
       .AddSingleton(sp => sp.GetRequiredService<IOptions<CachingProxyConfig>>().Value);
 
-    ConfigureOurServices(builder.Services, builder.Configuration);
+    builder.Services
+      .ConfigureOurServices(builder.Configuration);
 
     builder.Services
       .AddOpenTelemetry()
@@ -88,12 +89,12 @@ public static class Program
 
     app.UseOpenTelemetryPrometheusScrapingEndpoint();
 
-    ConfigureOurApp(app, app.Configuration);
+    app.ConfigureOurApp(app.Configuration);
 
     return app.RunAsync();
   }
 
-  public static void ConfigureOurServices(IServiceCollection services, IConfiguration configuration)
+  public static IServiceCollection ConfigureOurServices(this IServiceCollection services, IConfiguration configuration)
   {
     services
       .AddSingleton(TimeProvider.System)
@@ -157,9 +158,11 @@ public static class Program
       })
       .AddTransientHttpErrorPolicy(static policyBuilder => policyBuilder.WaitAndRetryAsync(
         4, retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt - 1))));
+
+    return services;
   }
 
-  public static void ConfigureOurApp(IApplicationBuilder app, IConfiguration configuration)
+  public static void ConfigureOurApp(this IApplicationBuilder app, IConfiguration configuration)
   {
     app.UseHealthChecks("/health");
     if (UseS3(configuration))
@@ -177,5 +180,5 @@ public static class Program
   // Single source of truth for the backend choice, so service registration and the request pipeline
   // never disagree about whether S3 is enabled.
   private static bool UseS3(IConfiguration configuration) =>
-    configuration.Get<CachingProxyConfig>()?.S3?.BucketName is not null;
+    !string.IsNullOrEmpty(configuration.Get<CachingProxyConfig>()?.S3?.BucketName);
 }

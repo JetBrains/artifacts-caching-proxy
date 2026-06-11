@@ -68,17 +68,18 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
     myHost = new HostBuilder()
       .ConfigureWebHost(webHostBuilder =>
       {
-        using var json = new MemoryStream(JsonSerializer.SerializeToUtf8Bytes(myConfig));
-        var configuration = new ConfigurationBuilder().AddJsonStream(json).Build();
         webHostBuilder
           .UseTestServer()
-          .ConfigureTestServices(services =>
+          .ConfigureAppConfiguration(cfg =>
+            cfg.AddJsonStream(new MemoryStream(JsonSerializer.SerializeToUtf8Bytes(myConfig))))
+          .ConfigureServices((context, services) =>
           {
-            services.AddSingleton(myConfig);
-            Program.ConfigureOurServices(services, configuration);
-            services.Replace(ServiceDescriptor.Singleton<TimeProvider>(myTimeProvider));
+            services
+              .AddSingleton(myConfig)
+              .ConfigureOurServices(context.Configuration)
+              .Replace(ServiceDescriptor.Singleton<TimeProvider>(myTimeProvider));
           })
-          .Configure((context, builder) => Program.ConfigureOurApp(builder, context.Configuration));
+          .Configure((context, builder) => builder.ConfigureOurApp(context.Configuration));
       })
       .Build();
     myServer = myHost.GetTestServer();

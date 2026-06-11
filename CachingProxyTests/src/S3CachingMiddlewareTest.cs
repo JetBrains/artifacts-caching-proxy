@@ -12,7 +12,6 @@ using Amazon.Runtime;
 using Amazon.S3;
 using Amazon.S3.Model;
 using Microsoft.AspNetCore.Hosting;
-using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -47,17 +46,19 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
         // must be present in the host configuration (not only in the locally-built one below).
         webHostBuilder
           .UseTestServer()
-          .ConfigureAppConfiguration(cfg => cfg.AddJsonStream(ToJsonStream(config)))
-          .ConfigureTestServices(services =>
+          .ConfigureAppConfiguration(cfg =>
+            cfg.AddJsonStream(new MemoryStream(JsonSerializer.SerializeToUtf8Bytes(config))))
+          .ConfigureServices((context, services) =>
           {
-            var configuration = new ConfigurationBuilder().AddJsonStream(ToJsonStream(config)).Build();
-            services.AddSingleton(config);
-            Program.ConfigureOurServices(services, configuration);
+            services
+              .AddSingleton(config)
+              .ConfigureOurServices(context.Configuration)
             // Real system clock: the signed-link path lets the real client compute the presigned
             // URL, whose Expires must be in the future (no test here advances time).
-            services.Replace(ServiceDescriptor.Singleton<IAmazonS3>(myS3));
+              .Replace(ServiceDescriptor.Singleton<IAmazonS3>(myS3));
+
           })
-          .Configure((context, builder) => Program.ConfigureOurApp(builder, context.Configuration));
+          .Configure((context, builder) => builder.ConfigureOurApp(context.Configuration));
       })
       .Build();
 
@@ -65,9 +66,6 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     host.Start();
     return host.GetTestServer();
   }
-
-  private static MemoryStream ToJsonStream(CachingProxyConfig config) =>
-    new(JsonSerializer.SerializeToUtf8Bytes(config));
 
   [Fact]
   public async Task Health_Reports_Bucket_Acl()
