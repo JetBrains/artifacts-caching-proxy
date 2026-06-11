@@ -7,7 +7,7 @@ namespace JetBrains.CachingProxy;
 
 public class CachingProxyConfig
 {
-  public record S3Config(string? BucketName, bool SignedLinks);
+  public record S3Config(string? BucketName = null, bool SignedLinks = false);
 
   public CachingProxyPrefix[] Prefixes { get; init; } = [];
   public S3Config? S3 { get; init; }
