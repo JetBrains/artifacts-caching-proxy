@@ -22,9 +22,8 @@ namespace JetBrains.CachingProxy.Tests;
 [SuppressMessage("ReSharper", "ClassNeverInstantiated.Global")]
 public class UpstreamTestServer : IAsyncLifetime
 {
-  [SuppressMessage("ReSharper", "PropertyFieldKeywordIsNeverAssigned")]
   public Uri Url =>
-    field ?? new Uri(myWebApp
+    field ??= new Uri(myWebApp
       .Services.GetRequiredService<IServer>()
       .Features.Get<IServerAddressesFeature>()!.Addresses.Single());
 
