@@ -1,3 +1,4 @@
+using System;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.IO.Compression;
@@ -11,6 +12,7 @@ using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
+using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
 using Xunit;
 
@@ -20,9 +22,11 @@ namespace JetBrains.CachingProxy.Tests;
 [SuppressMessage("ReSharper", "ClassNeverInstantiated.Global")]
 public class UpstreamTestServer : IAsyncLifetime
 {
-  public string Url => myWebApp
-    .Services.GetRequiredService<IServer>()
-    .Features.Get<IServerAddressesFeature>()!.Addresses.Single();
+  [SuppressMessage("ReSharper", "PropertyFieldKeywordIsNeverAssigned")]
+  public Uri Url =>
+    field ?? new Uri(myWebApp
+      .Services.GetRequiredService<IServer>()
+      .Features.Get<IServerAddressesFeature>()!.Addresses.Single());
 
   public string LastUserAgent { get; private set; } = "";
 
@@ -135,4 +139,12 @@ public class UpstreamTestServer : IAsyncLifetime
   public Task InitializeAsync() => myWebApp.StartAsync();
 
   public Task DisposeAsync() => myWebApp.StopAsync();
+}
+
+public static class TestServerEx
+{
+  public static string GetPathKey(this TestServer server, PathString path) =>
+    server.Services.GetService<RemoteServers>()!.
+      LookupRemoteServer(path, out var remainingPath)!.
+      GetUpstreamUriKey(remainingPath);
 }

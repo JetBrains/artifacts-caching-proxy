@@ -1,5 +1,4 @@
 using System.Collections.Generic;
-using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -13,6 +12,7 @@ using Amazon.Runtime;
 using Amazon.S3;
 using Amazon.S3.Model;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -89,12 +89,12 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     // Redirect points at a presigned URL for the object key.
     var location = response.Headers.Location?.ToString();
     Assert.NotNull(location);
-    Assert.Contains("real/a.jar", location);
+    Assert.Contains("a.jar", location);
     Assert.Contains("X-Amz-", location); // presigned query parameters
 
     // The upstream body was streamed into the bucket, not back to the client.
     Assert.Equal(1, myS3.PutObjectCalls);
-    Assert.True(myS3.Objects.TryGetValue("real/a.jar", out var stored));
+    Assert.True(myS3.Objects.TryGetValue(server.GetPathKey("/real/a.jar"), out var stored));
     Assert.Equal("a.jar", Encoding.UTF8.GetString(stored.Body));
   }
 
@@ -108,7 +108,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
 
     Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
     AssertStatusHeader(response, CachingProxyStatus.MISS);
-    Assert.True(myS3.Objects.TryGetValue("real/chunked.bin", out var stored));
+    Assert.True(myS3.Objects.TryGetValue(server.GetPathKey("/real/chunked.bin"), out var stored));
     Assert.Equal("chunk1chunk2", Encoding.UTF8.GetString(stored.Body));
   }
 
@@ -136,9 +136,8 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   [Fact]
   public async Task Existing_Object_Redirects_Without_Reupload()
   {
-    myS3.Objects["real/a.jar"] = (Encoding.UTF8.GetBytes("a.jar"), "application/java-archive");
-
     var server = CreateServer(signedLinks: true);
+    myS3.Objects[server.GetPathKey("/real/a.jar")] = ([.. "a.jar"u8], "application/java-archive");
     using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
 
     Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
@@ -164,12 +163,12 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   [Fact]
   public async Task Get_And_Head_Use_Separate_Verb_Signed_Redirects()
   {
+    var server = CreateServer(signedLinks: true);
+
     // A presigned URL is signed for a specific verb. Because the cache key includes the method, a
     // HEAD caches a HEAD-signed redirect and a GET caches its own GET-signed redirect; neither is
     // ever served for the other method (which S3 would reject as SignatureDoesNotMatch).
-    myS3.Objects["real/a.jar"] = (Encoding.UTF8.GetBytes("a.jar"), null);
-
-    var server = CreateServer(signedLinks: true);
+    myS3.Objects[server.GetPathKey("/real/a.jar")] = ([.. "a.jar"u8], null);
 
     using (var head = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Head.Method))
       Assert.Equal(HttpStatusCode.RedirectKeepVerb, head.StatusCode);
@@ -186,10 +185,10 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   [Fact]
   public async Task Second_Head_Is_Served_From_Memory_Cache()
   {
-    // Same verb twice: the second HEAD replays the cached HEAD-signed redirect without re-probing.
-    myS3.Objects["real/a.jar"] = (Encoding.UTF8.GetBytes("a.jar"), null);
-
     var server = CreateServer(signedLinks: true);
+
+    // Same verb twice: the second HEAD replays the cached HEAD-signed redirect without re-probing.
+    myS3.Objects[server.GetPathKey("/real/a.jar")] = ([.. "a.jar"u8], null);
 
     using (var first = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Head.Method))
       AssertStatusHeader(first, CachingProxyStatus.MISS);
@@ -210,18 +209,19 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     var location = response.Headers.Location?.ToString();
     Assert.NotNull(location);
     // Exactly one separator between the bucket endpoint and the key (regression for the URL join).
-    Assert.EndsWith("/real/a.jar", location);
-    Assert.DoesNotContain("//real/a.jar", location);
+    Assert.EndsWith("/a.jar", location);
+    Assert.DoesNotContain("//a.jar", location);
   }
 
   [Fact]
   public async Task Post_Is_Rejected_Before_Probing_S3()
   {
+    var server = CreateServer(signedLinks: true);
+
     // Regression test: even when the object exists in the bucket, a non-GET/HEAD method must be
     // rejected up front and must NOT be redirected (the validation-bypass fix).
-    myS3.Objects["real/a.jar"] = (Encoding.UTF8.GetBytes("a.jar"), null);
+    myS3.Objects[server.GetPathKey("/real/a.jar")] = ([.. "a.jar"u8], null);
 
-    var server = CreateServer(signedLinks: true);
     using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Post.Method);
 
     Assert.Equal(HttpStatusCode.MethodNotAllowed, response.StatusCode);
@@ -274,9 +274,6 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     public int PutObjectCalls;
     public HttpVerb? LastPresignVerb;
 
-    // Status a metadata probe throws for a missing key.
-    public HttpStatusCode MissStatusCode = HttpStatusCode.NotFound;
-
     string IAmazonS3.GetPreSignedURL(GetPreSignedUrlRequest request)
     {
       LastPresignVerb = request.Verb;
@@ -294,7 +291,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
       Interlocked.Increment(ref GetObjectMetadataCalls);
       if (Objects.ContainsKey(key))
         return Task.FromResult(new GetObjectMetadataResponse { HttpStatusCode = HttpStatusCode.OK });
-      throw new AmazonS3Exception(MissStatusCode.ToString()) { StatusCode = MissStatusCode };
+      throw new AmazonS3Exception(nameof(HttpStatusCode.NotFound)) { StatusCode = HttpStatusCode.NotFound };
     }
 
     public override async Task<PutObjectResponse> PutObjectAsync(PutObjectRequest request, CancellationToken cancellationToken = default)

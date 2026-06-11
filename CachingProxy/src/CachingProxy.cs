@@ -45,7 +45,7 @@ public class CachingProxy(
     var contentLength = response.Content.Headers.ContentLength;
     var contentLastModified = response.Content.Headers.LastModified;
 
-    var cachePath = cacheFileProvider.GetFutureCacheFileLocation(requestPath, contentEncoding);
+    var cachePath = cacheFileProvider.GetFutureCacheFileLocation(remoteServer, remainingPath, contentEncoding);
     if (cachePath == null)
     {
       await remoteProxy.SetStatusAsync(context, CachingProxyStatus.BAD_REQUEST, HttpStatusCode.BadRequest, "Invalid cache path");

@@ -33,11 +33,11 @@ public class S3CachingMiddleware(IAmazonS3 amazonS3, CachingProxyConfig config, 
     // non-GET/HEAD method can't be redirected to the bucket unchecked.
     if (!await remoteProxy.ValidateRequestAsync(context)) return;
 
-    var requestPath = context.Request.Path.Value!;
-    var s3Key = requestPath[1..];
+    var s3Key = remoteServer.GetUpstreamUriKey(remainingPath);
+
     // The cache key includes the HTTP method: a presigned redirect is signed for a specific verb, so
     // HEAD and GET each cache (and replay) their own correctly-signed redirect under separate keys.
-    var cacheKey = ResponseCache.CacheKey(context.Request.Method, requestPath);
+    var cacheKey = ResponseCache.CacheKey(context.Request.Method, remoteServer, remainingPath);
 
     try
     {
@@ -72,7 +72,7 @@ public class S3CachingMiddleware(IAmazonS3 amazonS3, CachingProxyConfig config, 
       // The artifact exists upstream; we just failed to store or redirect it. Respond 503 (and do
       // NOT cache a negative result) so the client retries and a transient S3 problem recovers on
       // the next request, instead of serving a "not found" for an artifact that is actually available.
-      logger.LogError(Event.FailedToCacheInS3, e, "Failed to cache {RequestPath} in S3", requestPath);
+      logger.LogError(Event.FailedToCacheInS3, e, "Failed to cache {RequestPath} in S3 with {S3Key}", context.Request.Path, s3Key);
       context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
       context.Response.ContentType = MediaTypeNames.Text.Plain;
       await context.Response.WriteAsync("Failed to cache response");

@@ -124,7 +124,7 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
       });
 
     Assert.Equal(11541, new FileInfo(
-      Path.Combine(myTempDirectory, "a1/8a/a18af857577c7f565795f2866ced49713aade459dafe8ca7ed0811d04a026382.jar")).Length);
+      Path.Combine(myTempDirectory, "2b/0b/2b0b5f703eb2ed34d6f0c4fb31fa6f3dc4d224f91ec8aaa51bc36f518ca54168.jar")).Length);
   }
 
   [Fact]
@@ -236,7 +236,7 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
   {
     await AssertGetResponse("/real/fakeBrEncoding.txt", HttpStatusCode.ServiceUnavailable, (message, bytes) =>
     {
-      Assert.Equal($"{myUpstreamServer.Url}/fakeBrEncoding.txt returned Content-Encoding 'br' which is not supported", Encoding.UTF8.GetString(bytes));
+      Assert.Equal($"{myUpstreamServer.Url}fakeBrEncoding.txt returned Content-Encoding 'br' which is not supported", Encoding.UTF8.GetString(bytes));
     });
   }
 
@@ -245,7 +245,7 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
   {
     await AssertGetResponse("/real/fakeMultipleEncodings.txt", HttpStatusCode.ServiceUnavailable, (message, bytes) =>
     {
-      Assert.Equal($"{myUpstreamServer.Url}/fakeMultipleEncodings.txt returned multiple Content-Encoding which is not allowed: deflate, gzip", Encoding.UTF8.GetString(bytes));
+      Assert.Equal($"{myUpstreamServer.Url}fakeMultipleEncodings.txt returned multiple Content-Encoding which is not allowed: deflate, gzip", Encoding.UTF8.GetString(bytes));
     });
   }
 

@@ -98,6 +98,7 @@ public static class Program
     services
       .AddSingleton(TimeProvider.System)
       .AddSingleton<CachingProxyMetrics>()
+      .AddSingleton<RemoteServers>()
       .AddSingleton<ResponseCache>()
       .AddSingleton<RemoteProxy>()
       .AddMemoryCache()

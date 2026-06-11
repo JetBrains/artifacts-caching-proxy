@@ -24,6 +24,7 @@ namespace JetBrains.CachingProxy;
 public partial class RemoteProxy(
   CachingProxyConfig config,
   ProxyHttpClient httpClient,
+  RemoteServers remoteServers,
   ResponseCache responseCache,
   CachingProxyMetrics metrics,
   ILogger<RemoteProxy> logger)
@@ -37,10 +38,8 @@ public partial class RemoteProxy(
   private readonly Regex? myRedirectToRemoteUrlsRegex = !string.IsNullOrWhiteSpace(config.RedirectToRemoteUrlsRegex) ?
     new Regex(config.RedirectToRemoteUrlsRegex, RegexOptions.Compiled) : null;
 
-  private readonly RemoteServers myRemoteServers = new([.. config.Prefixes]);
-
   public RemoteServers.RemoteServer? LookupRemoteServer(PathString url, out PathString remainingPart) =>
-    myRemoteServers.LookupRemoteServer(url, out remainingPart);
+    remoteServers.LookupRemoteServer(url, out remainingPart);
 
   /// <summary>
   /// Validates the request method (only GET/HEAD are allowed) and path (no traversal, only safe
@@ -85,7 +84,7 @@ public partial class RemoteProxy(
 
     var isHead = HttpMethods.IsHead(context.Request.Method);
     var requestPath = context.Request.Path.Value!;
-    var cacheKey = ResponseCache.CacheKey(context.Request.Method, requestPath);
+    var cacheKey = ResponseCache.CacheKey(context.Request.Method, remoteServer, remainingPath);
 
     var cachedResponse = responseCache.GetCachedStatusCode(cacheKey);
     switch (cachedResponse?.StatusCode)
@@ -110,11 +109,7 @@ public partial class RemoteProxy(
       return null;
     }
 
-    var upstreamUri = remoteServer.RemoteUri;
-    if (remainingPath != PathString.Empty)
-    {
-      upstreamUri = new Uri(upstreamUri, remainingPath.Value.AsSpan(remainingPath.Value?[0] == '/' ? 1 : 0).ToString());
-    }
+    var upstreamUri = remoteServer.GetUpstreamUri(remainingPath);
 
     var isRedirectToRemoteUrl = myRedirectToRemoteUrlsRegex != null && myRedirectToRemoteUrlsRegex.IsMatch(requestPath);
     if (isRedirectToRemoteUrl)

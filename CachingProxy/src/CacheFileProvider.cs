@@ -3,6 +3,7 @@ using System.Buffers;
 using System.IO;
 using System.Security.Cryptography;
 using System.Text;
+using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.FileProviders;
 using Microsoft.Extensions.Primitives;
 
@@ -12,10 +13,12 @@ namespace JetBrains.CachingProxy
   {
     private static readonly string ourGzippedContentSuffix = "-gzip-Ege4dHyCEA7IM";
 
+    private readonly RemoteServers myRemoteServers;
     private readonly PhysicalFileProvider myPhysicalFileProvider;
 
-    public CacheFileProvider(CachingProxyConfig config)
+    public CacheFileProvider(CachingProxyConfig config, RemoteServers? remoteServers = null)
     {
+      myRemoteServers = remoteServers ?? new RemoteServers(config);
       var localCachePath = config.LocalCachePath;
       if (string.IsNullOrEmpty(localCachePath))
         throw new ArgumentNullException(nameof(localCachePath), "LocalCachePath could not be null");
@@ -32,17 +35,20 @@ namespace JetBrains.CachingProxy
 
     public IFileInfo GetFileInfo(string subpath)
     {
+      if (myRemoteServers.LookupRemoteServer(subpath, out var remainingPart) is not {} remoteServer)
+        return new NotFoundFileInfo(subpath);
+
       // Mangle once: the gzip and plain variants differ only by a suffix appended after the
       // (identical) hash, so ManglePath(subpath, suffix) == ManglePath(subpath) + suffix.
-      var mangled = ManglePath(subpath);
+      var mangled = ManglePath(remoteServer, remainingPart);
       var withGzipSuffix = myPhysicalFileProvider.GetFileInfo(mangled + ourGzippedContentSuffix);
       return withGzipSuffix.Exists ? withGzipSuffix : myPhysicalFileProvider.GetFileInfo(mangled);
     }
 
     public IDirectoryContents GetDirectoryContents(string subpath) => throw new NotSupportedException();
 
-    public string? GetFutureCacheFileLocation(string subpath, string? contentEncoding) =>
-      myPhysicalFileProvider.GetFileInfo(ManglePath(subpath, GetContentEncodingCacheFileSuffix(contentEncoding))).PhysicalPath;
+    public string? GetFutureCacheFileLocation(RemoteServers.RemoteServer remoteServer, PathString remainingPart, string? contentEncoding) =>
+      myPhysicalFileProvider.GetFileInfo(ManglePath(remoteServer, remainingPart, GetContentEncodingCacheFileSuffix(contentEncoding))).PhysicalPath;
 
     public string? GetContentEncoding(IFileInfo fileInfo) =>
       fileInfo.PhysicalPath?.EndsWith(ourGzippedContentSuffix) ?? false ? "gzip" : null;
@@ -71,13 +77,10 @@ namespace JetBrains.CachingProxy
 
     public IChangeToken Watch(string filter) => throw new NotSupportedException();
 
-    /// <summary>
-    /// Change sub-path upon converting to a local file system path to handle hierarchy-conflicts like
-    /// caching both a/a.jar and a/b/c/c.jar, or a and a/b.jar
-    /// </summary>
-    private static string ManglePath(string subpath, string? contentEncodingSuffix = null)
+    private static string ManglePath(RemoteServers.RemoteServer remoteServer, PathString remainingPart, string? contentEncodingSuffix = null)
     {
-      var maxBytes = Encoding.UTF8.GetMaxByteCount(subpath.Length);
+      var path = remoteServer.GetUpstreamUriKey(remainingPart);
+      var maxBytes = Encoding.UTF8.GetMaxByteCount(path.Length);
 
       byte[]? rented = null;
       var buffer = maxBytes <= 512
@@ -86,7 +89,7 @@ namespace JetBrains.CachingProxy
 
       try
       {
-        var written = Encoding.UTF8.GetBytes(subpath, buffer);
+        var written = Encoding.UTF8.GetBytes(path, buffer);
         // Normalize the path delimiter to '/' so the same logical path hashes identically on every
         // platform. Do NOT case-fold: upstreams like Maven Central and npm are case-sensitive, so
         // e.g. 'Foo.jar' and 'foo.jar' are distinct artifacts and must map to distinct cache files.
@@ -99,7 +102,7 @@ namespace JetBrains.CachingProxy
           }
         }
         var hash = Convert.ToHexStringLower(SHA256.HashData(buffer[..written]));
-        return $"{hash[..2]}/{hash[2..4]}/{hash}{Path.GetExtension(subpath)}{contentEncodingSuffix}";
+        return $"{hash[..2]}/{hash[2..4]}/{hash}{Path.GetExtension(path)}{contentEncodingSuffix}";
       }
       finally
       {
