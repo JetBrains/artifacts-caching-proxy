@@ -32,12 +32,11 @@ namespace JetBrains.CachingProxy
 
     public IFileInfo GetFileInfo(string subpath)
     {
-      var withGzipSuffix = myPhysicalFileProvider.GetFileInfo(ManglePath(subpath, ourGzippedContentSuffix));
-      if (withGzipSuffix.Exists)
-        return withGzipSuffix;
-
-      var withoutGzipSuffix = myPhysicalFileProvider.GetFileInfo(ManglePath(subpath));
-      return withoutGzipSuffix;
+      // Mangle once: the gzip and plain variants differ only by a suffix appended after the
+      // (identical) hash, so ManglePath(subpath, suffix) == ManglePath(subpath) + suffix.
+      var mangled = ManglePath(subpath);
+      var withGzipSuffix = myPhysicalFileProvider.GetFileInfo(mangled + ourGzippedContentSuffix);
+      return withGzipSuffix.Exists ? withGzipSuffix : myPhysicalFileProvider.GetFileInfo(mangled);
     }
 
     public IDirectoryContents GetDirectoryContents(string subpath) => throw new NotSupportedException();

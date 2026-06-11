@@ -75,6 +75,21 @@ public class ResponseCacheTest
     Assert.Null(_cache.GetCachedStatusCode(key));
   }
 
+  [Fact]
+  public void CacheEntry_Redirect_ExpiresAfter5Minutes()
+  {
+    // The S3 "object is in the bucket" redirect must use the positive (5 min) duration, not the
+    // 1-minute DefaultDuration, otherwise the redirect is re-probed/re-signed every minute.
+    const string key = "test-key";
+    _cache.PutStatusCode(key, HttpStatusCode.RedirectKeepVerb);
+
+    _timeProvider.Advance(TimeSpan.FromMinutes(5) - TimeSpan.FromSeconds(1));
+    Assert.NotNull(_cache.GetCachedStatusCode(key));
+
+    _timeProvider.Advance(TimeSpan.FromSeconds(2));
+    Assert.Null(_cache.GetCachedStatusCode(key));
+  }
+
   [Theory]
   [InlineData(HttpStatusCode.InternalServerError)]
   [InlineData(HttpStatusCode.ServiceUnavailable)]
