@@ -49,11 +49,7 @@ public class S3CachingMiddleware(IAmazonS3 amazonS3, CachingProxyConfig config, 
           await RedirectToBucket();
           return;
         }
-        // A locked-down bucket (no s3:ListBucket) answers a missing key with 403 Forbidden rather
-        // than 404, so treat both as "not in the bucket" and fall through to fetch from upstream.
-        catch (AmazonServiceException ex) when (ex.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.Forbidden)
-        {
-        }
+        catch (AmazonServiceException ex) when (ex.StatusCode is HttpStatusCode.NotFound) { }
       }
 
       using var response = await remoteProxy.ProcessAsync(context, remoteServer, remainingPath);

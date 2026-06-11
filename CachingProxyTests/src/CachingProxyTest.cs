@@ -460,21 +460,23 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
   [Fact]
   public async Task Always_Cache_Directory_Index()
   {
-    // Content-Type is now the upstream's own (no longer the extension-derived default), so this
-    // test asserts only the caching behavior, not the served type.
     await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/",
       HttpStatusCode.OK, (message, bytes) =>
-        AssertStatusHeader(message, CachingProxyStatus.MISS));
+      {
+        AssertStatusHeader(message, CachingProxyStatus.MISS);
+        Assert.Equal(MediaTypeNames.Text.Html, message.Content.Headers.ContentType?.ToString());
+      });
   }
 
   [Fact]
   public async Task Always_Cache_Directory_Index_No_Trailing_Slash()
   {
-    // Content-Type is now the upstream's own (no longer the extension-derived default), so this
-    // test asserts only the caching behavior, not the served type.
     await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz",
       HttpStatusCode.OK, (message, bytes) =>
-        AssertStatusHeader(message, CachingProxyStatus.MISS));
+      {
+        AssertStatusHeader(message, CachingProxyStatus.MISS);
+        Assert.Equal(MediaTypeNames.Text.Html, message.Content.Headers.ContentType?.ToString());
+      });
   }
 
   [Fact]

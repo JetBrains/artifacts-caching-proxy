@@ -24,7 +24,6 @@ namespace JetBrains.CachingProxy.Tests;
 
 // Exercises the S3-backed configuration (Program picks S3CachingMiddleware when S3.BucketName is set).
 // A FakeAmazonS3 stands in for the AWS client so no network/credentials are required.
-[SuppressMessage("ReSharper", "UnusedParameter.Local")]
 public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   : IAsyncLifetime, IClassFixture<UpstreamTestServer>
 {
@@ -241,21 +240,6 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   }
 
   [Fact]
-  public async Task Forbidden_Probe_Falls_Through_To_Upstream()
-  {
-    // A bucket without s3:ListBucket answers a missing key with 403, not 404. That must be treated
-    // as a cache miss (fetch + store from upstream), not surfaced to the client as a 503.
-    myS3.MissStatusCode = HttpStatusCode.Forbidden;
-
-    var server = CreateServer(signedLinks: true);
-    using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
-
-    Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
-    AssertStatusHeader(response, CachingProxyStatus.MISS);
-    Assert.Equal(1, myS3.PutObjectCalls);
-  }
-
-  [Fact]
   public async Task Upstream_NotFound_Is_Negatively_Cached_Not_Uploaded()
   {
     var server = CreateServer(signedLinks: true);
@@ -283,17 +267,23 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   /// interface surface is inherited) and overrides only the operations the middleware invokes.
   /// </summary>
   private sealed class FakeAmazonS3() : AmazonS3Client(
-    new BasicAWSCredentials("test", "test"), new AmazonS3Config { RegionEndpoint = RegionEndpoint.USEast1 })
+    new BasicAWSCredentials("test", "test"), new AmazonS3Config { RegionEndpoint = RegionEndpoint.USEast1 }), IAmazonS3
   {
     public readonly Dictionary<string, (byte[] Body, string? ContentType)> Objects = new();
     public int GetObjectMetadataCalls;
     public int PutObjectCalls;
     public HttpVerb? LastPresignVerb;
 
-    // Status a metadata probe throws for a missing key. Buckets without s3:ListBucket answer 403.
+    // Status a metadata probe throws for a missing key.
     public HttpStatusCode MissStatusCode = HttpStatusCode.NotFound;
 
-    public override Task<string> GetPreSignedURLAsync(GetPreSignedUrlRequest request)
+    string IAmazonS3.GetPreSignedURL(GetPreSignedUrlRequest request)
+    {
+      LastPresignVerb = request.Verb;
+      return base.GetPreSignedURL(request);
+    }
+
+    Task<string> IAmazonS3.GetPreSignedURLAsync(GetPreSignedUrlRequest request)
     {
       LastPresignVerb = request.Verb;
       return base.GetPreSignedURLAsync(request);
