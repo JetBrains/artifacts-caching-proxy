@@ -166,9 +166,14 @@ public class S3CachingMiddleware(IAmazonS3 amazonS3, CachingProxyConfig config, 
   {
     try
     {
-      var bucketAcl = await amazonS3.GetBucketAclAsync(new GetBucketAclRequest { BucketName = config.S3?.BucketName }, cancellationToken);
+      var bucketAcl = await amazonS3.GetBucketAclAsync(new GetBucketAclRequest { BucketName = config.S3?.BucketName },
+        cancellationToken);
       if (bucketAcl.HttpStatusCode == HttpStatusCode.OK)
         return HealthCheckResult.Healthy(config.S3?.BucketName);
+    }
+    catch (OperationCanceledException)
+    {
+      throw;
     }
     catch (Exception e)
     {

@@ -15,7 +15,7 @@ public class CachingProxyConfig
   public string? BlacklistUrlRegex { get; init; }
   public long MinimumFreeDiskSpaceMb { get; init; } = 2048;
   public long RequestTimeoutSec { get; init; } = 20;
-  public string RedirectToRemoteUrlsRegex { get; init; } = $"^(.*-/npm/v1/security/audits/quick|.*-SNAPSHOT.*|.*maven-metadata\\.xml({string.Join('|', CheckSumExtensions.Select(Regex.Escape))})?)$";
+  public string RedirectToRemoteUrlsRegex { get; init; } = $"^(.*-/npm/v1/security/.*|.*-SNAPSHOT.*|.*maven-metadata\\.xml({string.Join('|', CheckSumExtensions.Select(Regex.Escape))})?)$";
 
   public static readonly string[] CheckSumExtensions = [".sha1", ".sha256", ".sha512", ".md5"];
 
