@@ -146,7 +146,7 @@ public class CachingProxy(
     }
   }
 
-  Task<HealthCheckResult> IHealthCheck.CheckHealthAsync(HealthCheckContext context, CancellationToken cancellationToken)
+  public Task<HealthCheckResult> CheckHealthAsync(HealthCheckContext context, CancellationToken cancellationToken)
   {
     var localCachePath = config.LocalCachePath;
     var minimumFreeDiskSpaceMb = config.MinimumFreeDiskSpaceMb;

@@ -172,7 +172,6 @@ public class S3CachingMiddleware(IAmazonS3 amazonS3, CachingProxyConfig config, 
     }
     catch (Exception e)
     {
-      logger.LogError(e, nameof(CheckHealthAsync));
       return HealthCheckResult.Unhealthy(e.Message);
     }
 
