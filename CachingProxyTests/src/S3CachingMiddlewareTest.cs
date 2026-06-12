@@ -73,7 +73,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     var server = CreateServer(signedLinks: true);
     using var response = await server.CreateRequest("/health").GetAsync();
     Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-    Assert.Equal("Healthy", await response.Content.ReadAsStringAsync());
+    Assert.Equal("HealthCheck: Healthy\nS3CachingMiddleware: test-bucket\n", await response.Content.ReadAsStringAsync());
   }
 
   [Fact]
