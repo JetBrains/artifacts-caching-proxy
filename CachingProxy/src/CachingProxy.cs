@@ -90,12 +90,6 @@ public class CachingProxy(
         }
         else throw;
       }
-
-      // Persist the upstream Content-Type next to the file so a later HIT serves it verbatim
-      // (the static-file extension lookup is only a fallback for when the upstream omitted it).
-      var upstreamContentType = response.Content.Headers.ContentType?.ToString();
-      if (upstreamContentType != null)
-        CatchSilently(() => File.WriteAllText(cacheFileProvider.GetContentTypeSidecarPath(cachePath), upstreamContentType));
     }
     catch (OperationCanceledException)
     {

@@ -70,9 +70,10 @@ public partial class RemoteProxy(
   /// hits, the upstream request and its validation (including Content-Encoding). Writes the full
   /// response head — status, metadata headers (Content-Length, Last-Modified), representation
   /// headers (Content-Type, Content-Encoding) and the proxy bookkeeping headers — to
-  /// <paramref name="context"/>. The Content-Type is the upstream's own when it declared one;
-  /// <paramref name="getContentType"/>, supplied by the caller, is only the fallback used when the
-  /// upstream omitted it (and is stored in the in-memory cache so later HEAD hits agree). For a successful GET the open
+  /// <paramref name="context"/>. The Content-Type is the one returned by <paramref name="getContentType"/>
+  /// when the caller supplies a resolver (the disk backend resolves it from the file extension, so a
+  /// MISS and a later HIT served from disk agree), and the upstream's own Content-Type otherwise. It
+  /// is stored in the in-memory cache so later HEAD hits agree. For a successful GET the open
   /// upstream response is returned so the caller can stream and persist the body (reading its
   /// Content-Encoding off the response) and must dispose it; in every other case the request is
   /// fully handled, the response (if any) is disposed internally, and <c>null</c> is returned.
@@ -179,9 +180,10 @@ public partial class RemoteProxy(
       IHeaderDictionary headers = new HeaderDictionary();
       headers.LastModified = response.Content.Headers.LastModified?.ToString("R");
       headers.ContentLength = response.Content.Headers.ContentLength;
-      // Prefer the upstream's own Content-Type; the caller's resolver (extension-based) is only a
-      // fallback for when the upstream didn't declare one.
-      headers.ContentType = response.Content.Headers.ContentType?.ToString() ?? getContentType?.Invoke(response);
+      // Prefer the caller's resolver (the disk backend derives the type from the file extension, so a
+      // MISS matches the later HIT served from disk); fall back to the upstream's own Content-Type
+      // when no resolver is supplied (e.g. the S3 backend, which stores and serves the upstream type).
+      headers.ContentType = getContentType?.Invoke(response) ?? response.Content.Headers.ContentType?.ToString();
       headers.ContentEncoding = contentEncoding;
       // Only successful (2xx) responses reach here, so the response is always eternally cacheable.
       headers.CacheControl = OurEternalCachingHeader;

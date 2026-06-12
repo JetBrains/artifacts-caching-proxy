@@ -437,15 +437,16 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
   }
 
   [Fact]
-  public async Task Original_Content_Type_Is_Served_Not_Extension()
+  public async Task Content_Type_Is_Produced_From_Extension()
   {
-    // The upstream sends text/html for a .jar. The proxy must serve the ORIGINAL upstream
-    // Content-Type on both MISS and HIT, not the extension-derived application/java-archive.
+    // The upstream sends text/html for a .jar, but the proxy derives the Content-Type from the file
+    // extension. The type is therefore application/java-archive on both MISS and HIT, so a response
+    // streamed on a MISS and the same artifact served from disk on a HIT agree.
     await AssertGetResponse("/real/wrong-content-type.jar", HttpStatusCode.OK,
       (message, bytes) =>
       {
         AssertStatusHeader(message, CachingProxyStatus.MISS);
-        Assert.Equal(MediaTypeNames.Text.Html, message.Content.Headers.ContentType?.ToString());
+        Assert.Equal("application/java-archive", message.Content.Headers.ContentType?.ToString());
         Assert.Equal("some html", Encoding.UTF8.GetString(bytes));
       });
 
@@ -453,7 +454,7 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
       (message, bytes) =>
       {
         AssertStatusHeader(message, CachingProxyStatus.HIT);
-        Assert.Equal(MediaTypeNames.Text.Html, message.Content.Headers.ContentType?.ToString());
+        Assert.Equal("application/java-archive", message.Content.Headers.ContentType?.ToString());
         Assert.Equal("some html", Encoding.UTF8.GetString(bytes));
       });
   }
@@ -465,7 +466,7 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
       HttpStatusCode.OK, (message, bytes) =>
       {
         AssertStatusHeader(message, CachingProxyStatus.MISS);
-        Assert.Equal(MediaTypeNames.Text.Html, message.Content.Headers.ContentType?.ToString());
+        Assert.Equal(MediaTypeNames.Application.Octet, message.Content.Headers.ContentType?.ToString());
       });
   }
 
@@ -476,7 +477,7 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
       HttpStatusCode.OK, (message, bytes) =>
       {
         AssertStatusHeader(message, CachingProxyStatus.MISS);
-        Assert.Equal(MediaTypeNames.Text.Html, message.Content.Headers.ContentType?.ToString());
+        Assert.Equal(MediaTypeNames.Application.Octet, message.Content.Headers.ContentType?.ToString());
       });
   }
 
