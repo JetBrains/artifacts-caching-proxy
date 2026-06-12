@@ -102,6 +102,11 @@ public static class Program
       .AddSingleton<RemoteServers>()
       .AddSingleton<ResponseCache>()
       .AddSingleton<RemoteProxy>()
+      .ConfigureOptions<HealthCheck>()
+      .AddHealthChecks()
+      .AddCheck<HealthCheck>(nameof(HealthCheck));
+
+    services
       .AddMemoryCache()
       .AddOptions<MemoryCacheOptions>()
       .Configure<TimeProvider>((options, tp) => options.Clock = new TimeProviderClock(tp));
