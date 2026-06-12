@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -73,7 +74,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     var server = CreateServer(signedLinks: true);
     using var response = await server.CreateRequest("/health").GetAsync();
     Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-    Assert.Equal("HealthCheck: Healthy\nS3CachingMiddleware: test-bucket\n", await response.Content.ReadAsStringAsync());
+    Assert.Equal("HealthCheck: release@1.0.0\nS3CachingMiddleware: test-bucket\n", await response.Content.ReadAsStringAsync());
   }
 
   [Fact]
@@ -251,7 +252,11 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   private static void AssertStatusHeader(HttpResponseMessage response, CachingProxyStatus status) =>
     Assert.Equal(status.ToString(), response.Headers.GetValues(CachingProxyConstants.StatusHeader).First());
 
-  Task IAsyncLifetime.InitializeAsync() => Task.CompletedTask;
+  Task IAsyncLifetime.InitializeAsync()
+  {
+    Environment.SetEnvironmentVariable("SENTRY_RELEASE", "release@1.0.0");
+    return Task.CompletedTask;
+  }
 
   async Task IAsyncLifetime.DisposeAsync()
   {

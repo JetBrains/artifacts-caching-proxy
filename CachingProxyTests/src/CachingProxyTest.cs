@@ -93,7 +93,7 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
     await AssertGetResponse("/health", HttpStatusCode.OK,
       (message, bytes) =>
       {
-        Assert.Equal("HealthCheck: Healthy\nCachingProxy: Healthy\n", Encoding.UTF8.GetString(bytes));
+        Assert.Equal("HealthCheck: release@1.0.0\nCachingProxy: Healthy\n", Encoding.UTF8.GetString(bytes));
       });
   }
 
@@ -793,7 +793,11 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
     return string.Join("", hash.Select(b => b.ToString("x2")).ToArray());
   }
 
-  Task IAsyncLifetime.InitializeAsync() => myHost.StartAsync();
+  Task IAsyncLifetime.InitializeAsync()
+  {
+    Environment.SetEnvironmentVariable("SENTRY_RELEASE", "release@1.0.0");
+    return myHost.StartAsync();
+  }
 
   async Task IAsyncLifetime.DisposeAsync()
   {
