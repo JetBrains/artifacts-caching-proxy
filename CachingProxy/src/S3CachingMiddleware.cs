@@ -164,9 +164,18 @@ public class S3CachingMiddleware(IAmazonS3 amazonS3, CachingProxyConfig config, 
 
   public async Task<HealthCheckResult> CheckHealthAsync(HealthCheckContext context, CancellationToken cancellationToken)
   {
-    var bucketAcl = await amazonS3.GetBucketAclAsync(new GetBucketAclRequest { BucketName = config.S3?.BucketName }, cancellationToken);
+    try
+    {
+      var bucketAcl = await amazonS3.GetBucketAclAsync(new GetBucketAclRequest { BucketName = config.S3?.BucketName }, cancellationToken);
+      if (bucketAcl.HttpStatusCode == HttpStatusCode.OK)
+        return HealthCheckResult.Healthy();
+    }
+    catch (Exception e)
+    {
+      logger.LogError(e, nameof(CheckHealthAsync));
+      return HealthCheckResult.Unhealthy(e.Message);
+    }
 
-    return bucketAcl.HttpStatusCode == HttpStatusCode.OK ? HealthCheckResult.Healthy() :
-      HealthCheckResult.Unhealthy("Failed to retrieve bucket ACL");
+    return HealthCheckResult.Unhealthy();
   }
 }
