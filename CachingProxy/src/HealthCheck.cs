@@ -1,21 +1,26 @@
-﻿using System.Diagnostics.CodeAnalysis;
+﻿using System;
+using System.Diagnostics.CodeAnalysis;
 using System.Net.Mime;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Options;
-using Sentry;
 
 namespace JetBrains.CachingProxy;
 
 [SuppressMessage("ReSharper", "ClassNeverInstantiated.Global")]
-public class HealthCheck(IOptions<SentryOptions> sentryOptions) : IHealthCheck, IConfigureOptions<HealthCheckOptions>
+public class HealthCheck : IHealthCheck, IConfigureOptions<HealthCheckOptions>
 {
+  private Task<HealthCheckResult>? mySuccessCheck;
+
   public Task<HealthCheckResult> CheckHealthAsync(HealthCheckContext context, CancellationToken cancellationToken)
   {
-    return Task.FromResult(HealthCheckResult.Healthy(sentryOptions.Value?.Release));
+    return mySuccessCheck ??= Task.FromResult(HealthCheckResult.Healthy(
+      Environment.GetEnvironmentVariable("SENTRY_RELEASE") ??
+        Assembly.GetEntryAssembly()?.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion));
   }
 
   public void Configure(HealthCheckOptions options)
