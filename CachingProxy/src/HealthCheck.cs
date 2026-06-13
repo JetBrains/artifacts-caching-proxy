@@ -28,10 +28,7 @@ public class HealthCheck : IHealthCheck, IConfigureOptions<HealthCheckOptions>
     options.ResponseWriter = static async (writer, result) =>
     {
       writer.Response.ContentType = MediaTypeNames.Text.Plain;
-      foreach (var (key, report) in result.Entries)
-      {
-        await writer.Response.WriteAsync($"{key}: {report.Description ?? report.Status.ToString()}\n", writer.RequestAborted);
-      }
+      await writer.Response.WriteAsync(result.Status == HealthStatus.Healthy ? "OK" : "Fail", writer.RequestAborted);
     };
   }
 }
