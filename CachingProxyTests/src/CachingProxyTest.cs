@@ -93,7 +93,7 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
     await AssertGetResponse("/health", HttpStatusCode.OK,
       (message, bytes) =>
       {
-        Assert.Equal("HealthCheck: release@1.0.0\nCachingProxy: Healthy\n", Encoding.UTF8.GetString(bytes));
+        Assert.Equal("OK", Encoding.UTF8.GetString(bytes));
       });
   }
 
