@@ -18,20 +18,18 @@ using Microsoft.Extensions.Logging;
 namespace JetBrains.CachingProxy;
 
 [SuppressMessage("ReSharper", "ClassNeverInstantiated.Global")]
-public class S3CachingMiddleware(IAmazonS3 amazonS3, CachingProxyConfig config, RemoteProxy remoteProxy, ResponseCache responseCache, TimeProvider timeProvider, ILogger<S3CachingMiddleware>  logger) : IMiddleware, IHealthCheck
+public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amazonS3, CachingProxyConfig config, RemoteProxy remoteProxy, ResponseCache responseCache, TimeProvider timeProvider, ILogger<S3CachingMiddleware>  logger)
 {
-  public async Task InvokeAsync(HttpContext context, RequestDelegate next)
+  public async Task InvokeAsync(HttpContext context)
   {
-    var remoteServer = remoteProxy.LookupRemoteServer(context.Request.Path, out var remainingPath);
-    if (remoteServer == null)
+    if (RemoteServers.GetRemoteServer(context, out var remainingPath) is not {} remoteServer)
     {
-      await next(context);
+      await requestDelegate(context);
       return;
     }
 
-    // Validate method/path before probing S3 or the in-memory cache, so an invalid path or a
-    // non-GET/HEAD method can't be redirected to the bucket unchecked.
-    if (!await remoteProxy.ValidateRequestAsync(context)) return;
+    if (!await remoteProxy.ValidateRequestAsync(context))
+      return;
 
     var s3Key = remoteServer.GetUpstreamUriKey(remainingPath);
 
@@ -162,24 +160,28 @@ public class S3CachingMiddleware(IAmazonS3 amazonS3, CachingProxyConfig config, 
     }
   }
 
-  public async Task<HealthCheckResult> CheckHealthAsync(HealthCheckContext context, CancellationToken cancellationToken)
+  public class HealthCheck(IAmazonS3 amazonS3, CachingProxyConfig config) : IHealthCheck
   {
-    try
+    public async Task<HealthCheckResult> CheckHealthAsync(HealthCheckContext context,
+      CancellationToken cancellationToken)
     {
-      var bucketAcl = await amazonS3.GetBucketAclAsync(new GetBucketAclRequest { BucketName = config.S3?.BucketName },
-        cancellationToken);
-      if (bucketAcl.HttpStatusCode == HttpStatusCode.OK)
-        return HealthCheckResult.Healthy(config.S3?.BucketName);
-    }
-    catch (OperationCanceledException)
-    {
-      throw;
-    }
-    catch (Exception e)
-    {
-      return HealthCheckResult.Unhealthy(e.Message);
-    }
+      try
+      {
+        var bucketAcl = await amazonS3.GetBucketAclAsync(new GetBucketAclRequest { BucketName = config.S3?.BucketName },
+          cancellationToken);
+        if (bucketAcl.HttpStatusCode == HttpStatusCode.OK)
+          return HealthCheckResult.Healthy(config.S3?.BucketName);
+      }
+      catch (OperationCanceledException)
+      {
+        throw;
+      }
+      catch (Exception e)
+      {
+        return HealthCheckResult.Unhealthy(e.Message);
+      }
 
-    return HealthCheckResult.Unhealthy();
+      return HealthCheckResult.Unhealthy();
+    }
   }
 }

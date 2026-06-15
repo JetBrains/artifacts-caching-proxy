@@ -1,42 +1,94 @@
 using System;
 using System.Buffers;
+using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Linq;
-using System.Net;
+using System.Net.Mime;
 using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Primitives;
 
 namespace JetBrains.CachingProxy;
 
 [SuppressMessage("ReSharper", "UnusedMember.Global")]
-public class CachingProxy(
-  CacheFileProvider cacheFileProvider,
-  ILogger<CachingProxy> logger,
-  CachingProxyConfig config,
-  StaticFileOptions options,
-  RemoteProxy remoteProxy)
-  : IMiddleware, IHealthCheck
+public class CachingProxy
 {
+  private readonly RequestDelegate myRequestDelegate;
+  private readonly ILogger<CachingProxy> myLogger;
+  private readonly IContentTypeProvider myContentTypeProvider;
+  private readonly RemoteProxy myRemoteProxy;
+  private readonly string myLocalCachePath;
+
   private const int BUFFER_SIZE = 81920;
 
-  public async Task InvokeAsync(HttpContext context, RequestDelegate next)
+  public CachingProxy(
+    RequestDelegate requestDelegate,
+    ILogger<CachingProxy> logger,
+    CachingProxyConfig config,
+    IContentTypeProvider contentTypeProvider,
+    RemoteProxy remoteProxy)
   {
-    var requestPath = context.Request.Path;
-    var remoteServer = remoteProxy.LookupRemoteServer(requestPath, out var remainingPath);
-    if (remoteServer == null)
+    myLocalCachePath = config.LocalCachePath;
+    if (string.IsNullOrEmpty(myLocalCachePath))
+      throw new ArgumentNullException(nameof(myLocalCachePath), "LocalCachePath could not be null");
+    if (!Directory.Exists(myLocalCachePath))
     {
-      await next(context);
+      if (myLocalCachePath.StartsWith(Path.GetTempPath()))
+        Directory.CreateDirectory(myLocalCachePath);
+      else
+        throw new ArgumentException("LocalCachePath doesn't exist: " + myLocalCachePath);
+    }
+
+    myRequestDelegate = requestDelegate;
+    myLogger = logger;
+    myContentTypeProvider = contentTypeProvider;
+    myRemoteProxy = remoteProxy;
+  }
+
+  public async Task InvokeAsync(HttpContext context)
+  {
+    if (RemoteServers.GetRemoteServer(context, out var remainingPath) is not {} remoteServer)
+    {
+      await myRequestDelegate(context);
       return;
     }
 
-    using var response = await remoteProxy.ProcessAsync(context, remoteServer, remainingPath, _ =>
-      options.ContentTypeProvider.TryGetContentType(requestPath.Value ?? "", out var resolvedContentType) ?
-        resolvedContentType : options.DefaultContentType);
+    if (!await myRemoteProxy.ValidateRequestAsync(context))
+      return;
+
+    IResult? cachedFileResult = null;
+    string? cachedContentEncoding = null;
+    CatchSilently(() =>
+    {
+      var contentType = GetContentType(remainingPath);
+      foreach (var contentEncoding in GetCacheLookupContentEncodings(context))
+      {
+        var cachedFile = Path.Combine(myLocalCachePath,
+          CacheFileProvider.GetFutureCacheFileLocation(remoteServer, remainingPath!, contentEncoding == null ? null : new StringSegment(contentEncoding)));
+        if (File.Exists(cachedFile))
+        {
+          cachedContentEncoding = contentEncoding;
+          cachedFileResult = TypedResults.PhysicalFile(cachedFile, contentType, enableRangeProcessing: true);
+          break;
+        }
+      }
+    });
+    if (cachedFileResult != null)
+    {
+      myRemoteProxy.SetStatusHeader(context, CachingProxyStatus.HIT);
+      context.Response.Headers.CacheControl = RemoteProxy.OurEternalCachingHeader;
+      if (cachedContentEncoding != null)
+        context.Response.Headers.ContentEncoding = cachedContentEncoding;
+      await cachedFileResult.ExecuteAsync(context);
+      return;
+    }
+
+    using var response = await myRemoteProxy.ProcessAsync(context, remoteServer, remainingPath, GetContentType(remainingPath));
 
     // A non-null response is a GET MISS body for us to stream and persist; otherwise it is handled.
     if (response == null) return;
@@ -45,13 +97,7 @@ public class CachingProxy(
     var contentLength = response.Content.Headers.ContentLength;
     var contentLastModified = response.Content.Headers.LastModified;
 
-    var cachePath = cacheFileProvider.GetFutureCacheFileLocation(remoteServer, remainingPath, contentEncoding);
-    if (cachePath == null)
-    {
-      await remoteProxy.SetStatusAsync(context, CachingProxyStatus.BAD_REQUEST, HttpStatusCode.BadRequest, "Invalid cache path");
-      return;
-    }
-
+    var cachePath = Path.Combine(myLocalCachePath, CacheFileProvider.GetFutureCacheFileLocation(remoteServer, remainingPath, contentEncoding));
     var tempFile = cachePath + ".tmp." + Guid.NewGuid();
     try
     {
@@ -69,8 +115,8 @@ public class CachingProxy(
       var tempFileInfo = new FileInfo(tempFile);
       if (contentLength != null && tempFileInfo.Length != contentLength)
       {
-        logger.LogWarning(Event.NotMatchedContentLength, "Expected {ContentLength} bytes from Content-Length, but downloaded {Length}: {RequestPath}",
-          contentLength, tempFileInfo.Length, requestPath);
+        myLogger.LogWarning(Event.NotMatchedContentLength, "Expected {ContentLength} bytes from Content-Length, but downloaded {Length}: {RequestPath}",
+          contentLength, tempFileInfo.Length, context.Request.Path);
         context.Abort();
         return;
       }
@@ -111,6 +157,12 @@ public class CachingProxy(
           File.Delete(tempFile);
       });
     }
+
+    string GetContentType(string? path)
+    {
+      return myContentTypeProvider.TryGetContentType(path ?? "", out var resolvedContentType) ?
+        resolvedContentType : MediaTypeNames.Application.Octet;
+    }
   }
 
   private void CatchSilently(Action action)
@@ -121,8 +173,19 @@ public class CachingProxy(
     }
     catch (Exception e)
     {
-      logger.Log(LogLevel.Error, e, "LogSilently: {Message}", e.Message);
+      myLogger.Log(LogLevel.Error, e, "LogSilently: {Message}", e.Message);
     }
+  }
+
+  // Only plain and gzip variants are ever stored on disk, so there is no point probing for any other
+  // Accept-Encoding token. Prefer the gzip variant when the client asked for it; otherwise prefer
+  // plain but still fall back to gzip (a gzip-only cache entry is served to every client, matching
+  // the previous static-file behavior).
+  private static IEnumerable<string?> GetCacheLookupContentEncodings(HttpContext context)
+  {
+    var acceptsGzip = context.Request.GetTypedHeaders().AcceptEncoding
+      .Any(headerValue => string.Equals(headerValue.Value.Value, "gzip", StringComparison.OrdinalIgnoreCase));
+    return acceptsGzip ? ["gzip", null] : [null, "gzip"];
   }
 
   private static async Task CopyToTwoStreamsAsync(Stream source, Stream dest1, FileStream dest2, CancellationToken cancellationToken)
@@ -140,20 +203,20 @@ public class CachingProxy(
     }
   }
 
-  public Task<HealthCheckResult> CheckHealthAsync(HealthCheckContext context, CancellationToken cancellationToken)
+  public class HealthCheck(CachingProxyConfig config) : IHealthCheck
   {
-    var localCachePath = config.LocalCachePath;
-    var minimumFreeDiskSpaceMb = config.MinimumFreeDiskSpaceMb;
-    var availableFreeSpaceMb = new DriveInfo(localCachePath).AvailableFreeSpace / (1024 * 1024);
-    if (availableFreeSpaceMb < minimumFreeDiskSpaceMb)
+    public Task<HealthCheckResult> CheckHealthAsync(HealthCheckContext context, CancellationToken cancellationToken)
     {
-      logger.LogError(Event.NotEnoughFreeDiskSpace,
-        "Not Enough Free Disk Space. {AvailableFreeSpaceMb} MB is free at {LocalCachePath}, but minimum is {MinimumFreeDiskSpaceMb} MB",
-        availableFreeSpaceMb, localCachePath, minimumFreeDiskSpaceMb);
-      return Task.FromResult(HealthCheckResult.Unhealthy(
-        $"Not Enough Free Disk Space. {availableFreeSpaceMb} MB is free at {localCachePath}, but minimum is {minimumFreeDiskSpaceMb} MB"));
-    }
+      var localCachePath = config.LocalCachePath;
+      var minimumFreeDiskSpaceMb = config.MinimumFreeDiskSpaceMb;
+      var availableFreeSpaceMb = new DriveInfo(localCachePath).AvailableFreeSpace / (1024 * 1024);
+      if (availableFreeSpaceMb < minimumFreeDiskSpaceMb)
+      {
+        return Task.FromResult(HealthCheckResult.Unhealthy(
+          $"Not Enough Free Disk Space. {availableFreeSpaceMb} MB is free at {localCachePath}, but minimum is {minimumFreeDiskSpaceMb} MB"));
+      }
 
-    return Task.FromResult(HealthCheckResult.Healthy());
+      return Task.FromResult(HealthCheckResult.Healthy());
+    }
   }
 }

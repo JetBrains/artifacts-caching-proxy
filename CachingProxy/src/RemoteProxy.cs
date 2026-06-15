@@ -24,7 +24,6 @@ namespace JetBrains.CachingProxy;
 public partial class RemoteProxy(
   CachingProxyConfig config,
   ProxyHttpClient httpClient,
-  RemoteServers remoteServers,
   ResponseCache responseCache,
   CachingProxyMetrics metrics,
   ILogger<RemoteProxy> logger)
@@ -38,12 +37,9 @@ public partial class RemoteProxy(
   private readonly Regex? myRedirectToRemoteUrlsRegex = !string.IsNullOrWhiteSpace(config.RedirectToRemoteUrlsRegex) ?
     new Regex(config.RedirectToRemoteUrlsRegex, RegexOptions.Compiled) : null;
 
-  public RemoteServers.RemoteServer? LookupRemoteServer(PathString url, out PathString remainingPart) =>
-    remoteServers.LookupRemoteServer(url, out remainingPart);
-
   /// <summary>
   /// Validates the request method (only GET/HEAD are allowed) and path (no traversal, only safe
-  /// characters). On failure it writes the appropriate response (405 or 400 BAD_REQUEST) and
+  /// characters). On a failure it writes the appropriate response (405 or 400 BAD_REQUEST) and
   /// returns <c>false</c>; otherwise returns <c>true</c>. Both this layer and storage middlewares
   /// (disk, S3) call it before doing any upstream/storage work so the checks are applied uniformly.
   /// </summary>
@@ -70,7 +66,7 @@ public partial class RemoteProxy(
   /// hits, the upstream request and its validation (including Content-Encoding). Writes the full
   /// response head — status, metadata headers (Content-Length, Last-Modified), representation
   /// headers (Content-Type, Content-Encoding) and the proxy bookkeeping headers — to
-  /// <paramref name="context"/>. The Content-Type is the one returned by <paramref name="getContentType"/>
+  /// <paramref name="context"/>. The Content-Type is the one returned by <paramref name="contentType"/>
   /// when the caller supplies a resolver (the disk backend resolves it from the file extension, so a
   /// MISS and a later HIT served from disk agree), and the upstream's own Content-Type otherwise. It
   /// is stored in the in-memory cache so later HEAD hits agree. For a successful GET the open
@@ -78,13 +74,9 @@ public partial class RemoteProxy(
   /// Content-Encoding off the response) and must dispose it; in every other case the request is
   /// fully handled, the response (if any) is disposed internally, and <c>null</c> is returned.
   /// </summary>
-  public async Task<HttpResponseMessage?> ProcessAsync(HttpContext context, RemoteServers.RemoteServer remoteServer, PathString remainingPath,
-    Func<HttpResponseMessage, string?>? getContentType = null)
+  public async Task<HttpResponseMessage?> ProcessAsync(HttpContext context, RemoteServers.RemoteServer remoteServer, string? remainingPath, string? contentType = null)
   {
-    if (!await ValidateRequestAsync(context)) return null;
-
     var isHead = HttpMethods.IsHead(context.Request.Method);
-    var requestPath = context.Request.Path.Value!;
     var cacheKey = ResponseCache.CacheKey(context.Request.Method, remoteServer, remainingPath);
 
     var cachedResponse = responseCache.GetCachedStatusCode(cacheKey);
@@ -104,6 +96,7 @@ public partial class RemoteProxy(
         return null;
     }
 
+    var requestPath = context.Request.Path.Value!;
     if (myBlacklistRegex != null && myBlacklistRegex.IsMatch(requestPath))
     {
       await SetStatusAsync(context, CachingProxyStatus.BLACKLISTED, HttpStatusCode.NotFound, "Blacklisted");
@@ -183,7 +176,7 @@ public partial class RemoteProxy(
       // Prefer the caller's resolver (the disk backend derives the type from the file extension, so a
       // MISS matches the later HIT served from disk); fall back to the upstream's own Content-Type
       // when no resolver is supplied (e.g. the S3 backend, which stores and serves the upstream type).
-      headers.ContentType = getContentType?.Invoke(response) ?? response.Content.Headers.ContentType?.ToString();
+      headers.ContentType = contentType ?? response.Content.Headers.ContentType?.ToString();
       headers.ContentEncoding = contentEncoding;
       // Only successful (2xx) responses reach here, so the response is always eternally cacheable.
       headers.CacheControl = OurEternalCachingHeader;
@@ -211,7 +204,7 @@ public partial class RemoteProxy(
   public static readonly StringValues OurEternalCachingHeader =
     new CacheControlHeaderValue { Public = true, MaxAge = TimeSpan.FromDays(365) }.ToString();
 
-  public async ValueTask SetStatusAsync(HttpContext context, CachingProxyStatus status, HttpStatusCode? httpCode = null, string? responseString = null)
+  private async ValueTask SetStatusAsync(HttpContext context, CachingProxyStatus status, HttpStatusCode? httpCode = null, string? responseString = null)
   {
     SetStatusHeader(context, status);
 

@@ -12,7 +12,6 @@ using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
-using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
 using Xunit;
 
@@ -138,12 +137,4 @@ public class UpstreamTestServer : IAsyncLifetime
   public Task InitializeAsync() => myWebApp.StartAsync();
 
   public Task DisposeAsync() => myWebApp.StopAsync();
-}
-
-public static class TestServerEx
-{
-  public static string GetPathKey(this TestServer server, PathString path) =>
-    server.Services.GetService<RemoteServers>()!.
-      LookupRemoteServer(path, out var remainingPath)!.
-      GetUpstreamUriKey(remainingPath);
 }

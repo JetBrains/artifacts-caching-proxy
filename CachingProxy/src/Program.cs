@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using Amazon.S3;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -99,7 +100,6 @@ public static class Program
     services
       .AddSingleton(TimeProvider.System)
       .AddSingleton<CachingProxyMetrics>()
-      .AddSingleton<RemoteServers>()
       .AddSingleton<ResponseCache>()
       .AddSingleton<RemoteProxy>()
       .ConfigureOptions<HealthCheck>()
@@ -107,33 +107,30 @@ public static class Program
       .AddCheck<HealthCheck>(nameof(HealthCheck));
 
     services
+      .AddRouting()
       .AddMemoryCache()
       .AddOptions<MemoryCacheOptions>()
       .Configure<TimeProvider>((options, tp) => options.Clock = new TimeProviderClock(tp));
 
-    if (UseS3(configuration))
+    if (!string.IsNullOrEmpty(configuration.Get<CachingProxyConfig>()?.S3?.BucketName))
     {
       // AWSOptions resolves the configured profile (including SSO) into credentials when the client is
       // created, so a named profile and the default credential chain go through the same registration.
       services
         .AddDefaultAWSOptions(configuration.GetAWSOptions())
         .AddAWSService<IAmazonS3>()
-        .AddSingleton<S3CachingMiddleware>()
         .AddHealthChecks()
-        .AddCheck<S3CachingMiddleware>(nameof(S3CachingMiddleware));
+        .AddCheck<S3CachingMiddleware.HealthCheck>(nameof(S3CachingMiddleware));
     }
     else
     {
       // Disk-only services: CacheFileProvider validates/creates LocalCachePath in its constructor, so
       // it (and the static-file options that depend on it) must not be registered in S3 mode.
       services
-        .AddSingleton<CacheFileProvider>()
-        .ConfigureOptions<ConfigureStaticFileMiddleware>()
-        .AddSingleton(sp => sp.GetRequiredService<IOptions<StaticFileOptions>>().Value)
-        .AddScoped<CachingProxy>()
+        .AddSingleton<IContentTypeProvider>(new FileExtensionContentTypeProvider())
         .AddHostedService<CleanupService>()
         .AddHealthChecks()
-        .AddCheck<CachingProxy>(nameof(CachingProxy));
+        .AddCheck<CachingProxy.HealthCheck>(nameof(CachingProxy));
     }
 
     services
@@ -169,21 +166,21 @@ public static class Program
 
   public static void ConfigureOurApp(this IApplicationBuilder app, IConfiguration configuration)
   {
+    var cachingProxyConfig = configuration.Get<CachingProxyConfig>()!;
+    app.UseRouting();
     app.UseHealthChecks("/health");
-    if (UseS3(configuration))
+    if (!string.IsNullOrEmpty(cachingProxyConfig.S3?.BucketName))
     {
       app.UseMiddleware<S3CachingMiddleware>();
     }
     else
     {
-      app
-        .UseStaticFiles()
-        .UseMiddleware<CachingProxy>();
+      app.UseMiddleware<CachingProxy>();
     }
-  }
+    app.UseEndpoints(builder =>
+    {
+      builder.DataSources.Add(new RemoteServers(cachingProxyConfig));
+    });
 
-  // Single source of truth for the backend choice, so service registration and the request pipeline
-  // never disagree about whether S3 is enabled.
-  private static bool UseS3(IConfiguration configuration) =>
-    !string.IsNullOrEmpty(configuration.Get<CachingProxyConfig>()?.S3?.BucketName);
+  }
 }

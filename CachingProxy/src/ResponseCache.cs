@@ -18,7 +18,7 @@ public class ResponseCache(IMemoryCache cache, TimeProvider timeProvider)
   /// responses are verb-specific — most importantly an S3 presigned redirect, which is signed for
   /// either GET or HEAD — so a HEAD and a GET for the same path must not share an entry.
   /// </summary>
-  public static string CacheKey(string httpMethod, RemoteServers.RemoteServer remoteServer, PathString remainingPath) =>
+  public static string CacheKey(string httpMethod, RemoteServers.RemoteServer remoteServer, string? remainingPath) =>
     httpMethod + remoteServer.GetUpstreamUriKey(remainingPath);
 
   public CachedResponse? GetCachedStatusCode(string cacheKey) =>

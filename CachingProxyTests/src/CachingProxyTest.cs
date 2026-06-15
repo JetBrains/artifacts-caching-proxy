@@ -51,6 +51,11 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
         "/plugins.gradle.org/m2",
         "/registry.npmjs.org",
         "/unknown_host.xyz",
+        // Overlapping prefixes, deliberately listed shortest-first: the more specific prefix must win
+        // regardless of declaration order. The shorter one points at a non-existent upstream subpath so
+        // that a wrong (shorter) match yields a 404 instead of the expected body.
+        $"/overlap={upstreamServer.Url}wrong/",
+        $"/overlap/nested={upstreamServer.Url}",
         $"/real={upstreamServer.Url}",
         new CachingProxyPrefix($"/real-custom-ttl={upstreamServer.Url}", new CacheDuration
         {
@@ -601,6 +606,25 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
         AssertCachedStatusHeader(message, HttpStatusCode.InternalServerError);
         Assert.Null(message.Headers.CacheControl);
       });
+  }
+
+  [Fact]
+  public async Task More_Specific_Prefix_Wins_Over_Shorter_Overlapping_One()
+  {
+    // /overlap/nested/a.jar must be served by the more specific "/overlap/nested" prefix (-> upstream
+    // "a.jar", body "a.jar"), NOT by the shorter "/overlap" prefix (-> upstream "wrong/nested/a.jar",
+    // which 404s). This holds even though "/overlap" is declared first in the config.
+    await AssertGetResponse("/overlap/nested/a.jar", HttpStatusCode.OK,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.MISS);
+        Assert.Equal("a.jar", Encoding.UTF8.GetString(bytes));
+      });
+
+    // A path that only matches the shorter prefix is still routed there (-> upstream "wrong/a.jar",
+    // which 404s), confirming the shorter prefix remains active for its own paths.
+    await AssertGetResponse("/overlap/a.jar", HttpStatusCode.NotFound,
+      (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_MISS));
   }
 
   [Fact]

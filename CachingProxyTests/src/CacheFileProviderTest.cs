@@ -1,82 +1,57 @@
-using System.IO;
+using System;
+using Microsoft.Extensions.Primitives;
 using Xunit;
 
 namespace JetBrains.CachingProxy.Tests;
 
 public class CacheFileProviderTest
 {
-  private static CacheFileProvider GetCacheFileProvider()
-  {
-    return new CacheFileProvider(new CachingProxyConfig
-    {
-      Prefixes =
-      [
-        "/a",
-        "/b=a",
-        "/c/d=a/",
-      ],
-      LocalCachePath = Path.GetTempPath()
-    });
-  }
+  // All three config prefixes in the original test (/a, /b=a, /c/d=a/) resolve to the same upstream
+  // https://a/, so the mangled cache location depends only on (RemoteUri, remainingPath). Prefix and
+  // alias parsing now lives in RemoteServers and is covered by RemoteServersTest.
+  private static readonly RemoteServers.RemoteServer ourServer = new("/a", new Uri("https://a/"));
 
   [Fact]
   public void ManglePath1()
   {
-    var provider = GetCacheFileProvider();
     Assert.Equal(
-      Path.Combine(Path.GetTempPath(), "d9", "6d" ,"d96d0bd13935d4ab082c410dea64c70bf2f926b75f3b487ac18c0e290ee8ac3a.jar"),
-      provider.GetFileInfo("/a/a.jar").PhysicalPath);
+      "d9/6d/d96d0bd13935d4ab082c410dea64c70bf2f926b75f3b487ac18c0e290ee8ac3a.jar",
+      CacheFileProvider.GetFutureCacheFileLocation(ourServer, "a.jar"));
   }
 
   [Fact]
   public void ManglePath2()
   {
-    var provider = GetCacheFileProvider();
+    // A trailing slash makes the upstream key "a/a.jar/", which has no file extension.
     Assert.Equal(
-      Path.Combine(Path.GetTempPath(), "14", "40", "1440b34e1707076ba9c32fd06c18405254883be42d14cd240f237eaa3eb5960c"),
-      provider.GetFileInfo("/a/a.jar/").PhysicalPath);
+      "14/40/1440b34e1707076ba9c32fd06c18405254883be42d14cd240f237eaa3eb5960c",
+      CacheFileProvider.GetFutureCacheFileLocation(ourServer, "a.jar/"));
   }
 
   [Fact]
-  public void ManglePath3()
+  public void ManglePath_LeadingSlashIsIgnored()
   {
-    var provider = GetCacheFileProvider();
-    Assert.Null(provider.GetFileInfo("/tt.jar").PhysicalPath);
-  }
-
-  [Fact]
-  public void ManglePath4()
-  {
-    var provider = GetCacheFileProvider();
-    Assert.Null(provider.GetFileInfo("/../..").PhysicalPath);
+    // The route catch-all value has no leading slash, but a leading slash must hash identically.
+    Assert.Equal(
+      CacheFileProvider.GetFutureCacheFileLocation(ourServer, "a.jar"),
+      CacheFileProvider.GetFutureCacheFileLocation(ourServer, "/a.jar"));
   }
 
   [Fact]
   public void ManglePath_IsCaseSensitive()
   {
     // Upstreams are case-sensitive, so paths differing only in case must map to distinct cache files.
-    var provider = GetCacheFileProvider();
     Assert.NotEqual(
-      provider.GetFileInfo("/a/Foo.jar").PhysicalPath,
-      provider.GetFileInfo("/a/foo.jar").PhysicalPath);
+      CacheFileProvider.GetFutureCacheFileLocation(ourServer, "Foo.jar"),
+      CacheFileProvider.GetFutureCacheFileLocation(ourServer, "foo.jar"));
   }
 
   [Fact]
-  public void ManglePathAlias()
+  public void ManglePath_GzipVariantAppendsSuffix()
   {
-    var provider = GetCacheFileProvider();
-    Assert.Equal(
-      Path.Combine(Path.GetTempPath(), "14", "40", "1440b34e1707076ba9c32fd06c18405254883be42d14cd240f237eaa3eb5960c"),
-      provider.GetFileInfo("/b/a.jar/").PhysicalPath);
+    // The gzip variant differs from the plain one only by a suffix appended after the hash.
+    var plain = CacheFileProvider.GetFutureCacheFileLocation(ourServer, "a.jar");
+    var gzip = CacheFileProvider.GetFutureCacheFileLocation(ourServer, "a.jar", new StringSegment("gzip"));
+    Assert.Equal(plain + "-gzip-Ege4dHyCEA7IM", gzip);
   }
-
-  [Fact]
-  public void ManglePathAlias2()
-  {
-    var provider = GetCacheFileProvider();
-    Assert.Equal(
-      Path.Combine(Path.GetTempPath(), "14", "40", "1440b34e1707076ba9c32fd06c18405254883be42d14cd240f237eaa3eb5960c"),
-      provider.GetFileInfo("/c/d/a.jar/").PhysicalPath);
-  }
-
 }

@@ -31,6 +31,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
 
   private readonly FakeAmazonS3 myS3 = new();
   private readonly List<IHost> myHosts = [];
+  private readonly RemoteServers.RemoteServer myRemoteServer = new("/real", upstreamServer.Url);
 
   private TestServer CreateServer(bool signedLinks)
   {
@@ -57,7 +58,6 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
             // Real system clock: the signed-link path lets the real client compute the presigned
             // URL, whose Expires must be in the future (no test here advances time).
               .Replace(ServiceDescriptor.Singleton<IAmazonS3>(myS3));
-
           })
           .Configure((context, builder) => builder.ConfigureOurApp(context.Configuration));
       })
@@ -93,7 +93,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
 
     // The upstream body was streamed into the bucket, not back to the client.
     Assert.Equal(1, myS3.PutObjectCalls);
-    Assert.True(myS3.Objects.TryGetValue(server.GetPathKey("/real/a.jar"), out var stored));
+    Assert.True(myS3.Objects.TryGetValue(GetPathKey("/real/a.jar"), out var stored));
     Assert.Equal("a.jar", Encoding.UTF8.GetString(stored.Body));
   }
 
@@ -107,7 +107,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
 
     Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
     AssertStatusHeader(response, CachingProxyStatus.MISS);
-    Assert.True(myS3.Objects.TryGetValue(server.GetPathKey("/real/chunked.bin"), out var stored));
+    Assert.True(myS3.Objects.TryGetValue(GetPathKey("/real/chunked.bin"), out var stored));
     Assert.Equal("chunk1chunk2", Encoding.UTF8.GetString(stored.Body));
   }
 
@@ -136,7 +136,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   public async Task Existing_Object_Redirects_Without_Reupload()
   {
     var server = CreateServer(signedLinks: true);
-    myS3.Objects[server.GetPathKey("/real/a.jar")] = ([.. "a.jar"u8], "application/java-archive");
+    myS3.Objects[GetPathKey("/real/a.jar")] = ([.. "a.jar"u8], "application/java-archive");
     using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
 
     Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
@@ -167,7 +167,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     // A presigned URL is signed for a specific verb. Because the cache key includes the method, a
     // HEAD caches a HEAD-signed redirect and a GET caches its own GET-signed redirect; neither is
     // ever served for the other method (which S3 would reject as SignatureDoesNotMatch).
-    myS3.Objects[server.GetPathKey("/real/a.jar")] = ([.. "a.jar"u8], null);
+    myS3.Objects[GetPathKey("/real/a.jar")] = ([.. "a.jar"u8], null);
 
     using (var head = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Head.Method))
       Assert.Equal(HttpStatusCode.RedirectKeepVerb, head.StatusCode);
@@ -187,7 +187,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     var server = CreateServer(signedLinks: true);
 
     // Same verb twice: the second HEAD replays the cached HEAD-signed redirect without re-probing.
-    myS3.Objects[server.GetPathKey("/real/a.jar")] = ([.. "a.jar"u8], null);
+    myS3.Objects[GetPathKey("/real/a.jar")] = ([.. "a.jar"u8], null);
 
     using (var first = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Head.Method))
       AssertStatusHeader(first, CachingProxyStatus.MISS);
@@ -219,7 +219,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
 
     // Regression test: even when the object exists in the bucket, a non-GET/HEAD method must be
     // rejected up front and must NOT be redirected (the validation-bypass fix).
-    myS3.Objects[server.GetPathKey("/real/a.jar")] = ([.. "a.jar"u8], null);
+    myS3.Objects[GetPathKey("/real/a.jar")] = ([.. "a.jar"u8], null);
 
     using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Post.Method);
 
@@ -247,6 +247,12 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
     AssertStatusHeader(response, CachingProxyStatus.NEGATIVE_MISS);
     Assert.Equal(0, myS3.PutObjectCalls);
+  }
+
+  private string GetPathKey(string path)
+  {
+    Assert.StartsWith(myRemoteServer.Prefix, path);
+    return myRemoteServer.GetUpstreamUriKey(path[myRemoteServer.Prefix.Value!.Length..]);
   }
 
   private static void AssertStatusHeader(HttpResponseMessage response, CachingProxyStatus status) =>
