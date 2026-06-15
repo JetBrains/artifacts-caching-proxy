@@ -12,9 +12,6 @@ public class CacheDuration : Dictionary<HttpStatusCode, TimeSpan>
     // Clear reply from a server
     [HttpStatusCode.OK] = TimeSpan.FromMinutes(5),
     [HttpStatusCode.NotFound] = TimeSpan.FromMinutes(5),
-    // S3 "object is in the bucket" redirect — a positive result. Without an explicit entry it would
-    // fall back to DefaultDuration (1 min) and re-probe S3 / re-sign the redirect every minute.
-    [HttpStatusCode.RedirectKeepVerb] = TimeSpan.FromMinutes(5),
   };
 
   public static readonly TimeSpan DefaultDuration = TimeSpan.FromMinutes(1);
