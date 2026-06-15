@@ -9,7 +9,7 @@ public class CacheFileProviderTest
   // All three config prefixes in the original test (/a, /b=a, /c/d=a/) resolve to the same upstream
   // https://a/, so the mangled cache location depends only on (RemoteUri, remainingPath). Prefix and
   // alias parsing now lives in RemoteServers and is covered by RemoteServersTest.
-  private static readonly RemoteServers.RemoteServer ourServer = new("/a", new Uri("https://a/"));
+  private static readonly RemoteServers.RemoteServer ourServer = new("/a", new Uri("https://a/"), new CacheDuration());
 
   [Fact]
   public void ManglePath1()

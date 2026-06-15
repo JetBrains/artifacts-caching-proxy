@@ -10,6 +10,10 @@ public class ResponseCacheTest
 {
   private readonly FakeTimeProvider _timeProvider = new();
   private readonly ResponseCache _cache;
+  private readonly CacheDuration _cacheDuration = new()
+  {
+    [HttpStatusCode.TemporaryRedirect] = TimeSpan.FromMinutes(5)
+  };
 
   public ResponseCacheTest()
   {
@@ -24,7 +28,7 @@ public class ResponseCacheTest
   public void CacheEntry_ExpiresAfterAbsoluteTime()
   {
     const string key = "test-key";
-    _cache.PutStatusCode(key, HttpStatusCode.OK);
+    _cache.PutStatusCode(key, HttpStatusCode.OK, _cacheDuration);
 
     // Entry should exist immediately
     Assert.NotNull(_cache.GetCachedStatusCode(key));
@@ -40,7 +44,7 @@ public class ResponseCacheTest
   public void CacheEntry_AccessDoesNotExtendExpiration()
   {
     const string key = "test-key";
-    _cache.PutStatusCode(key, HttpStatusCode.OK);
+    _cache.PutStatusCode(key, HttpStatusCode.OK, _cacheDuration);
 
     // Simulate high-load access pattern: access every 30 seconds
     // With sliding expiration, these repeated accesses would keep extending the entry
@@ -64,7 +68,7 @@ public class ResponseCacheTest
   public void CacheEntry_OkAndNotFound_ExpireAfter5Minutes(HttpStatusCode statusCode)
   {
     const string key = "test-key";
-    _cache.PutStatusCode(key, statusCode);
+    _cache.PutStatusCode(key, statusCode, _cacheDuration);
 
     // Should exist at 4:59
     _timeProvider.Advance(TimeSpan.FromMinutes(5) - TimeSpan.FromSeconds(1));
@@ -81,7 +85,7 @@ public class ResponseCacheTest
     // The S3 "object is in the bucket" redirect must use the positive (5 min) duration, not the
     // 1-minute DefaultDuration, otherwise the redirect is re-probed/re-signed every minute.
     const string key = "test-key";
-    _cache.PutStatusCode(key, HttpStatusCode.RedirectKeepVerb);
+    _cache.PutStatusCode(key, HttpStatusCode.RedirectKeepVerb, _cacheDuration);
 
     _timeProvider.Advance(TimeSpan.FromMinutes(5) - TimeSpan.FromSeconds(1));
     Assert.NotNull(_cache.GetCachedStatusCode(key));
@@ -97,7 +101,7 @@ public class ResponseCacheTest
   public void CacheEntry_OtherStatusCodes_ExpireAfter1Minute(HttpStatusCode statusCode)
   {
     const string key = "test-key";
-    _cache.PutStatusCode(key, statusCode);
+    _cache.PutStatusCode(key, statusCode, _cacheDuration);
 
     // Should exist at 0:59
     _timeProvider.Advance(TimeSpan.FromSeconds(59));
@@ -112,7 +116,7 @@ public class ResponseCacheTest
   public void CustomCacheDuration_OverridesDefaultForOk()
   {
     const string key = "test-key";
-    var customDuration = new CacheDuration
+    var customDuration = new CacheDuration(_cacheDuration)
     {
       [HttpStatusCode.OK] = TimeSpan.FromMinutes(30),
     };
@@ -135,10 +139,10 @@ public class ResponseCacheTest
   public void CustomCacheDuration_ShortensExpirationForOk()
   {
     const string key = "test-key";
-    var customDuration = new CacheDuration
+    var customDuration = _cacheDuration.Union(new CacheDuration
     {
       [HttpStatusCode.OK] = TimeSpan.FromSeconds(10),
-    };
+    });
     _cache.PutStatusCode(key, HttpStatusCode.OK, customDuration);
 
     // Should exist just before 10-second mark
@@ -154,10 +158,10 @@ public class ResponseCacheTest
   public void CustomCacheDuration_OverridesDefaultForNotFound()
   {
     const string key = "test-key";
-    var customDuration = new CacheDuration
+    var customDuration = _cacheDuration.Union(new CacheDuration
     {
       [HttpStatusCode.NotFound] = TimeSpan.FromMinutes(1),
-    };
+    });
     _cache.PutStatusCode(key, HttpStatusCode.NotFound, customDuration);
 
     // Should exist just before 1-minute mark
@@ -173,10 +177,10 @@ public class ResponseCacheTest
   public void CustomCacheDuration_AppliesToCustomStatusCode()
   {
     const string key = "test-key";
-    var customDuration = new CacheDuration
+    var customDuration = _cacheDuration.Union(new CacheDuration
     {
       [HttpStatusCode.InternalServerError] = TimeSpan.FromMinutes(10),
-    };
+    });
     _cache.PutStatusCode(key, HttpStatusCode.InternalServerError, customDuration);
 
     // Default 500 falls back to DefaultDuration of 1 minute; custom is 10 minutes
@@ -197,10 +201,10 @@ public class ResponseCacheTest
   {
     const string key = "test-key";
     // Custom duration only defines OK; NotFound should fall back to CacheDuration.Default (5 minutes)
-    var customDuration = new CacheDuration
+    var customDuration = _cacheDuration.Union(new CacheDuration
     {
       [HttpStatusCode.OK] = TimeSpan.FromMinutes(30),
-    };
+    });
     _cache.PutStatusCode(key, HttpStatusCode.NotFound, customDuration);
 
     // Should exist just before the 5-minute default for NotFound
@@ -218,10 +222,10 @@ public class ResponseCacheTest
     const string key = "test-key";
     // Custom duration defines only OK; 500 is not in custom or in CacheDuration.Default,
     // so falls back to CacheDuration.DefaultDuration (1 minute)
-    var customDuration = new CacheDuration
+    var customDuration = _cacheDuration.Union(new CacheDuration
     {
       [HttpStatusCode.OK] = TimeSpan.FromMinutes(30),
-    };
+    });
     _cache.PutStatusCode(key, HttpStatusCode.InternalServerError, customDuration);
 
     // Should exist just before 1-minute mark
@@ -242,13 +246,13 @@ public class ResponseCacheTest
     const string key = "test-key";
     // Simulate prefix-level configuration: a CachingProxyPrefix carries a CacheDuration
     // which is then forwarded to the cache layer.
-    var prefix = new CachingProxyPrefix("repo.example.com", new CacheDuration
+    var prefix = new CachingProxyPrefix("repo.example.com", _cacheDuration.Union(new CacheDuration
     {
       [HttpStatusCode.OK] = TimeSpan.FromHours(1),
       [HttpStatusCode.NotFound] = TimeSpan.FromHours(1),
       [HttpStatusCode.InternalServerError] = TimeSpan.FromHours(1),
-    });
-    _cache.PutStatusCode(key, statusCode, prefix.CacheDuration);
+    }));
+    _cache.PutStatusCode(key, statusCode, prefix.CacheDuration!);
 
     // All three should remain past the defaults (5 min / 1 min) thanks to the 1-hour override
     _timeProvider.Advance(TimeSpan.FromMinutes(30));

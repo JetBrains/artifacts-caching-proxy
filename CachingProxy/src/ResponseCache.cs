@@ -24,12 +24,12 @@ public class ResponseCache(IMemoryCache cache, TimeProvider timeProvider)
   public CachedResponse? GetCachedStatusCode(string cacheKey) =>
     cache.TryGetValue<CachedResponse>(cacheKey, out var entry) ? entry : null;
 
-  public CachedResponse PutStatusCode(string cacheKey, HttpStatusCode statusCode, CacheDuration? cacheDuration = null) =>
-    PutStatusCode(cacheKey, cacheDuration, new CachedResponse(statusCode, new HeaderDictionary()));
+  public CachedResponse PutStatusCode(string cacheKey, HttpStatusCode statusCode, CacheDuration cacheDuration) =>
+    PutStatusCode(cacheKey, new CachedResponse(statusCode, new HeaderDictionary()), cacheDuration);
 
-  public CachedResponse PutStatusCode(string cacheKey, CacheDuration? cacheDuration, CachedResponse entry)
+  public CachedResponse PutStatusCode(string cacheKey, CachedResponse entry, CacheDuration cacheDuration)
   {
-    var cachingTime = GetCacheDuration(cacheDuration, entry.StatusCode);
+    var cachingTime = cacheDuration.GetDuration(entry.StatusCode);
     entry.Headers[CachingProxyConstants.CachedStatusHeader] = entry.StatusCode.ToString("D");
     entry.Headers[CachingProxyConstants.CachedUntilHeader] = (timeProvider.GetUtcNow() + cachingTime).ToString("R");
 
@@ -38,8 +38,4 @@ public class ResponseCache(IMemoryCache cache, TimeProvider timeProvider)
       AbsoluteExpirationRelativeToNow = cachingTime,
     });
   }
-
-  public static TimeSpan GetCacheDuration(CacheDuration? cacheDuration, HttpStatusCode statusCode) =>
-    cacheDuration?.TryGetValue(statusCode, out var timeSpan) ?? false ? timeSpan :
-    CacheDuration.Default.TryGetValue(statusCode, out timeSpan) ? timeSpan : CacheDuration.DefaultDuration;
 }

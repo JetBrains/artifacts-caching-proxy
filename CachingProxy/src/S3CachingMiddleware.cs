@@ -88,8 +88,9 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
           BucketName = config.S3.BucketName,
           Key = s3Key,
           Verb = HttpMethods.IsHead(context.Request.Method) ? HttpVerb.HEAD : HttpVerb.GET,
-          Expires = timeProvider.GetUtcNow().UtcDateTime + CacheDuration.CacheOffsetDuration +
-                    ResponseCache.GetCacheDuration(remoteServer.CacheDuration, HttpStatusCode.RedirectKeepVerb)
+          Expires = timeProvider.GetUtcNow().UtcDateTime +
+                    config.S3.CacheOffsetDuration +
+                    remoteServer.CacheDuration.GetDuration((HttpStatusCode)context.Response.StatusCode)
         });
       }
       else
@@ -110,7 +111,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
       headers.Location = location;
       var cachingResponse = new CachedResponse(HttpStatusCode.RedirectKeepVerb, headers);
       remoteProxy.SetStatus(context, CachingProxyStatus.MISS,
-        responseCache.PutStatusCode(cacheKey, remoteServer.CacheDuration, cachingResponse));
+        responseCache.PutStatusCode(cacheKey, cachingResponse, remoteServer.CacheDuration));
     }
   }
 

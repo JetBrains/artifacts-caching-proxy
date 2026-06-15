@@ -7,7 +7,12 @@ namespace JetBrains.CachingProxy;
 
 public class CachingProxyConfig
 {
-  public record S3Config(string? BucketName = null, bool SignedLinks = false);
+  public record S3Config(string? BucketName = null, bool SignedLinks = false)
+  {
+    // Added to the S3 redirect cache duration so a presigned link stays valid slightly longer than the
+    // cached redirect itself, avoiding a race where the link expires right as the redirect is replayed.
+    public TimeSpan CacheOffsetDuration { get; init; } = TimeSpan.FromSeconds(5);
+  }
 
   public CachingProxyPrefix[] Prefixes { get; init; } = [];
   public S3Config? S3 { get; init; }
@@ -23,4 +28,6 @@ public class CachingProxyConfig
 
   public string? CleanupInterval { get; init; }
   public TimeSpan CleanupPeriod { get; init; } = TimeSpan.FromDays(7);
+
+  public CacheDuration CacheDuration { get; init; } = new();
 }

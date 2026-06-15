@@ -185,7 +185,7 @@ public partial class RemoteProxy(
 
       if (isHead)
       {
-        responseCache.PutStatusCode(cacheKey, remoteServer.CacheDuration, responseEntry);
+        responseCache.PutStatusCode(cacheKey, responseEntry, remoteServer.CacheDuration);
         SetStatus(context, CachingProxyStatus.MISS, responseEntry);
         return null;
       }

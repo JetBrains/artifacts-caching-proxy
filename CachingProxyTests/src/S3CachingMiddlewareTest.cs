@@ -31,13 +31,16 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
 
   private readonly FakeAmazonS3 myS3 = new();
   private readonly List<IHost> myHosts = [];
-  private readonly RemoteServers.RemoteServer myRemoteServer = new("/real", upstreamServer.Url);
+  private readonly RemoteServers.RemoteServer myRemoteServer = new("/real", upstreamServer.Url, new CacheDuration());
 
-  private TestServer CreateServer(bool signedLinks)
+  private TestServer CreateServer(bool signedLinks, TimeSpan? cacheOffsetDuration = null)
   {
     var config = new CachingProxyConfig
     {
-      S3 = new CachingProxyConfig.S3Config(BucketName, signedLinks),
+      S3 = new CachingProxyConfig.S3Config(BucketName, signedLinks)
+      {
+        CacheOffsetDuration = cacheOffsetDuration ?? TimeSpan.FromSeconds(5),
+      },
       Prefixes = [$"/real={upstreamServer.Url}"],
     };
 
@@ -95,6 +98,27 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     Assert.Equal(1, myS3.PutObjectCalls);
     Assert.True(myS3.Objects.TryGetValue(GetPathKey("/real/a.jar"), out var stored));
     Assert.Equal("a.jar", Encoding.UTF8.GetString(stored.Body));
+  }
+
+  [Fact]
+  public async Task Signed_Redirect_Expiry_Includes_Configured_CacheOffset()
+  {
+    // The presigned link must outlive the cached redirect by the configured offset:
+    //   Expires = now + CacheOffsetDuration + the OK(200) cache duration.
+    // A distinctive 90s offset makes the assertion fail if the 5s default were used instead.
+    var offset = TimeSpan.FromSeconds(90);
+    var okDuration = TimeSpan.FromMinutes(5); // CacheDuration default for OK
+    var server = CreateServer(signedLinks: true, cacheOffsetDuration: offset);
+
+    var before = DateTime.UtcNow;
+    using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
+    var after = DateTime.UtcNow;
+
+    Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
+    Assert.NotNull(myS3.LastPresignExpires);
+    // GetUtcNow() was sampled during the request, so Expires lands inside the [before, after] window
+    // shifted by offset + okDuration.
+    Assert.InRange(myS3.LastPresignExpires.Value, before + offset + okDuration, after + offset + okDuration);
   }
 
   [Fact]
@@ -282,16 +306,19 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     public int GetObjectMetadataCalls;
     public int PutObjectCalls;
     public HttpVerb? LastPresignVerb;
+    public DateTime? LastPresignExpires;
 
     string IAmazonS3.GetPreSignedURL(GetPreSignedUrlRequest request)
     {
       LastPresignVerb = request.Verb;
+      LastPresignExpires = request.Expires;
       return base.GetPreSignedURL(request);
     }
 
     Task<string> IAmazonS3.GetPreSignedURLAsync(GetPreSignedUrlRequest request)
     {
       LastPresignVerb = request.Verb;
+      LastPresignExpires = request.Expires;
       return base.GetPreSignedURLAsync(request);
     }
 

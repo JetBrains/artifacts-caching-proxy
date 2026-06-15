@@ -26,8 +26,9 @@ public class RemoteServers : EndpointDataSource
       var target = index < 0 ? trimmed : trimmed[(index + 1)..];
       target = target.TrimEnd('/') + '/';
       var remoteServer = new RemoteServer(trimmedPrefix,
-        Uri.TryCreate(target, UriKind.Absolute, out var targetUri) ? targetUri
-          : new Uri(Uri.UriSchemeHttps + Uri.SchemeDelimiter + target, UriKind.Absolute), prefix.CacheDuration);
+        Uri.TryCreate(target, UriKind.Absolute, out var targetUri) ? targetUri :
+          new Uri(Uri.UriSchemeHttps + Uri.SchemeDelimiter + target, UriKind.Absolute),
+            config.CacheDuration.Union(prefix.CacheDuration));
 
       // Overlapping prefixes (e.g. "/aprefix" and "/aprefix/too") both match via their {**path}
       // catch-all, and routing breaks such ties by Endpoint.Order, NOT by specificity. So order by
@@ -51,7 +52,7 @@ public class RemoteServers : EndpointDataSource
     return context.GetEndpoint()?.Metadata.GetMetadata<RemoteServer>();
   }
 
-  public record RemoteServer(PathString Prefix, Uri RemoteUri, CacheDuration? CacheDuration = null)
+  public record RemoteServer(PathString Prefix, Uri RemoteUri, CacheDuration CacheDuration)
   {
     public Uri GetUpstreamUri(string? remainingPath) => string.IsNullOrEmpty(remainingPath) ? RemoteUri :
       new Uri(RemoteUri, remainingPath.AsSpan(remainingPath[0] == '/' ? 1 : 0).ToString());
