@@ -131,6 +131,7 @@ public class UpstreamTestServer : IAsyncLifetime
         res.ContentType = MediaTypeNames.Text.Html;
         return res.WriteAsync("some html");
       })
+      .MapGet("artifact.pom", (req, res, data) => res.WriteAsync("<project/>"))
     );
   }
 

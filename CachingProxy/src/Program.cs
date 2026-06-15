@@ -127,7 +127,27 @@ public static class Program
       // Disk-only services: CacheFileProvider validates/creates LocalCachePath in its constructor, so
       // it (and the static-file options that depend on it) must not be registered in S3 mode.
       services
-        .AddSingleton<IContentTypeProvider>(new FileExtensionContentTypeProvider())
+        .AddSingleton<IContentTypeProvider>(_ => new FileExtensionContentTypeProvider
+        {
+          Mappings =
+          {
+            [".pom"] = "application/x-maven-pom+xml",
+            [".ivy"] = "application/x-ivy+xml",
+            [".nuspec"] = "application/x-nuspec+xml",
+            [".jnlp"] = "application/x-java-jnlp-file",
+            [".sha1"] = "application/x-checksum",
+            [".sha256"] = "application/x-checksum",
+            [".sha512"] = "application/x-checksum",
+            [".md5"] = "application/x-checksum",
+            [".jar"] = "application/java-archive",
+            [".war"] = "application/java-archive",
+            [".ear"] = "application/java-archive",
+            [".sar"] = "application/java-archive",
+            [".har"] = "application/java-archive",
+            [".hpi"] = "application/java-archive",
+            [".jpi"] = "application/java-archive"
+          }
+        })
         .AddHostedService<CleanupService>()
         .AddHealthChecks()
         .AddCheck<CachingProxy.HealthCheck>(nameof(CachingProxy));

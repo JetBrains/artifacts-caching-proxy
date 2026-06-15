@@ -465,6 +465,28 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
   }
 
   [Fact]
+  public async Task Pom_Content_Type_Is_Produced_From_Extension()
+  {
+    // .pom is not a built-in MIME type; it is configured to map to application/x-maven-pom+xml.
+    // The proxy derives the Content-Type from the extension, so MISS and HIT (served from disk) agree.
+    await AssertGetResponse("/real/artifact.pom", HttpStatusCode.OK,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.MISS);
+        Assert.Equal("application/x-maven-pom+xml", message.Content.Headers.ContentType?.ToString());
+        Assert.Equal("<project/>", Encoding.UTF8.GetString(bytes));
+      });
+
+    await AssertGetResponse("/real/artifact.pom", HttpStatusCode.OK,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.HIT);
+        Assert.Equal("application/x-maven-pom+xml", message.Content.Headers.ContentType?.ToString());
+        Assert.Equal("<project/>", Encoding.UTF8.GetString(bytes));
+      });
+  }
+
+  [Fact]
   public async Task Always_Cache_Directory_Index()
   {
     await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/",
