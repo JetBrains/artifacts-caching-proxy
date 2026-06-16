@@ -11,6 +11,7 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection;
 using Xunit;
@@ -28,6 +29,10 @@ public class UpstreamTestServer : IAsyncLifetime
 
   public string LastUserAgent { get; private set; } = "";
 
+  // The exact origin-form target the proxy emitted (= the PathAndQuery the proxy's HttpClient
+  // sent), so tests can assert what the upstream actually received on the wire.
+  public string LastRawTarget { get; private set; } = "";
+
   private readonly WebApplication myWebApp;
   public volatile bool Conditional500SendErrorOnce;
 
@@ -41,6 +46,7 @@ public class UpstreamTestServer : IAsyncLifetime
       .Use((context, next) =>
       {
         LastUserAgent = context.Request.Headers.UserAgent.ToString();
+        LastRawTarget = context.Features.Get<IHttpRequestFeature>()?.RawTarget ?? "";
         return next(context);
       })
       .UseRouter(router => router

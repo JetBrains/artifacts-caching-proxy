@@ -278,6 +278,11 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
         AssertStatusHeader(message, CachingProxyStatus.MISS);
         Assert.Equal("scoped-package-content", Encoding.UTF8.GetString(bytes));
       });
+
+    // Direct guard: the proxy must forward the slash still percent-encoded, not as a real '/'.
+    // (Hex case may be normalized by System.Uri, so compare case-insensitively.)
+    Assert.Contains("@scope%2f", myUpstreamServer.LastRawTarget, StringComparison.OrdinalIgnoreCase);
+    Assert.DoesNotContain("@scope/package", myUpstreamServer.LastRawTarget);
   }
 
   [Fact]

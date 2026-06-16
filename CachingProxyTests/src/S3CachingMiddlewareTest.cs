@@ -237,6 +237,33 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   }
 
   [Fact]
+  public async Task Encoded_Slash_Is_Stored_Under_Encoded_Key()
+  {
+    // npm scoped packages arrive with an encoded slash (e.g. @scope%2Fname). The %2F must be
+    // preserved in the S3 key (NOT decoded to a real '/'), so the scoped package is keyed
+    // distinctly from a real two-segment path "@scope/name". Unsigned links so the Location is
+    // a plain bucket URL we can assert on.
+    var server = CreateServer(signedLinks: false);
+    using var response = await server.CreateRequest("/real/@scope%2fpackage").SendAsync(HttpMethod.Get.Method);
+
+    Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
+    AssertStatusHeader(response, CachingProxyStatus.MISS);
+
+    // Stored under the encoded key, body intact. (Hex case may be normalized by System.Uri.)
+    var key = GetPathKey("/real/@scope%2fpackage");
+    Assert.Contains("@scope%2f", key, StringComparison.OrdinalIgnoreCase); // literal %2F preserved
+    Assert.DoesNotContain("@scope/package", key);                          // not decoded to a real slash
+    Assert.True(myS3.Objects.TryGetValue(key, out var stored));
+    Assert.Equal("scoped-package-content", Encoding.UTF8.GetString(stored.Body));
+
+    // The unsigned redirect references that literal key: the '%' is itself encoded (%2F -> %252F)
+    // so S3 resolves the Location back to the stored key.
+    var location = response.Headers.Location?.ToString();
+    Assert.NotNull(location);
+    Assert.Contains("%252f", location, StringComparison.OrdinalIgnoreCase);
+  }
+
+  [Fact]
   public async Task Post_Is_Rejected_Before_Probing_S3()
   {
     var server = CreateServer(signedLinks: true);

@@ -37,7 +37,7 @@ public class RemoteServers : EndpointDataSource
       // them are never observed.
       endpoints[i] = new RouteEndpoint(
         requestDelegate: static _ => Task.CompletedTask,
-        routePattern: RoutePatternFactory.Parse(trimmedPrefix + "/{**path}"),
+        routePattern: RoutePatternFactory.Parse(trimmedPrefix + $"/{{**{ourPathParameterName}}}"),
         order: 0, // Yes, the same order for everything. Real order will be determined by the ASP.NET in runtime according to prefixes topology.
         metadata: new EndpointMetadataCollection(remoteServer),
         displayName: $"Metadata-only {prefix}");
@@ -46,16 +46,18 @@ public class RemoteServers : EndpointDataSource
     Endpoints = endpoints;
   }
 
+  private const string ourPathParameterName = "path";
+
   public static RemoteServer? GetRemoteServer(HttpContext context, out string? path)
   {
-    path = context.GetRouteValue("path")?.ToString();
+    path = context.GetRouteValue(ourPathParameterName)?.ToString();
     return context.GetEndpoint()?.Metadata.GetMetadata<RemoteServer>();
   }
 
   public record RemoteServer(PathString Prefix, Uri RemoteUri, CacheDuration CacheDuration)
   {
-    public Uri GetUpstreamUri(string? remainingPath) => string.IsNullOrEmpty(remainingPath) ? RemoteUri :
-      new Uri(RemoteUri, remainingPath.AsSpan(remainingPath[0] == '/' ? 1 : 0).ToString());
+    public Uri GetUpstreamUri(string? remainingPath) =>
+      string.IsNullOrEmpty(remainingPath) ? RemoteUri : new Uri(RemoteUri, remainingPath);
 
     public string GetUpstreamUriKey(string? remainingPath) =>
       GetUpstreamUri(remainingPath).GetComponents(UriComponents.Host | UriComponents.Port | UriComponents.Path, UriFormat.UriEscaped);
