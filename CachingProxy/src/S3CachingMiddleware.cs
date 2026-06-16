@@ -31,11 +31,14 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
     if (!await remoteProxy.ValidateRequestAsync(context))
       return;
 
-    var s3Key = remoteServer.GetUpstreamUriKey(remainingPath);
+    var upstreamUri = remoteServer.GetUpstreamUri(remainingPath);
+    var s3Key = upstreamUri.ToKey();
 
-    // The cache key includes the HTTP method: a presigned redirect is signed for a specific verb, so
-    // HEAD and GET each cache (and replay) their own correctly-signed redirect under separate keys.
-    var cacheKey = ResponseCache.CacheKey(context.Request.Method, remoteServer, remainingPath);
+    // Only signed links need a per-method cache key: a presigned redirect is signed for a specific
+    // verb, so HEAD and GET must each cache (and replay) their own correctly-signed redirect under
+    // separate keys. Unsigned links point at the bucket endpoint and are verb-agnostic, so they
+    // share a single key.
+    var cacheKey = config.S3!.SignedLinks ? context.Request.Method + s3Key : s3Key;
 
     try
     {
@@ -50,7 +53,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
         catch (AmazonServiceException ex) when (ex.StatusCode is HttpStatusCode.NotFound) { }
       }
 
-      using var response = await remoteProxy.ProcessAsync(context, remoteServer, remainingPath);
+      using var response = await remoteProxy.ProcessAsync(context, cacheKey, remoteServer.CacheDuration, upstreamUri);
 
       // A non-null response is a GET MISS body for us to stream and persist; otherwise it is handled.
       if (response == null) return;

@@ -59,9 +59,6 @@ public class RemoteServers : EndpointDataSource
     public Uri GetUpstreamUri(string? remainingPath) =>
       string.IsNullOrEmpty(remainingPath) ? RemoteUri : new Uri(RemoteUri, remainingPath);
 
-    public string GetUpstreamUriKey(string? remainingPath) =>
-      GetUpstreamUri(remainingPath).GetComponents(UriComponents.Host | UriComponents.Port | UriComponents.Path, UriFormat.UriEscaped);
-
     public override string ToString() => $"{Prefix}={RemoteUri}";
   }
 

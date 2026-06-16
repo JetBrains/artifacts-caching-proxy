@@ -74,10 +74,9 @@ public partial class RemoteProxy(
   /// Content-Encoding off the response) and must dispose it; in every other case the request is
   /// fully handled, the response (if any) is disposed internally, and <c>null</c> is returned.
   /// </summary>
-  public async Task<HttpResponseMessage?> ProcessAsync(HttpContext context, RemoteServers.RemoteServer remoteServer, string? remainingPath, string? contentType = null)
+  public async Task<HttpResponseMessage?> ProcessAsync(HttpContext context, string cacheKey, CacheDuration cacheDuration, Uri upstreamUri, string? contentType = null)
   {
     var isHead = HttpMethods.IsHead(context.Request.Method);
-    var cacheKey = ResponseCache.CacheKey(context.Request.Method, remoteServer, remainingPath);
 
     var cachedResponse = responseCache.GetCachedStatusCode(cacheKey);
     switch (cachedResponse?.StatusCode)
@@ -86,9 +85,9 @@ public partial class RemoteProxy(
         SetStatus(context, CachingProxyStatus.NEGATIVE_HIT, HttpStatusCode.NotFound, cachedResponse.Headers);
         return null;
 
-      // Entries are keyed by HTTP method (see ResponseCache.CacheKey), so an entry only ever replays
-      // for the same verb it was stored under — which keeps a verb-specific presigned redirect from
-      // being served to the wrong method. A 2xx only ever originates from a HEAD: a GET body is not
+      // The caller decides whether the key includes the HTTP method (the S3 backend does so for
+      // signed links), so a verb-specific presigned redirect only ever replays for the same verb it
+      // was stored under. A 2xx only ever originates from a HEAD: a GET body is not
       // cached in memory but persisted to disk or S3 and served from there.
       case >= HttpStatusCode.MultipleChoices:
       case >= HttpStatusCode.OK when isHead:
@@ -102,8 +101,6 @@ public partial class RemoteProxy(
       await SetStatusAsync(context, CachingProxyStatus.BLACKLISTED, HttpStatusCode.NotFound, "Blacklisted");
       return null;
     }
-
-    var upstreamUri = remoteServer.GetUpstreamUri(remainingPath);
 
     var isRedirectToRemoteUrl = myRedirectToRemoteUrlsRegex != null && myRedirectToRemoteUrlsRegex.IsMatch(requestPath);
     if (isRedirectToRemoteUrl)
@@ -132,7 +129,7 @@ public partial class RemoteProxy(
 
       logger.LogWarning(Event.Timeout, "Timeout requesting {UpstreamUri}", upstreamUri);
 
-      var entry = responseCache.PutStatusCode(cacheKey, HttpStatusCode.GatewayTimeout, remoteServer.CacheDuration);
+      var entry = responseCache.PutStatusCode(cacheKey, HttpStatusCode.GatewayTimeout, cacheDuration);
       SetStatus(context, CachingProxyStatus.NEGATIVE_MISS, HttpStatusCode.NotFound, entry.Headers);
       return null;
     }
@@ -140,7 +137,7 @@ public partial class RemoteProxy(
     {
       logger.LogWarning(e, "Exception requesting {UpstreamUri}: {Message}", upstreamUri, e.Message);
 
-      var entry = responseCache.PutStatusCode(cacheKey, HttpStatusCode.ServiceUnavailable, remoteServer.CacheDuration);
+      var entry = responseCache.PutStatusCode(cacheKey, HttpStatusCode.ServiceUnavailable, cacheDuration);
       SetStatus(context, CachingProxyStatus.NEGATIVE_MISS, HttpStatusCode.NotFound, entry.Headers);
       return null;
     }
@@ -155,7 +152,7 @@ public partial class RemoteProxy(
           logger.LogWarning(Event.NegativeMiss(response.StatusCode), "Non-success requesting {UpstreamUri}: {StatusCode}", upstreamUri, response.StatusCode);
         }
 
-        var entry = responseCache.PutStatusCode(cacheKey, response.StatusCode, remoteServer.CacheDuration);
+        var entry = responseCache.PutStatusCode(cacheKey, response.StatusCode, cacheDuration);
         SetStatus(context, CachingProxyStatus.NEGATIVE_MISS, HttpStatusCode.NotFound, entry.Headers);
         return null;
       }
@@ -185,7 +182,7 @@ public partial class RemoteProxy(
 
       if (isHead)
       {
-        responseCache.PutStatusCode(cacheKey, responseEntry, remoteServer.CacheDuration);
+        responseCache.PutStatusCode(cacheKey, responseEntry, cacheDuration);
         SetStatus(context, CachingProxyStatus.MISS, responseEntry);
         return null;
       }

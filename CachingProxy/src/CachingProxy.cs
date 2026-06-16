@@ -11,7 +11,6 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Primitives;
 
 namespace JetBrains.CachingProxy;
 
@@ -69,7 +68,7 @@ public class CachingProxy
       foreach (var contentEncoding in GetCacheLookupContentEncodings(context))
       {
         var cachedFile = Path.Combine(myLocalCachePath,
-          CacheFileProvider.GetFutureCacheFileLocation(remoteServer, remainingPath!, contentEncoding == null ? null : new StringSegment(contentEncoding)));
+          remoteServer.GetFutureCacheFileLocation(remainingPath!, contentEncoding));
         if (File.Exists(cachedFile))
         {
           cachedContentEncoding = contentEncoding;
@@ -88,7 +87,8 @@ public class CachingProxy
       return;
     }
 
-    using var response = await myRemoteProxy.ProcessAsync(context, remoteServer, remainingPath, GetContentType(remainingPath));
+    var upstreamUri = remoteServer.GetUpstreamUri(remainingPath);
+    using var response = await myRemoteProxy.ProcessAsync(context, upstreamUri.ToKey(), remoteServer.CacheDuration, upstreamUri, GetContentType(remainingPath));
 
     // A non-null response is a GET MISS body for us to stream and persist; otherwise it is handled.
     if (response == null) return;
@@ -97,7 +97,7 @@ public class CachingProxy
     var contentLength = response.Content.Headers.ContentLength;
     var contentLastModified = response.Content.Headers.LastModified;
 
-    var cachePath = Path.Combine(myLocalCachePath, CacheFileProvider.GetFutureCacheFileLocation(remoteServer, remainingPath, contentEncoding));
+    var cachePath = Path.Combine(myLocalCachePath, remoteServer.GetFutureCacheFileLocation(remainingPath, contentEncoding));
     var tempFile = cachePath + ".tmp." + Guid.NewGuid();
     try
     {

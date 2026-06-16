@@ -303,7 +303,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   private string GetPathKey(string path)
   {
     Assert.StartsWith(myRemoteServer.Prefix, path);
-    return myRemoteServer.GetUpstreamUriKey(path[myRemoteServer.Prefix.Value!.Length..]);
+    return myRemoteServer.GetUpstreamUri(path[myRemoteServer.Prefix.Value!.Length..]).ToKey();
   }
 
   private static void AssertStatusHeader(HttpResponseMessage response, CachingProxyStatus status) =>

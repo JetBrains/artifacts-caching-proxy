@@ -13,14 +13,6 @@ public sealed record CachedResponse(HttpStatusCode StatusCode, IHeaderDictionary
 
 public class ResponseCache(IMemoryCache cache, TimeProvider timeProvider)
 {
-  /// <summary>
-  /// Builds the cache key for a request. The HTTP method is part of the key because some cached
-  /// responses are verb-specific — most importantly an S3 presigned redirect, which is signed for
-  /// either GET or HEAD — so a HEAD and a GET for the same path must not share an entry.
-  /// </summary>
-  public static string CacheKey(string httpMethod, RemoteServers.RemoteServer remoteServer, string? remainingPath) =>
-    httpMethod + remoteServer.GetUpstreamUriKey(remainingPath);
-
   public CachedResponse? GetCachedStatusCode(string cacheKey) =>
     cache.TryGetValue<CachedResponse>(cacheKey, out var entry) ? entry : null;
 
