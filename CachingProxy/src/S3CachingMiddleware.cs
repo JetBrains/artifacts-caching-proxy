@@ -37,20 +37,21 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
     var upstreamUri = remoteServer.GetUpstreamUri(remainingPath);
     var s3Key = upstreamUri.ToKey();
 
-    // The only verb-bound cached value is a presigned redirect (signed for a specific verb), so it
-    // lives under a per-method key and is replayed only for the matching verb. Everything else is
-    // verb-agnostic and shares one key: inline bodies (plain bytes), negative results, upstream HEAD
-    // metadata and unsigned bucket redirects. So a HEAD that prefetches a small object warms the
-    // following GET, and a missing object is probed/cached once for both verbs.
-    var signedRedirectKey = context.Request.Method + s3Key;
+    // A HEAD is always answered from memory with the object's metadata (never redirected), and a
+    // redirect is therefore produced only for a GET. So the verb-specific key holds, per verb, a
+    // HEAD's large-object metadata head or a GET's (signed or unsigned) redirect — replayed only for
+    // the verb that produced it. The shared key holds the verb-agnostic values: inline bodies (plain
+    // bytes) and negative results. So a HEAD that prefetches a small object warms the following GET,
+    // and a missing object is probed/cached once for both verbs.
+    var verbKey = context.Request.Method + s3Key;
+    var isHead = HttpMethods.IsHead(context.Request.Method);
 
     try
     {
-      // A signed presigned redirect is the only per-verb entry; replay it for the matching verb.
-      if (config.S3!.SignedLinks
-          && responseCache.GetCachedStatusCode(signedRedirectKey) is { } signedRedirect)
+      // Replay the verb-specific head: a HEAD's cached metadata, or a GET's cached redirect.
+      if (responseCache.GetCachedStatusCode(verbKey) is { } verbEntry)
       {
-        await remoteProxy.SetStatusAsync(context, CachingProxyStatus.HIT, signedRedirect);
+        await remoteProxy.SetStatusAsync(context, CachingProxyStatus.HIT, verbEntry);
         return;
       }
 
@@ -61,21 +62,45 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
         {
           using var s3Object = await amazonS3.GetObjectAsync(new GetObjectRequest
           {
-            BucketName = config.S3.BucketName,
+            BucketName = config.S3!.BucketName,
             Key = s3Key,
             ByteRange = ourPrefetchSize
           }, context.RequestAborted);
 
-          // strictly less: the whole object fit in the prefetch window, so inline it.
-          if (ContentRangeHeaderValue.TryParse(s3Object.ContentRange, out var contentRange) && contentRange.To < ourPrefetchSize.End && contentRange.HasLength)
+          // Did the probe return the whole object, or only the first slice? Decide purely from
+          // Content-Range ("bytes <from>-<to>/<total>"), whose semantics are unambiguous: the bytes
+          // returned are (to - from + 1) and the object's full size is the total.
+          // When the returned range spans the whole object it fit the window, so
+          // inline it (shared by both verbs); otherwise we only got a slice and must redirect.
+          if (ContentRangeHeaderValue.TryParse(s3Object.ContentRange, out var contentRange)
+              && contentRange is { HasRange: true, HasLength: true }
+              && contentRange.To - contentRange.From + 1 == contentRange.Length)
           {
-            var body = new byte[contentRange.Length!.Value];
+            var body = new byte[contentRange.To!.Value - contentRange.From!.Value + 1];
             await s3Object.ResponseStream.ReadExactlyAsync(body, 0, body.Length, context.RequestAborted);
 
             var cachingResponse = new CachedResponse(s3Object) { StatusCode = HttpStatusCode.OK, Body = body };
 
             await remoteProxy.SetStatusAsync(context, CachingProxyStatus.MISS,
               responseCache.PutStatusCode(s3Key, cachingResponse, remoteServer.CacheDuration));
+            return;
+          }
+
+          // Too large to inline. A HEAD is answered from memory with the object's metadata: the body
+          // is omitted but Content-Length is the full object size from Content-Range (not the
+          // prefetched slice). A GET is redirected to S3.
+          if (isHead && contentRange is { HasLength: true })
+          {
+            var head = new CachedResponse(s3Object)
+            {
+              StatusCode = HttpStatusCode.OK,
+              Headers =
+              {
+                ContentLength = contentRange.Length
+              }
+            };
+            await remoteProxy.SetStatusAsync(context, CachingProxyStatus.MISS,
+              responseCache.PutStatusCode(verbKey, head, remoteServer.CacheDuration));
             return;
           }
 
@@ -154,11 +179,10 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
           Location = location
         }
       };
-      // A signed redirect is verb-bound, so it goes under the per-method key; an unsigned bucket
-      // redirect is verb-agnostic and shares the common key.
-      var redirectCacheKey = config.S3!.SignedLinks ? signedRedirectKey : s3Key;
+      // Only a GET redirects (a HEAD is served from memory), so the redirect always belongs under the
+      // verb-specific key and is never replayed to a HEAD.
       await remoteProxy.SetStatusAsync(context, CachingProxyStatus.MISS,
-        responseCache.PutStatusCode(redirectCacheKey, cachingResponse, remoteServer.CacheDuration));
+        responseCache.PutStatusCode(verbKey, cachingResponse, remoteServer.CacheDuration));
     }
   }
 
