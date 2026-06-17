@@ -35,8 +35,8 @@ public class RemoteServersTest
     // regardless of which prefix was used to reach it.
     var servers = Build("/a", "/b=a", "/c/d=a/");
     Assert.Equal(new[] { "/a", "/b", "/c/d" }, servers.Select(s => s.Prefix.Value!).ToArray());
-    var keys = servers.Select(s => s.GetUpstreamUri("a.jar").ToKey()).Distinct();
-    Assert.Equal("a/a.jar", Assert.Single(keys));
+    var keys = servers.Select(s => s.ManglePath("a.jar")).Distinct();
+    Assert.Equal("d9/6d/d96d0bd13935d4ab082c410dea64c70bf2f926b75f3b487ac18c0e290ee8ac3a", Assert.Single(keys));
   }
 
   [Fact]

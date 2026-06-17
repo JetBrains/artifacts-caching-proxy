@@ -13,16 +13,20 @@ public static class CacheFileProvider
   extension(RemoteServers.RemoteServer remoteServer)
   {
     public string GetFutureCacheFileLocation(string? remainingPart, string? contentEncoding = null) =>
-      remoteServer.ManglePath(remainingPart, contentEncoding switch
-      {
-        "gzip" => ourGzippedContentSuffix,
-        "" or null => null,
-        _ => throw new ArgumentException("Invalid content encoding", nameof(contentEncoding)),
-      });
+      remoteServer.ManglePath(remainingPart)
+        + Path.GetExtension(remainingPart)
+        + contentEncoding switch
+        {
+          "gzip" => ourGzippedContentSuffix,
+          "" or null => null,
+          _ => throw new ArgumentException("Invalid content encoding", nameof(contentEncoding)),
+        };
 
-    private string ManglePath(string? remainingPart, string? contentEncodingSuffix = null)
+    public string ManglePath(string? remainingPart)
     {
-      var path = remoteServer.GetUpstreamUri(remainingPart).ToKey();
+      var path = remoteServer
+        .GetUpstreamUri(remainingPart)
+        .GetComponents(UriComponents.Host | UriComponents.Port | UriComponents.Path, UriFormat.UriEscaped);
       var maxBytes = Encoding.UTF8.GetMaxByteCount(path.Length);
 
       byte[]? rented = null;
@@ -45,7 +49,7 @@ public static class CacheFileProvider
           }
         }
         var hash = Convert.ToHexStringLower(SHA256.HashData(buffer[..written]));
-        return $"{hash[..2]}/{hash[2..4]}/{hash}{Path.GetExtension(path)}{contentEncodingSuffix}";
+        return $"{hash[..2]}/{hash[2..4]}/{hash}";
       }
       finally
       {
@@ -54,7 +58,4 @@ public static class CacheFileProvider
       }
     }
   }
-
-  public static string ToKey(this Uri uri) =>
-    uri.GetComponents(UriComponents.Host | UriComponents.Port | UriComponents.Path, UriFormat.UriEscaped);
 }

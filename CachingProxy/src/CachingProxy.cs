@@ -88,8 +88,8 @@ public class CachingProxy
       return;
     }
 
-    var upstreamUri = remoteServer.GetUpstreamUri(remainingPath);
-    using var response = await myRemoteProxy.ProcessAsync(context, upstreamUri.ToKey(), remoteServer.CacheDuration, upstreamUri, GetContentType(remainingPath));
+    using var response = await myRemoteProxy.ProcessAsync(context, remoteServer.ManglePath(remainingPath),
+      remoteServer.CacheDuration, remoteServer.GetUpstreamUri(remainingPath), GetContentType(remainingPath));
 
     // A non-null response is a GET MISS body for us to stream and persist; otherwise it is handled.
     if (response == null) return;

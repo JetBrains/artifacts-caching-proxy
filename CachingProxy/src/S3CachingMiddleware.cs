@@ -34,8 +34,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
     if (!await remoteProxy.ValidateRequestAsync(context))
       return;
 
-    var upstreamUri = remoteServer.GetUpstreamUri(remainingPath);
-    var s3Key = upstreamUri.ToKey();
+    var s3Key = remoteServer.ManglePath(remainingPath);
 
     // A HEAD is always answered from memory with the object's metadata (never redirected), and a
     // redirect is therefore produced only for a GET. So the verb-specific key holds, per verb, a
@@ -115,7 +114,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
         }
       }
 
-      using var response = await remoteProxy.ProcessAsync(context, s3Key, remoteServer.CacheDuration, upstreamUri);
+      using var response = await remoteProxy.ProcessAsync(context, s3Key, remoteServer.CacheDuration, remoteServer.GetUpstreamUri(remainingPath));
 
       // A non-null response is a GET MISS body for us to stream and persist; otherwise it is handled.
       if (response == null) return;
@@ -169,7 +168,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
         // Join with exactly one '/' and percent-encode each key segment (the path may contain
         // spaces or other reserved characters), keeping the '/' separators intact.
         var baseUrl = endpoint.URL.EndsWith('/') ? endpoint.URL : endpoint.URL + "/";
-        location = baseUrl + string.Join('/', s3Key.Split('/').Select(Uri.EscapeDataString));
+        location = baseUrl + s3Key;
       }
 
       var cachingResponse = new CachedResponse(HttpStatusCode.RedirectKeepVerb, new HeaderDictionary())
@@ -220,7 +219,11 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
         {
           ContentType = response.Content.Headers.ContentType?.ToString(),
           ContentEncoding = response.Content.Headers.ContentEncoding.FirstOrDefault(),
-          ContentLength = contentLength.Value
+          ContentLength = contentLength.Value,
+        },
+        Metadata =
+        {
+          ["uri"] = response.RequestMessage?.RequestUri?.ToString()
         },
         InputStream = uploadStream,
       }, cancellationToken);

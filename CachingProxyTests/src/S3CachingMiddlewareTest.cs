@@ -31,7 +31,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
 
   // An object larger than the middleware's prefetch window (16 KiB) is redirected rather than
   // served inline; an object that fits inside the window is read and served from memory.
-  private static readonly byte[] LargeBody = new byte[32 * 1024];
+  private static readonly byte[] ourLargeBody = new byte[32 * 1024];
 
   private readonly FakeAmazonS3 myS3 = new();
   private readonly List<IHost> myHosts = [];
@@ -95,13 +95,29 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     // Redirect points at a presigned URL for the object key.
     var location = response.Headers.Location?.ToString();
     Assert.NotNull(location);
-    Assert.Contains("a.jar", location);
+    Assert.Contains(GetPathKey("/real/a.jar"), location); // hashed object key
     Assert.Contains("X-Amz-", location); // presigned query parameters
 
     // The upstream body was streamed into the bucket, not back to the client.
     Assert.Equal(1, myS3.PutObjectCalls);
     Assert.True(myS3.Objects.TryGetValue(GetPathKey("/real/a.jar"), out var stored));
     Assert.Equal("a.jar", Encoding.UTF8.GetString(stored.Body));
+  }
+
+  [Fact]
+  public async Task Get_Miss_Stores_Upstream_Uri_In_Object_Metadata()
+  {
+    // The S3 key is an opaque hash, so the original upstream URI is preserved as the object's
+    // "uri" user-metadata for traceability (e.g. reverse-mapping a hashed key back to its source).
+    var server = CreateServer(signedLinks: true);
+    using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
+
+    Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
+    Assert.Equal(1, myS3.PutObjectCalls);
+
+    var key = GetPathKey("/real/a.jar");
+    Assert.True(myS3.PutObjectUris.TryGetValue(key, out var storedUri));
+    Assert.Equal(myRemoteServer.GetUpstreamUri("a.jar").ToString(), storedUri);
   }
 
   [Fact]
@@ -165,7 +181,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   {
     // An object too large to prefetch inline (> 16 KiB) is redirected, not served from memory.
     var server = CreateServer(signedLinks: true);
-    myS3.Objects[GetPathKey("/real/a.jar")] = (LargeBody, "application/java-archive", null);
+    myS3.Objects[GetPathKey("/real/a.jar")] = (ourLargeBody, "application/java-archive", null);
     using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
 
     Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
@@ -342,14 +358,14 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     // A large object can't be inlined. A HEAD is answered from memory with the full metadata (the
     // Content-Length is the whole object size from Content-Range, not the 16 KiB prefetch slice) and
     // never signs a redirect; a GET is sent its own GET-signed redirect. Independent cache entries.
-    myS3.Objects[GetPathKey("/real/a.jar")] = (LargeBody, null, "\"big\"");
+    myS3.Objects[GetPathKey("/real/a.jar")] = (ourLargeBody, null, "\"big\"");
 
     using (var head = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Head.Method))
     {
       Assert.Equal(HttpStatusCode.OK, head.StatusCode);
       AssertStatusHeader(head, CachingProxyStatus.MISS);
       Assert.Null(head.Headers.Location);
-      Assert.Equal(LargeBody.Length, head.Content.Headers.ContentLength);
+      Assert.Equal(ourLargeBody.Length, head.Content.Headers.ContentLength);
       Assert.Equal("\"big\"", head.Headers.ETag?.ToString());
       Assert.Null(myS3.LastPresignVerb); // HEAD never signs a redirect
     }
@@ -368,7 +384,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
 
     // A large object: the HEAD is answered with metadata from memory, and the second HEAD replays
     // that metadata from cache without re-probing S3.
-    myS3.Objects[GetPathKey("/real/a.jar")] = (LargeBody, null, null);
+    myS3.Objects[GetPathKey("/real/a.jar")] = (ourLargeBody, null, null);
 
     using (var first = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Head.Method))
     {
@@ -392,15 +408,16 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     var location = response.Headers.Location?.ToString();
     Assert.NotNull(location);
     // Exactly one separator between the bucket endpoint and the key (regression for the URL join).
-    Assert.EndsWith("/a.jar", location);
-    Assert.DoesNotContain("//a.jar", location);
+    var key = GetPathKey("/real/a.jar");
+    Assert.EndsWith("/" + key, location);
+    Assert.DoesNotContain("//" + key, location);
   }
 
   [Fact]
   public async Task Encoded_Slash_Is_Stored_Under_Encoded_Key()
   {
     // npm scoped packages arrive with an encoded slash (e.g. @scope%2Fname). The %2F must be
-    // preserved in the S3 key (NOT decoded to a real '/'), so the scoped package is keyed
+    // preserved when hashing the key (NOT decoded to a real '/'), so the scoped package is keyed
     // distinctly from a real two-segment path "@scope/name". Unsigned links so the Location is
     // a plain bucket URL we can assert on.
     var server = CreateServer(signedLinks: false);
@@ -409,18 +426,17 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
     AssertStatusHeader(response, CachingProxyStatus.MISS);
 
-    // Stored under the encoded key, body intact. (Hex case may be normalized by System.Uri.)
+    // The encoded slash hashes to a DIFFERENT key than a real slash: the %2F is kept pre-hash
+    // (UriFormat.UriEscaped), so "@scope%2fpackage" and "@scope/package" map to distinct objects.
     var key = GetPathKey("/real/@scope%2fpackage");
-    Assert.Contains("@scope%2f", key, StringComparison.OrdinalIgnoreCase); // literal %2F preserved
-    Assert.DoesNotContain("@scope/package", key);                          // not decoded to a real slash
-    Assert.True(myS3.Objects.TryGetValue(key, out var stored));
+    Assert.NotEqual(GetPathKey("/real/@scope/package"), key);
+    Assert.True(myS3.Objects.TryGetValue(key, out var stored)); // stored under that key, body intact
     Assert.Equal("scoped-package-content", Encoding.UTF8.GetString(stored.Body));
 
-    // The unsigned redirect references that literal key: the '%' is itself encoded (%2F -> %252F)
-    // so S3 resolves the Location back to the stored key.
+    // The unsigned redirect references that hashed key (pure hex + '/', no escaping needed).
     var location = response.Headers.Location?.ToString();
     Assert.NotNull(location);
-    Assert.Contains("%252f", location, StringComparison.OrdinalIgnoreCase);
+    Assert.EndsWith(key, location);
   }
 
   [Fact]
@@ -463,7 +479,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   private string GetPathKey(string path)
   {
     Assert.StartsWith(myRemoteServer.Prefix, path);
-    return myRemoteServer.GetUpstreamUri(path[myRemoteServer.Prefix.Value!.Length..]).ToKey();
+    return myRemoteServer.ManglePath(path[myRemoteServer.Prefix.Value!.Length..]);
   }
 
   private static void AssertStatusHeader(HttpResponseMessage response, CachingProxyStatus status) =>
@@ -490,6 +506,8 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     new BasicAWSCredentials("test", "test"), new AmazonS3Config { RegionEndpoint = RegionEndpoint.USEast1 }), IAmazonS3
   {
     public readonly Dictionary<string, (byte[] Body, string? ContentType, string? ETag)> Objects = new();
+    // The "uri" user-metadata stored alongside each PutObject, keyed by object key.
+    public readonly Dictionary<string, string?> PutObjectUris = new();
     // S3 existence probes via the ranged GetObject prefetch.
     public int GetObjectCalls;
     public int PutObjectCalls;
@@ -544,6 +562,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
       using var ms = new MemoryStream();
       await request.InputStream.CopyToAsync(ms, cancellationToken);
       Objects[request.Key] = (ms.ToArray(), request.Headers.ContentType, null);
+      PutObjectUris[request.Key] = request.Metadata["uri"];
       return new PutObjectResponse { HttpStatusCode = HttpStatusCode.OK };
     }
 
