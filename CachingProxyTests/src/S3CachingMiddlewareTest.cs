@@ -29,6 +29,10 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
 {
   private const string BucketName = "test-bucket";
 
+  // An object larger than the middleware's prefetch window (16 KiB) is redirected rather than
+  // served inline; an object that fits inside the window is read and served from memory.
+  private static readonly byte[] LargeBody = new byte[32 * 1024];
+
   private readonly FakeAmazonS3 myS3 = new();
   private readonly List<IHost> myHosts = [];
   private readonly RemoteServers.RemoteServer myRemoteServer = new("/real", upstreamServer.Url, new CacheDuration());
@@ -157,16 +161,144 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   }
 
   [Fact]
-  public async Task Existing_Object_Redirects_Without_Reupload()
+  public async Task Existing_Large_Object_Redirects_Without_Reupload()
   {
+    // An object too large to prefetch inline (> 16 KiB) is redirected, not served from memory.
     var server = CreateServer(signedLinks: true);
-    myS3.Objects[GetPathKey("/real/a.jar")] = ([.. "a.jar"u8], "application/java-archive");
+    myS3.Objects[GetPathKey("/real/a.jar")] = (LargeBody, "application/java-archive", null);
     using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
 
     Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
     AssertStatusHeader(response, CachingProxyStatus.MISS);
-    Assert.Equal(1, myS3.GetObjectMetadataCalls); // probed S3
-    Assert.Equal(0, myS3.PutObjectCalls);         // but did not re-upload
+    Assert.Equal(1, myS3.GetObjectCalls); // probed S3
+    Assert.Equal(0, myS3.PutObjectCalls); // but did not re-upload
+  }
+
+  [Fact]
+  public async Task Existing_Small_Object_Is_Served_Inline_From_Memory()
+  {
+    // An object that fits in the prefetch window is read during the probe and served inline
+    // (200 + body) instead of redirecting the client to S3.
+    var server = CreateServer(signedLinks: true);
+    myS3.Objects[GetPathKey("/real/a.jar")] = ([.. "a.jar"u8], "application/java-archive", null);
+    using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
+
+    Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    AssertStatusHeader(response, CachingProxyStatus.MISS);
+    Assert.Null(response.Headers.Location);
+    Assert.Equal("a.jar", await response.Content.ReadAsStringAsync());
+    Assert.Equal("application/java-archive", response.Content.Headers.ContentType?.ToString());
+    Assert.Equal(1, myS3.GetObjectCalls);
+    Assert.Equal(0, myS3.PutObjectCalls); // already present, not re-uploaded
+  }
+
+  [Fact]
+  public async Task Inlined_Small_Object_Propagates_ETag()
+  {
+    // Representation headers from the S3 object (notably ETag) must be replayed to the client.
+    var server = CreateServer(signedLinks: true);
+    myS3.Objects[GetPathKey("/real/a.jar")] = ([.. "a.jar"u8], "application/java-archive", "\"deadbeef\"");
+    using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
+
+    Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    Assert.Equal("\"deadbeef\"", response.Headers.ETag?.ToString());
+  }
+
+  [Fact]
+  public async Task Signed_Head_Inlines_Small_Object()
+  {
+    // A HEAD prefetches like a GET: a small object is inlined (200 + metadata), not redirected, so
+    // its verb-agnostic body can later serve a GET. (Kestrel drops the body for HEAD but keeps the
+    // metadata.) No presigned redirect is produced.
+    var server = CreateServer(signedLinks: true);
+    myS3.Objects[GetPathKey("/real/a.jar")] = ([.. "a.jar"u8], "application/java-archive", "\"deadbeef\"");
+
+    using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Head.Method);
+
+    Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    AssertStatusHeader(response, CachingProxyStatus.MISS);
+    Assert.Null(response.Headers.Location);
+    Assert.Equal("\"deadbeef\"", response.Headers.ETag?.ToString());
+    Assert.Equal(5, response.Content.Headers.ContentLength);
+    Assert.Null(myS3.LastPresignVerb);
+    Assert.Equal(0, myS3.PutObjectCalls);
+  }
+
+  [Fact]
+  public async Task Signed_Head_Prefetch_Warms_Cache_For_Following_Get()
+  {
+    // The inline body is verb-agnostic, so even under signed links a HEAD's prefetch is reused by a
+    // following GET from the shared cache entry: the object is probed only once.
+    var server = CreateServer(signedLinks: true);
+    myS3.Objects[GetPathKey("/real/a.jar")] = ([.. "a.jar"u8], "application/java-archive", null);
+
+    using (var head = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Head.Method))
+      Assert.Equal(HttpStatusCode.OK, head.StatusCode);
+
+    using var get = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
+    Assert.Equal(HttpStatusCode.OK, get.StatusCode);
+    AssertStatusHeader(get, CachingProxyStatus.HIT);
+    Assert.Equal("a.jar", await get.Content.ReadAsStringAsync());
+    Assert.Equal(1, myS3.GetObjectCalls); // HEAD probed; GET replayed from the shared entry
+  }
+
+  [Fact]
+  public async Task Negative_Result_Is_Shared_Across_Verbs()
+  {
+    // A negative result has no body and no signature, so it is verb-agnostic: a HEAD that negatively
+    // caches a missing object answers a following GET from memory without re-probing S3 or upstream.
+    var server = CreateServer(signedLinks: true);
+
+    using (var head = await server.CreateRequest("/real/does-not-exist.jar").SendAsync(HttpMethod.Head.Method))
+    {
+      Assert.Equal(HttpStatusCode.NotFound, head.StatusCode);
+      AssertStatusHeader(head, CachingProxyStatus.NEGATIVE_MISS);
+    }
+
+    using var get = await server.CreateRequest("/real/does-not-exist.jar").SendAsync(HttpMethod.Get.Method);
+    Assert.Equal(HttpStatusCode.NotFound, get.StatusCode);
+    AssertStatusHeader(get, CachingProxyStatus.NEGATIVE_HIT); // served from the shared negative entry
+    Assert.Equal(1, myS3.GetObjectCalls);                     // probed once, not re-probed for the GET
+  }
+
+  [Fact]
+  public async Task Unsigned_Head_Prefetch_Warms_Cache_For_Following_Get()
+  {
+    // Unsigned links share one verb-agnostic cache key, so the body a HEAD prefetches and inlines is
+    // replayed to a following GET from memory: the object is probed/downloaded only once.
+    var server = CreateServer(signedLinks: false);
+    myS3.Objects[GetPathKey("/real/a.jar")] = ([.. "a.jar"u8], "application/java-archive", null);
+
+    using (var head = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Head.Method))
+    {
+      Assert.Equal(HttpStatusCode.OK, head.StatusCode);
+      AssertStatusHeader(head, CachingProxyStatus.MISS);
+    }
+
+    using var get = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
+    Assert.Equal(HttpStatusCode.OK, get.StatusCode);
+    AssertStatusHeader(get, CachingProxyStatus.HIT);
+    Assert.Equal("a.jar", await get.Content.ReadAsStringAsync());
+    Assert.Equal(1, myS3.GetObjectCalls); // HEAD probed; GET replayed from memory
+  }
+
+  [Fact]
+  public async Task Inlined_Small_Object_Second_Request_Is_Served_From_Memory_Cache()
+  {
+    // The inlined body is cached in memory: a second GET must replay it as a HIT without
+    // re-probing S3 or re-fetching upstream.
+    var server = CreateServer(signedLinks: true);
+    myS3.Objects[GetPathKey("/real/a.jar")] = ([.. "a.jar"u8], "application/java-archive", null);
+
+    using (var first = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method))
+      AssertStatusHeader(first, CachingProxyStatus.MISS);
+
+    using var second = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
+    Assert.Equal(HttpStatusCode.OK, second.StatusCode);
+    AssertStatusHeader(second, CachingProxyStatus.HIT);
+    Assert.Equal("a.jar", await second.Content.ReadAsStringAsync());
+    Assert.Equal(1, myS3.GetObjectCalls); // probed only once
+    Assert.Equal(0, myS3.PutObjectCalls);
   }
 
   [Fact]
@@ -191,7 +323,8 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     // A presigned URL is signed for a specific verb. Because the cache key includes the method, a
     // HEAD caches a HEAD-signed redirect and a GET caches its own GET-signed redirect; neither is
     // ever served for the other method (which S3 would reject as SignatureDoesNotMatch).
-    myS3.Objects[GetPathKey("/real/a.jar")] = ([.. "a.jar"u8], null);
+    // Use a large object so the response is a redirect (small objects are served inline instead).
+    myS3.Objects[GetPathKey("/real/a.jar")] = (LargeBody, null, null);
 
     using (var head = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Head.Method))
       Assert.Equal(HttpStatusCode.RedirectKeepVerb, head.StatusCode);
@@ -202,7 +335,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     Assert.Equal(HttpStatusCode.RedirectKeepVerb, get.StatusCode);
     AssertStatusHeader(get, CachingProxyStatus.MISS);
     Assert.Equal(HttpVerb.GET, myS3.LastPresignVerb);
-    Assert.Equal(2, myS3.GetObjectMetadataCalls);
+    Assert.Equal(2, myS3.GetObjectCalls);
   }
 
   [Fact]
@@ -211,7 +344,8 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     var server = CreateServer(signedLinks: true);
 
     // Same verb twice: the second HEAD replays the cached HEAD-signed redirect without re-probing.
-    myS3.Objects[GetPathKey("/real/a.jar")] = ([.. "a.jar"u8], null);
+    // Large object so the HEAD is answered with a redirect (not inlined).
+    myS3.Objects[GetPathKey("/real/a.jar")] = (LargeBody, null, null);
 
     using (var first = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Head.Method))
       AssertStatusHeader(first, CachingProxyStatus.MISS);
@@ -219,7 +353,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     using var second = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Head.Method);
     Assert.Equal(HttpStatusCode.RedirectKeepVerb, second.StatusCode);
     AssertStatusHeader(second, CachingProxyStatus.HIT);
-    Assert.Equal(1, myS3.GetObjectMetadataCalls); // probed once, replayed from memory the second time
+    Assert.Equal(1, myS3.GetObjectCalls); // probed once, replayed from memory the second time
   }
 
   [Fact]
@@ -270,12 +404,12 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
 
     // Regression test: even when the object exists in the bucket, a non-GET/HEAD method must be
     // rejected up front and must NOT be redirected (the validation-bypass fix).
-    myS3.Objects[GetPathKey("/real/a.jar")] = ([.. "a.jar"u8], null);
+    myS3.Objects[GetPathKey("/real/a.jar")] = ([.. "a.jar"u8], null, null);
 
     using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Post.Method);
 
     Assert.Equal(HttpStatusCode.MethodNotAllowed, response.StatusCode);
-    Assert.Equal(0, myS3.GetObjectMetadataCalls);
+    Assert.Equal(0, myS3.GetObjectCalls);
   }
 
   [Fact]
@@ -286,7 +420,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
 
     Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
     AssertStatusHeader(response, CachingProxyStatus.BAD_REQUEST);
-    Assert.Equal(0, myS3.GetObjectMetadataCalls);
+    Assert.Equal(0, myS3.GetObjectCalls);
   }
 
   [Fact]
@@ -329,8 +463,9 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   private sealed class FakeAmazonS3() : AmazonS3Client(
     new BasicAWSCredentials("test", "test"), new AmazonS3Config { RegionEndpoint = RegionEndpoint.USEast1 }), IAmazonS3
   {
-    public readonly Dictionary<string, (byte[] Body, string? ContentType)> Objects = new();
-    public int GetObjectMetadataCalls;
+    public readonly Dictionary<string, (byte[] Body, string? ContentType, string? ETag)> Objects = new();
+    // S3 existence probes via the ranged GetObject prefetch.
+    public int GetObjectCalls;
     public int PutObjectCalls;
     public HttpVerb? LastPresignVerb;
     public DateTime? LastPresignExpires;
@@ -349,12 +484,32 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
       return base.GetPreSignedURLAsync(request);
     }
 
-    public override Task<GetObjectMetadataResponse> GetObjectMetadataAsync(string bucketName, string key, CancellationToken cancellationToken = default)
+    // The middleware probes with a ranged GET (prefetch of the first bytes): on a small enough object
+    // the whole body fits in the range and is served inline; otherwise it redirects. Honour the
+    // requested ByteRange and report the slice with a 206 + Content-Range, exactly as S3 does.
+    public override Task<GetObjectResponse> GetObjectAsync(GetObjectRequest request, CancellationToken cancellationToken = default)
     {
-      Interlocked.Increment(ref GetObjectMetadataCalls);
-      if (Objects.ContainsKey(key))
-        return Task.FromResult(new GetObjectMetadataResponse { HttpStatusCode = HttpStatusCode.OK });
-      throw new AmazonS3Exception(nameof(HttpStatusCode.NotFound)) { StatusCode = HttpStatusCode.NotFound };
+      Interlocked.Increment(ref GetObjectCalls);
+      if (!Objects.TryGetValue(request.Key, out var obj))
+        throw new AmazonS3Exception(nameof(HttpStatusCode.NotFound)) { StatusCode = HttpStatusCode.NotFound };
+
+      var total = obj.Body.Length;
+      var start = (int)request.ByteRange.Start;
+      var lastIndex = Math.Min((int)request.ByteRange.End, total - 1);
+      var length = lastIndex - start + 1;
+      var slice = new byte[length];
+      Array.Copy(obj.Body, start, slice, 0, length);
+
+      var response = new GetObjectResponse
+      {
+        HttpStatusCode = HttpStatusCode.PartialContent,
+        ResponseStream = new MemoryStream(slice),
+        ContentLength = length,
+        ContentRange = $"bytes {start}-{lastIndex}/{total}",
+        ETag = obj.ETag,
+      };
+      response.Headers.ContentType = obj.ContentType;
+      return Task.FromResult(response);
     }
 
     public override async Task<PutObjectResponse> PutObjectAsync(PutObjectRequest request, CancellationToken cancellationToken = default)
@@ -362,7 +517,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
       Interlocked.Increment(ref PutObjectCalls);
       using var ms = new MemoryStream();
       await request.InputStream.CopyToAsync(ms, cancellationToken);
-      Objects[request.Key] = (ms.ToArray(), request.Headers.ContentType);
+      Objects[request.Key] = (ms.ToArray(), request.Headers.ContentType, null);
       return new PutObjectResponse { HttpStatusCode = HttpStatusCode.OK };
     }
 

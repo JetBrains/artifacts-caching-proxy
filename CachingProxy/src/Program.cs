@@ -1,4 +1,6 @@
 ﻿using System;
+using System.Net;
+using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Reflection;
 using System.Threading.Tasks;
@@ -158,6 +160,8 @@ public static class Program
       {
         var config = provider.GetRequiredService<CachingProxyConfig>();
         client.Timeout = TimeSpan.FromSeconds(config.RequestTimeoutSec);
+        client.DefaultRequestVersion = HttpVersion.Version20;
+        client.DefaultVersionPolicy = HttpVersionPolicy.RequestVersionOrHigher;
         var userAgentHeader = client.DefaultRequestHeaders.UserAgent;
         userAgentHeader.Add(ourUserAgent);
         if (config.UserAgentComment is { Length: >0 } userAgentComment)
@@ -174,8 +178,10 @@ public static class Program
       })
       .UseSocketsHttpHandler(static (handler, _) =>
       {
-        // force reconnection (and DNS re-resolve) every two minutes
-        handler.PooledConnectionLifetime = TimeSpan.FromMinutes(2);
+        // force reconnection (and DNS re-resolve) every ten minutes
+        handler.PooledConnectionLifetime = TimeSpan.FromMinutes(10);
+        handler.AllowAutoRedirect = true;
+        handler.AutomaticDecompression = DecompressionMethods.None;
         handler.UseCookies = false;
       })
       .AddTransientHttpErrorPolicy(static policyBuilder => policyBuilder.WaitAndRetryAsync(

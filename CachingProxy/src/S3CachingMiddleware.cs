@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Net.Mime;
 using System.Threading;
 using System.Threading.Tasks;
@@ -20,6 +21,8 @@ namespace JetBrains.CachingProxy;
 [SuppressMessage("ReSharper", "ClassNeverInstantiated.Global")]
 public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amazonS3, CachingProxyConfig config, RemoteProxy remoteProxy, ResponseCache responseCache, TimeProvider timeProvider, ILogger<S3CachingMiddleware>  logger)
 {
+  private static readonly ByteRange ourPrefetchSize = new(0, 16 * 1024 - 1);
+
   public async Task InvokeAsync(HttpContext context)
   {
     if (RemoteServers.GetRemoteServer(context, out var remainingPath) is not {} remoteServer)
@@ -34,26 +37,60 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
     var upstreamUri = remoteServer.GetUpstreamUri(remainingPath);
     var s3Key = upstreamUri.ToKey();
 
-    // Only signed links need a per-method cache key: a presigned redirect is signed for a specific
-    // verb, so HEAD and GET must each cache (and replay) their own correctly-signed redirect under
-    // separate keys. Unsigned links point at the bucket endpoint and are verb-agnostic, so they
-    // share a single key.
-    var cacheKey = config.S3!.SignedLinks ? context.Request.Method + s3Key : s3Key;
+    // The only verb-bound cached value is a presigned redirect (signed for a specific verb), so it
+    // lives under a per-method key and is replayed only for the matching verb. Everything else is
+    // verb-agnostic and shares one key: inline bodies (plain bytes), negative results, upstream HEAD
+    // metadata and unsigned bucket redirects. So a HEAD that prefetches a small object warms the
+    // following GET, and a missing object is probed/cached once for both verbs.
+    var signedRedirectKey = context.Request.Method + s3Key;
 
     try
     {
-      if (responseCache.GetCachedStatusCode(cacheKey) == null)
+      // A signed presigned redirect is the only per-verb entry; replay it for the matching verb.
+      if (config.S3!.SignedLinks
+          && responseCache.GetCachedStatusCode(signedRedirectKey) is { } signedRedirect)
+      {
+        await remoteProxy.SetStatusAsync(context, CachingProxyStatus.HIT, signedRedirect);
+        return;
+      }
+
+      // Nothing known yet for this object: probe S3 with the ranged prefetch (HEAD and GET alike).
+      if (responseCache.GetCachedStatusCode(s3Key) == null)
       {
         try
         {
-          await amazonS3.GetObjectMetadataAsync(config.S3!.BucketName, s3Key, context.RequestAborted);
+          using var s3Object = await amazonS3.GetObjectAsync(new GetObjectRequest
+          {
+            BucketName = config.S3.BucketName,
+            Key = s3Key,
+            ByteRange = ourPrefetchSize
+          }, context.RequestAborted);
+
+          // strictly less: the whole object fit in the prefetch window, so inline it.
+          if (ContentRangeHeaderValue.TryParse(s3Object.ContentRange, out var contentRange) && contentRange.To < ourPrefetchSize.End && contentRange.HasLength)
+          {
+            var body = new byte[contentRange.Length!.Value];
+            await s3Object.ResponseStream.ReadExactlyAsync(body, 0, body.Length, context.RequestAborted);
+
+            var cachingResponse = new CachedResponse(s3Object) { StatusCode = HttpStatusCode.OK, Body = body };
+
+            await remoteProxy.SetStatusAsync(context, CachingProxyStatus.MISS,
+              responseCache.PutStatusCode(s3Key, cachingResponse, remoteServer.CacheDuration));
+            return;
+          }
+
           await RedirectToBucket();
           return;
         }
         catch (AmazonServiceException ex) when (ex.StatusCode is HttpStatusCode.NotFound) { }
+        catch (Exception ex)
+        {
+          logger.LogWarning(ex, "Failed to retrieve S3 Object {S3Key}", s3Key);
+          throw;
+        }
       }
 
-      using var response = await remoteProxy.ProcessAsync(context, cacheKey, remoteServer.CacheDuration, upstreamUri);
+      using var response = await remoteProxy.ProcessAsync(context, s3Key, remoteServer.CacheDuration, upstreamUri);
 
       // A non-null response is a GET MISS body for us to stream and persist; otherwise it is handled.
       if (response == null) return;
@@ -110,11 +147,18 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
         location = baseUrl + string.Join('/', s3Key.Split('/').Select(Uri.EscapeDataString));
       }
 
-      IHeaderDictionary headers = new HeaderDictionary();
-      headers.Location = location;
-      var cachingResponse = new CachedResponse(HttpStatusCode.RedirectKeepVerb, headers);
-      remoteProxy.SetStatus(context, CachingProxyStatus.MISS,
-        responseCache.PutStatusCode(cacheKey, cachingResponse, remoteServer.CacheDuration));
+      var cachingResponse = new CachedResponse(HttpStatusCode.RedirectKeepVerb, new HeaderDictionary())
+      {
+        Headers =
+        {
+          Location = location
+        }
+      };
+      // A signed redirect is verb-bound, so it goes under the per-method key; an unsigned bucket
+      // redirect is verb-agnostic and shares the common key.
+      var redirectCacheKey = config.S3!.SignedLinks ? signedRedirectKey : s3Key;
+      await remoteProxy.SetStatusAsync(context, CachingProxyStatus.MISS,
+        responseCache.PutStatusCode(redirectCacheKey, cachingResponse, remoteServer.CacheDuration));
     }
   }
 

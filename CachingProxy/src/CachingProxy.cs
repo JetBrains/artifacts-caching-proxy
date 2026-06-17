@@ -80,7 +80,8 @@ public class CachingProxy
     if (cachedFileResult != null)
     {
       myRemoteProxy.SetStatusHeader(context, CachingProxyStatus.HIT);
-      context.Response.Headers.CacheControl = RemoteProxy.OurEternalCachingHeader;
+      // Only successful (2xx) responses reach here, so the response is always eternally cacheable.
+      context.Response.Headers.CacheControl = CachedResponse.EternalCachingHeader;
       if (cachedContentEncoding != null)
         context.Response.Headers.ContentEncoding = cachedContentEncoding;
       await cachedFileResult.ExecuteAsync(context);

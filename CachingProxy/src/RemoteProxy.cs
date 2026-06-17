@@ -3,13 +3,11 @@ using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
-using System.Net.Http.Headers;
 using System.Net.Mime;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Primitives;
 
 namespace JetBrains.CachingProxy;
 
@@ -47,14 +45,14 @@ public partial class RemoteProxy(
   {
     if (!HttpMethods.IsHead(context.Request.Method) && !HttpMethods.IsGet(context.Request.Method))
     {
-      await SetStatusAsync(context, CachingProxyStatus.BAD_REQUEST, HttpStatusCode.MethodNotAllowed);
+      await SetStatusAsync(context, CachingProxyStatus.BAD_REQUEST, CachedResponse.MethodNotAllowed);
       return false;
     }
 
     var requestPath = context.Request.Path.Value!;
     if (requestPath.Contains("..", StringComparison.Ordinal) || !OurGoodPathChars.IsMatch(requestPath))
     {
-      await SetStatusAsync(context, CachingProxyStatus.BAD_REQUEST, HttpStatusCode.BadRequest, "Invalid request path");
+      await SetStatusAsync(context, CachingProxyStatus.BAD_REQUEST, CachedResponse.InvalidPath);
       return false;
     }
 
@@ -82,33 +80,38 @@ public partial class RemoteProxy(
     switch (cachedResponse?.StatusCode)
     {
       case >= HttpStatusCode.BadRequest:
-        SetStatus(context, CachingProxyStatus.NEGATIVE_HIT, HttpStatusCode.NotFound, cachedResponse.Headers);
+        await SetStatusAsync(context, CachingProxyStatus.NEGATIVE_HIT, cachedResponse with { StatusCode = HttpStatusCode.NotFound });
         return null;
 
       // The caller decides whether the key includes the HTTP method (the S3 backend does so for
       // signed links), so a verb-specific presigned redirect only ever replays for the same verb it
-      // was stored under. A 2xx only ever originates from a HEAD: a GET body is not
-      // cached in memory but persisted to disk or S3 and served from there.
+      // was stored under. A cached 2xx is replayed when it carries the full body (the S3 backend
+      // inlines small objects into the cache) or when the request is a HEAD (which needs only the
+      // metadata); a bodyless 2xx is never replayed to a GET, whose body lives on disk/S3 instead.
       case >= HttpStatusCode.MultipleChoices:
-      case >= HttpStatusCode.OK when isHead:
-        SetStatus(context, CachingProxyStatus.HIT, cachedResponse);
+      case >= HttpStatusCode.OK when isHead || cachedResponse.Body != null:
+        await SetStatusAsync(context, CachingProxyStatus.HIT, cachedResponse);
         return null;
     }
 
     var requestPath = context.Request.Path.Value!;
     if (myBlacklistRegex != null && myBlacklistRegex.IsMatch(requestPath))
     {
-      await SetStatusAsync(context, CachingProxyStatus.BLACKLISTED, HttpStatusCode.NotFound, "Blacklisted");
+      await SetStatusAsync(context, CachingProxyStatus.BLACKLISTED, CachedResponse.Blacklisted);
       return null;
     }
 
     var isRedirectToRemoteUrl = myRedirectToRemoteUrlsRegex != null && myRedirectToRemoteUrlsRegex.IsMatch(requestPath);
     if (isRedirectToRemoteUrl)
     {
-      IHeaderDictionary redirectHeaders = new HeaderDictionary();
-      redirectHeaders.Location = upstreamUri.ToString();
-      cachedResponse = new CachedResponse(HttpStatusCode.RedirectKeepVerb, redirectHeaders);
-      SetStatus(context, CachingProxyStatus.ALWAYS_REDIRECT, cachedResponse);
+      cachedResponse = new CachedResponse(HttpStatusCode.RedirectKeepVerb, new HeaderDictionary())
+      {
+        Headers =
+        {
+          Location = upstreamUri.ToString()
+        }
+      };
+      await SetStatusAsync(context, CachingProxyStatus.ALWAYS_REDIRECT, cachedResponse);
       return null;
     }
 
@@ -130,7 +133,7 @@ public partial class RemoteProxy(
       logger.LogWarning(Event.Timeout, "Timeout requesting {UpstreamUri}", upstreamUri);
 
       var entry = responseCache.PutStatusCode(cacheKey, HttpStatusCode.GatewayTimeout, cacheDuration);
-      SetStatus(context, CachingProxyStatus.NEGATIVE_MISS, HttpStatusCode.NotFound, entry.Headers);
+      await SetStatusAsync(context, CachingProxyStatus.NEGATIVE_MISS, entry with { StatusCode = HttpStatusCode.NotFound });
       return null;
     }
     catch (Exception e)
@@ -138,7 +141,7 @@ public partial class RemoteProxy(
       logger.LogWarning(e, "Exception requesting {UpstreamUri}: {Message}", upstreamUri, e.Message);
 
       var entry = responseCache.PutStatusCode(cacheKey, HttpStatusCode.ServiceUnavailable, cacheDuration);
-      SetStatus(context, CachingProxyStatus.NEGATIVE_MISS, HttpStatusCode.NotFound, entry.Headers);
+      await SetStatusAsync(context, CachingProxyStatus.NEGATIVE_MISS, entry with { StatusCode = HttpStatusCode.NotFound });
       return null;
     }
 
@@ -153,7 +156,7 @@ public partial class RemoteProxy(
         }
 
         var entry = responseCache.PutStatusCode(cacheKey, response.StatusCode, cacheDuration);
-        SetStatus(context, CachingProxyStatus.NEGATIVE_MISS, HttpStatusCode.NotFound, entry.Headers);
+        await SetStatusAsync(context, CachingProxyStatus.NEGATIVE_MISS, entry with { StatusCode = HttpStatusCode.NotFound });
         return null;
       }
 
@@ -167,27 +170,22 @@ public partial class RemoteProxy(
         return await RejectUpstreamEncoding(context, Event.NotSupportedContentType,
           $"{upstreamUri} returned Content-Encoding '{contentEncoding}' which is not supported");
 
-      IHeaderDictionary headers = new HeaderDictionary();
-      headers.LastModified = response.Content.Headers.LastModified?.ToString("R");
-      headers.ContentLength = response.Content.Headers.ContentLength;
-      // Prefer the caller's resolver (the disk backend derives the type from the file extension, so a
-      // MISS matches the later HIT served from disk); fall back to the upstream's own Content-Type
-      // when no resolver is supplied (e.g. the S3 backend, which stores and serves the upstream type).
-      headers.ContentType = contentType ?? response.Content.Headers.ContentType?.ToString();
-      headers.ContentEncoding = contentEncoding;
-      // Only successful (2xx) responses reach here, so the response is always eternally cacheable.
-      headers.CacheControl = OurEternalCachingHeader;
-
-      var responseEntry = new CachedResponse(response.StatusCode, headers);
+      var responseEntry = new CachedResponse(response)
+      {
+        Headers =
+        {
+          ContentType = contentType ?? response.Content.Headers.ContentType?.ToString(),
+        }
+      };
 
       if (isHead)
       {
-        responseCache.PutStatusCode(cacheKey, responseEntry, cacheDuration);
-        SetStatus(context, CachingProxyStatus.MISS, responseEntry);
+        await SetStatusAsync(context, CachingProxyStatus.MISS,
+          responseCache.PutStatusCode(cacheKey, responseEntry, cacheDuration));
         return null;
       }
 
-      SetStatus(context, CachingProxyStatus.MISS, responseEntry);
+      await SetStatusAsync(context, CachingProxyStatus.MISS, responseEntry);
       transferOwnership = true;
       return response;
     }
@@ -198,42 +196,16 @@ public partial class RemoteProxy(
   }
 
 
-  public static readonly StringValues OurEternalCachingHeader =
-    new CacheControlHeaderValue { Public = true, MaxAge = TimeSpan.FromDays(365) }.ToString();
-
-  private async ValueTask SetStatusAsync(HttpContext context, CachingProxyStatus status, HttpStatusCode? httpCode = null, string? responseString = null)
+  public async ValueTask SetStatusAsync(HttpContext context, CachingProxyStatus status, CachedResponse response)
   {
     SetStatusHeader(context, status);
-
-    if (httpCode != null)
-      context.Response.StatusCode = (int) httpCode;
-
-    if (responseString != null)
-      await context.Response.WriteAsync(responseString);
-  }
-
-  public void SetStatus(HttpContext context, CachingProxyStatus status, CachedResponse response) =>
-    SetStatus(context, status, response.StatusCode, response.Headers);
-
-  private void SetStatus(HttpContext context, CachingProxyStatus status, HttpStatusCode statusCode, IHeaderDictionary headers)
-  {
-    SetStatusHeader(context, status);
-    context.Response.StatusCode = (int)statusCode;
-    SetCachedResponseHeader(context, headers);
+    await response.InvokeAsync(context);
   }
 
   public void SetStatusHeader(HttpContext context, CachingProxyStatus status)
   {
     context.Response.Headers[CachingProxyConstants.StatusHeader] = status.ToString();
     metrics.IncrementRequests(status);
-  }
-
-  private static void SetCachedResponseHeader(HttpContext context, IHeaderDictionary headers)
-  {
-    foreach (var (key, value) in headers)
-    {
-      context.Response.Headers[key] = value;
-    }
   }
 
   private async Task<HttpResponseMessage?> RejectUpstreamEncoding(HttpContext context, EventId eventId, string message)
