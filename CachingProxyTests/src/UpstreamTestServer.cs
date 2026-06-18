@@ -65,6 +65,11 @@ public class UpstreamTestServer : IAsyncLifetime
       {
         res.StatusCode = StatusCodes.Status500InternalServerError;
         return res.WriteAsync("Some Error");
+      })
+      .MapGet("403.jar", (req, res, data) =>
+      {
+        res.StatusCode = StatusCodes.Status403Forbidden;
+        return res.WriteAsync("Forbidden");
       }).MapGet("wrong-content-length.jar", (req, res, data) =>
       {
         res.ContentLength = 1024;

@@ -636,6 +636,28 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
   }
 
   [Fact]
+  public async Task Remote_Forbidden()
+  {
+    // Authentication / access errors must be surfaced to the client verbatim (not masked to 404),
+    // both on the live miss and on the replayed negative-cache hit.
+    await AssertGetResponse("/real/403.jar", HttpStatusCode.Forbidden,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_MISS);
+        AssertCachedStatusHeader(message, HttpStatusCode.Forbidden);
+        Assert.Null(message.Headers.CacheControl);
+      });
+
+    await AssertGetResponse("/real/403.jar", HttpStatusCode.Forbidden,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_HIT);
+        AssertCachedStatusHeader(message, HttpStatusCode.Forbidden);
+        Assert.Null(message.Headers.CacheControl);
+      });
+  }
+
+  [Fact]
   public async Task More_Specific_Prefix_Wins_Over_Shorter_Overlapping_One()
   {
     // /overlap/nested/a.jar must be served by the more specific "/overlap/nested" prefix (-> upstream

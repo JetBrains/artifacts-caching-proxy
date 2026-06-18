@@ -72,6 +72,20 @@ public partial class RemoteProxy(
   /// Content-Encoding off the response) and must dispose it; in every other case the request is
   /// fully handled, the response (if any) is disposed internally, and <c>null</c> is returned.
   /// </summary>
+  // 404 and authentication / access errors are surfaced to the client verbatim (we do not mask
+  // them); every other non-success status is masked to 404. Used for both negative cache hits and
+  // misses so a replayed entry returns the same status the live response did.
+  private static HttpStatusCode ClientFacingStatus(HttpStatusCode upstream) => upstream switch
+  {
+    HttpStatusCode.NotFound or
+      HttpStatusCode.Unauthorized or
+      HttpStatusCode.PaymentRequired or
+      HttpStatusCode.Forbidden or
+      HttpStatusCode.ProxyAuthenticationRequired or
+      HttpStatusCode.UnavailableForLegalReasons => upstream,
+    _ => HttpStatusCode.NotFound,
+  };
+
   public async Task<HttpResponseMessage?> ProcessAsync(HttpContext context, string cacheKey, CacheDuration cacheDuration, Uri upstreamUri, string? contentType = null)
   {
     var isHead = HttpMethods.IsHead(context.Request.Method);
@@ -80,7 +94,8 @@ public partial class RemoteProxy(
     switch (cachedResponse?.StatusCode)
     {
       case >= HttpStatusCode.BadRequest:
-        await SetStatusAsync(context, CachingProxyStatus.NEGATIVE_HIT, cachedResponse with { StatusCode = HttpStatusCode.NotFound });
+        await SetStatusAsync(context, CachingProxyStatus.NEGATIVE_HIT,
+          cachedResponse with { StatusCode = ClientFacingStatus(cachedResponse.StatusCode) });
         return null;
 
       // The caller decides whether the key includes the HTTP method (the S3 backend does so for
@@ -150,13 +165,15 @@ public partial class RemoteProxy(
     {
       if (!response.IsSuccessStatusCode)
       {
-        if (response.StatusCode != HttpStatusCode.NotFound)
+        var entry = responseCache.PutStatusCode(cacheKey, response.StatusCode, cacheDuration);
+        if (ClientFacingStatus(response.StatusCode) is var statusCode and HttpStatusCode.NotFound && response.StatusCode != statusCode)
         {
-          logger.LogWarning(Event.NegativeMiss(response.StatusCode), "Non-success requesting {UpstreamUri}: {StatusCode}", upstreamUri, response.StatusCode);
+          logger.LogWarning(Event.NegativeMiss(response.StatusCode),
+            "Non-success requesting {UpstreamUri}: {StatusCode}", upstreamUri, response.StatusCode);
+          entry = entry with { StatusCode = statusCode };
         }
 
-        var entry = responseCache.PutStatusCode(cacheKey, response.StatusCode, cacheDuration);
-        await SetStatusAsync(context, CachingProxyStatus.NEGATIVE_MISS, entry with { StatusCode = HttpStatusCode.NotFound });
+        await SetStatusAsync(context, CachingProxyStatus.NEGATIVE_MISS, entry);
         return null;
       }
 
