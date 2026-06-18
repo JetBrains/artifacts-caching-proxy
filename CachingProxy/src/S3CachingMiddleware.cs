@@ -154,11 +154,6 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
           return;
         }
         catch (AmazonServiceException ex) when (ex.StatusCode is HttpStatusCode.NotFound) { }
-        catch (Exception ex)
-        {
-          logger.LogWarning(ex, "Failed to retrieve S3 Object {S3Key}", s3Key);
-          throw;
-        }
       }
 
       var upstreamUri = remoteServer.GetUpstreamUri(remainingPath);
@@ -186,10 +181,18 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
       context.Response.ContentType = MediaTypeNames.Text.Plain;
       await context.Response.WriteAsync("Failed to cache response");
 
-      if (e is AmazonServiceException ae)
-        logger.LogError(Event.FailedToCacheInS3,"Failed to cache {RequestPath} with S3 error {s3ErrorCode}: {s3ErrorMessage}", context.Request.Path, ae.ErrorCode, ae.Message);
-      else
-        logger.LogError(Event.FailedToCacheInS3, e, "Failed to cache {RequestPath}", context.Request.Path);
+      switch (e)
+      {
+        case AmazonServiceException ase:
+          logger.LogError(Event.FailedToCacheInS3,"Failed to cache {RequestPath} with S3 error {s3ErrorCode}: {s3ErrorMessage}", context.Request.Path, ase.ErrorCode, ase.Message);
+          break;
+        case AmazonClientException ace:
+          logger.LogError(Event.FailedToCacheInS3,"Failed to cache {RequestPath} with S3 error {s3ErrorMessage}", context.Request.Path, ace.Message);
+          break;
+        default:
+          logger.LogError(Event.FailedToCacheInS3, e, "Failed to cache {RequestPath}", context.Request.Path);
+          break;
+      }
     }
 
     return;
