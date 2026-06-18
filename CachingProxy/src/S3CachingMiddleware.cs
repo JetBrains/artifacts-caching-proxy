@@ -114,14 +114,15 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
         }
       }
 
-      using var response = await remoteProxy.ProcessAsync(context, s3Key, remoteServer.CacheDuration, remoteServer.GetUpstreamUri(remainingPath));
+      var upstreamUri = remoteServer.GetUpstreamUri(remainingPath);
+      using var response = await remoteProxy.ProcessAsync(context, s3Key, remoteServer.CacheDuration, upstreamUri);
 
       // A non-null response is a GET MISS body for us to stream and persist; otherwise it is handled.
       if (response == null) return;
 
       context.Response.Clear();
 
-      await StoreInBucketAsync(s3Key, response, context.RequestAborted);
+      await StoreInBucketAsync(s3Key, upstreamUri, response, context.RequestAborted);
 
       await RedirectToBucket();
     }
@@ -138,13 +139,10 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
       context.Response.ContentType = MediaTypeNames.Text.Plain;
       await context.Response.WriteAsync("Failed to cache response");
 
-      // S3 throttling (SlowDown / 503) once the SDK's retries are exhausted is expected, transient
-      // backpressure — log it at Warning so it does not drown the error stream.
-      if (e is AmazonServiceException { StatusCode: HttpStatusCode.ServiceUnavailable }
-            or AmazonServiceException { ErrorCode: "SlowDown" or "RequestThrottled" or "Throttling" or "ThrottlingException" })
-        logger.LogWarning(Event.FailedToCacheInS3, e, "S3 throttled caching {RequestPath} with {S3Key}", context.Request.Path, s3Key);
+      if (e is AmazonServiceException ae)
+        logger.LogError(Event.FailedToCacheInS3,"Failed to cache {RequestPath} with S3 error {s3ErrorCode}: {s3ErrorMessage}", context.Request.Path, ae.ErrorCode, ae.Message);
       else
-        logger.LogError(Event.FailedToCacheInS3, e, "Failed to cache {RequestPath} in S3 with {S3Key}", context.Request.Path, s3Key);
+        logger.LogError(Event.FailedToCacheInS3, e, "Failed to cache {RequestPath}", context.Request.Path);
     }
 
     return;
@@ -198,7 +196,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
   /// through; when it did not (e.g. chunked transfer) we first spool the body to a temp file so the
   /// SDK gets a real length and does not buffer the whole body in memory.
   /// </summary>
-  private async Task StoreInBucketAsync(string s3Key, HttpResponseMessage response, CancellationToken cancellationToken)
+  private async Task StoreInBucketAsync(string s3Key, Uri requestUri, HttpResponseMessage response, CancellationToken cancellationToken)
   {
     await using var body = await response.Content.ReadAsStreamAsync(cancellationToken);
     var contentLength = response.Content.Headers.ContentLength;
@@ -230,7 +228,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
         },
         Metadata =
         {
-          ["uri"] = response.RequestMessage?.RequestUri?.ToString()
+          ["uri"] = requestUri.ToString()
         },
         InputStream = uploadStream,
       }, cancellationToken);
