@@ -35,18 +35,20 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
   // limiter reclaims idle partitions on its own. The middleware is a singleton (UseMiddleware), so
   // this single instance is shared across all requests for the app's lifetime.
   private readonly PartitionedRateLimiter<string> myKeyLocks = PartitionedRateLimiter.Create<string, int>(
-    static s3Key => RateLimitPartition.GetConcurrencyLimiter(PrefixPartition(s3Key), static _ => new ConcurrencyLimiterOptions
-    {
-      PermitLimit = 1,
-      QueueLimit = int.MaxValue,
-      QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
-    }));
+    static s3Key => RateLimitPartition.GetConcurrencyLimiter((Nibble(s3Key[0]) << 4) | Nibble(s3Key[1]), static _ =>
+      new ConcurrencyLimiterOptions
+      {
+        PermitLimit = 1,
+        QueueLimit = int.MaxValue,
+        QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+      }));
+
+  private static int Nibble(char c) => c <= '9' ? c - '0' : c - 'a' + 10;
 
   // s3Key is "aa/bb/<lowercase-hex-hash>" (see ManglePath). Fold its two prefix bytes "aa" and "bb"
   // into a 0..65535 partition id so partitioning allocates no per-request substring.
   private static int PrefixPartition(string s3Key)
   {
-    static int Nibble(char c) => c <= '9' ? c - '0' : c - 'a' + 10;
     return (Nibble(s3Key[0]) << 12) | (Nibble(s3Key[1]) << 8) | (Nibble(s3Key[3]) << 4) | Nibble(s3Key[4]);
   }
 
