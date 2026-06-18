@@ -134,10 +134,17 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
       // The artifact exists upstream; we just failed to store or redirect it. Respond 503 (and do
       // NOT cache a negative result) so the client retries and a transient S3 problem recovers on
       // the next request, instead of serving a "not found" for an artifact that is actually available.
-      logger.LogError(Event.FailedToCacheInS3, e, "Failed to cache {RequestPath} in S3 with {S3Key}", context.Request.Path, s3Key);
       context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
       context.Response.ContentType = MediaTypeNames.Text.Plain;
       await context.Response.WriteAsync("Failed to cache response");
+
+      // S3 throttling (SlowDown / 503) once the SDK's retries are exhausted is expected, transient
+      // backpressure — log it at Warning so it does not drown the error stream.
+      if (e is AmazonServiceException { StatusCode: HttpStatusCode.ServiceUnavailable }
+            or AmazonServiceException { ErrorCode: "SlowDown" or "RequestThrottled" or "Throttling" or "ThrottlingException" })
+        logger.LogWarning(Event.FailedToCacheInS3, e, "S3 throttled caching {RequestPath} with {S3Key}", context.Request.Path, s3Key);
+      else
+        logger.LogError(Event.FailedToCacheInS3, e, "Failed to cache {RequestPath} in S3 with {S3Key}", context.Request.Path, s3Key);
     }
 
     return;
