@@ -476,6 +476,77 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     Assert.Equal(0, myS3.PutObjectCalls);
   }
 
+  [Fact]
+  public async Task Concurrent_Misses_For_Same_Key_Probe_And_Upload_Once()
+  {
+    // A thundering herd: many concurrent GETs for the same uncached object. Single-flight coalescing
+    // must let exactly ONE request probe S3, fetch upstream and upload; the rest wait and serve the
+    // result from the now-populated cache. Without it, every request would probe and upload (the
+    // amplification that trips S3 SlowDown).
+    var server = CreateServer(signedLinks: true);
+    myS3.GateKey = GetPathKey("/real/a.jar"); // block the leader inside its probe
+
+    var tasks = Enumerable.Range(0, 16)
+      .Select(_ => server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method))
+      .ToArray();
+
+    // Wait until the leader is inside the gated probe (holding the per-key lock), then give the rest
+    // of the herd time to pile up on the lock before releasing. Without coalescing they would all be
+    // blocked inside the probe instead, driving GetObjectCalls toward 16.
+    await myS3.GateReached.Task.WaitAsync(TimeSpan.FromSeconds(10));
+    await Task.Delay(500);
+    myS3.GateRelease.TrySetResult();
+
+    var responses = await Task.WhenAll(tasks);
+    try
+    {
+      foreach (var response in responses)
+        Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
+
+      // Exactly one request did the work (MISS); the rest were coalesced and served from cache (HIT).
+      var statuses = responses
+        .Select(r => r.Headers.GetValues(CachingProxyConstants.StatusHeader).First())
+        .ToList();
+      Assert.Equal(1, statuses.Count(s => s == CachingProxyStatus.MISS.ToString()));
+      Assert.Equal(responses.Length - 1, statuses.Count(s => s == CachingProxyStatus.HIT.ToString()));
+
+      Assert.Equal(1, myS3.GetObjectCalls); // probed once despite 16 concurrent misses
+      Assert.Equal(1, myS3.PutObjectCalls); // uploaded once
+    }
+    finally
+    {
+      foreach (var response in responses) response.Dispose();
+    }
+  }
+
+  [Fact]
+  public async Task Concurrent_Misses_For_Different_Keys_Do_Not_Block_Each_Other()
+  {
+    // The lock must serialize only same-prefix-partition work: a request for an object in a different
+    // "aa/bb" prefix must not wait behind a leader busy resolving another. This is only meaningful if
+    // the two objects fall in different prefix-partitions (the key is "aa/bb/<hash>", so compare the
+    // 5-char prefix).
+    Assert.NotEqual(GetPathKey("/real/a.jar")[..5], GetPathKey("/real/extensionless")[..5]);
+
+    var server = CreateServer(signedLinks: true);
+    myS3.GateKey = GetPathKey("/real/a.jar"); // stall only a.jar's probe
+
+    var blocked = server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
+    await myS3.GateReached.Task.WaitAsync(TimeSpan.FromSeconds(10)); // a.jar's leader holds its lock
+
+    // A different key resolves end-to-end while a.jar is still gated.
+    using (var other = await server.CreateRequest("/real/extensionless").SendAsync(HttpMethod.Get.Method)
+             .WaitAsync(TimeSpan.FromSeconds(10)))
+    {
+      Assert.Equal(HttpStatusCode.RedirectKeepVerb, other.StatusCode);
+      AssertStatusHeader(other, CachingProxyStatus.MISS);
+    }
+
+    myS3.GateRelease.TrySetResult();
+    using var blockedResponse = await blocked;
+    Assert.Equal(HttpStatusCode.RedirectKeepVerb, blockedResponse.StatusCode);
+  }
+
   private string GetPathKey(string path)
   {
     Assert.StartsWith(myRemoteServer.Prefix, path);
@@ -514,6 +585,13 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     public HttpVerb? LastPresignVerb;
     public DateTime? LastPresignExpires;
 
+    // Test gate for forcing concurrent probes to overlap: when GateKey is set, a probe for that key
+    // signals GateReached and then blocks on GateRelease before continuing. Lets a test pile up a
+    // herd of concurrent requests behind the leader and assert how many actually reach S3.
+    public string? GateKey;
+    public readonly TaskCompletionSource GateReached = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    public readonly TaskCompletionSource GateRelease = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
     string IAmazonS3.GetPreSignedURL(GetPreSignedUrlRequest request)
     {
       LastPresignVerb = request.Verb;
@@ -531,9 +609,15 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     // The middleware probes with a ranged GET (prefetch of the first bytes): on a small enough object
     // the whole body fits in the range and is served inline; otherwise it redirects. Honour the
     // requested ByteRange and report the slice with a 206 + Content-Range, exactly as S3 does.
-    public override Task<GetObjectResponse> GetObjectAsync(GetObjectRequest request, CancellationToken cancellationToken = default)
+    public override async Task<GetObjectResponse> GetObjectAsync(GetObjectRequest request, CancellationToken cancellationToken = default)
     {
       Interlocked.Increment(ref GetObjectCalls);
+      if (GateKey != null && request.Key == GateKey)
+      {
+        GateReached.TrySetResult();
+        await GateRelease.Task.WaitAsync(cancellationToken);
+      }
+
       if (!Objects.TryGetValue(request.Key, out var obj))
         throw new AmazonS3Exception(nameof(HttpStatusCode.NotFound)) { StatusCode = HttpStatusCode.NotFound };
 
@@ -553,7 +637,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
         ETag = obj.ETag,
       };
       response.Headers.ContentType = obj.ContentType;
-      return Task.FromResult(response);
+      return response;
     }
 
     public override async Task<PutObjectResponse> PutObjectAsync(PutObjectRequest request, CancellationToken cancellationToken = default)

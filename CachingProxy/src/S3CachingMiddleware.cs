@@ -7,6 +7,7 @@ using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Net.Mime;
 using System.Threading;
+using System.Threading.RateLimiting;
 using System.Threading.Tasks;
 using Amazon.Runtime;
 using Amazon.Runtime.Endpoints;
@@ -22,6 +23,32 @@ namespace JetBrains.CachingProxy;
 public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amazonS3, CachingProxyConfig config, RemoteProxy remoteProxy, ResponseCache responseCache, TimeProvider timeProvider, ILogger<S3CachingMiddleware>  logger)
 {
   private static readonly ByteRange ourPrefetchSize = new(0, 16 * 1024 - 1);
+
+  // Single-flight coalescing of S3 misses, partitioned by the object key's "aa/bb" prefix (see
+  // ManglePath) rather than by the full key. Each prefix-partition is a single-permit concurrency
+  // limiter, so at most one request per prefix probes/fetches/uploads at a time while the rest wait
+  // and then serve from cache; different prefixes run freely. This both de-duplicates concurrent
+  // requests for the same object (same key => same prefix) AND bounds concurrent work per S3
+  // prefix-partition, the unit S3 throttles on. Because the keys are sha256-spread, distinct hot
+  // objects rarely share a prefix, so the coarser locking seldom serializes unrelated objects. An
+  // unbounded queue means contenders wait their turn rather than being rejected; the partitioned
+  // limiter reclaims idle partitions on its own. The middleware is a singleton (UseMiddleware), so
+  // this single instance is shared across all requests for the app's lifetime.
+  private readonly PartitionedRateLimiter<string> myKeyLocks = PartitionedRateLimiter.Create<string, int>(
+    static s3Key => RateLimitPartition.GetConcurrencyLimiter(PrefixPartition(s3Key), static _ => new ConcurrencyLimiterOptions
+    {
+      PermitLimit = 1,
+      QueueLimit = int.MaxValue,
+      QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+    }));
+
+  // s3Key is "aa/bb/<lowercase-hex-hash>" (see ManglePath). Fold its two prefix bytes "aa" and "bb"
+  // into a 0..65535 partition id so partitioning allocates no per-request substring.
+  private static int PrefixPartition(string s3Key)
+  {
+    static int Nibble(char c) => c <= '9' ? c - '0' : c - 'a' + 10;
+    return (Nibble(s3Key[0]) << 12) | (Nibble(s3Key[1]) << 8) | (Nibble(s3Key[3]) << 4) | Nibble(s3Key[4]);
+  }
 
   public async Task InvokeAsync(HttpContext context)
   {
@@ -47,14 +74,34 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
 
     try
     {
-      // Replay the verb-specific head: a HEAD's cached metadata, or a GET's cached redirect.
+      // Replay the verb-specific head: a HEAD's cached metadata, or a GET's cached redirect. Kept
+      // outside the per-key lock so steady-state HITs never contend on the semaphore.
       if (responseCache.GetCachedStatusCode(verbKey) is { } verbEntry)
       {
         await remoteProxy.SetStatusAsync(context, CachingProxyStatus.HIT, verbEntry);
         return;
       }
 
+      // Coalesce concurrent misses: only one request per S3 prefix-partition probes S3, fetches
+      // upstream and uploads, while the rest wait here and then serve from the now-populated cache —
+      // this is what keeps a thundering herd from amplifying into many GetObject/PutObject calls
+      // against one prefix (S3 SlowDown). Pass the verb-agnostic s3Key (the limiter partitions it down
+      // to its "aa/bb" prefix) so a concurrent HEAD and GET share one probe; the only verb-specific
+      // outputs (large-object HEAD head, GET redirect) are cheap local work.
+      // The unbounded queue guarantees the permit is granted, so the lease is always acquired.
+      using var keyLock = await myKeyLocks.AcquireAsync(s3Key, permitCount: 1, context.RequestAborted);
+
+      // Re-check after acquiring (double-checked locking): a prior leader may have populated the
+      // verb-specific head (a large-object redirect or HEAD metadata) while we waited.
+      if (responseCache.GetCachedStatusCode(verbKey) is { } cachedVerbEntry)
+      {
+        await remoteProxy.SetStatusAsync(context, CachingProxyStatus.HIT, cachedVerbEntry);
+        return;
+      }
+
       // Nothing known yet for this object: probe S3 with the ranged prefetch (HEAD and GET alike).
+      // The shared-key check also serves as the post-lock re-check for the verb-agnostic values (a
+      // leader's inlined small object or negative result), so waiters serve those without re-probing.
       if (responseCache.GetCachedStatusCode(s3Key) == null)
       {
         try
@@ -242,13 +289,11 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
 
   public class HealthCheck(IAmazonS3 amazonS3, CachingProxyConfig config) : IHealthCheck
   {
-    public async Task<HealthCheckResult> CheckHealthAsync(HealthCheckContext context,
-      CancellationToken cancellationToken)
+    public async Task<HealthCheckResult> CheckHealthAsync(HealthCheckContext context, CancellationToken cancellationToken)
     {
       try
       {
-        var bucketAcl = await amazonS3.GetBucketAclAsync(new GetBucketAclRequest { BucketName = config.S3?.BucketName },
-          cancellationToken);
+        var bucketAcl = await amazonS3.GetBucketAclAsync(new GetBucketAclRequest { BucketName = config.S3?.BucketName }, cancellationToken);
         if (bucketAcl.HttpStatusCode == HttpStatusCode.OK)
           return HealthCheckResult.Healthy(config.S3?.BucketName);
       }
