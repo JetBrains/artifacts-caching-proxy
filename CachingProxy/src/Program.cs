@@ -133,9 +133,7 @@ public static class Program
           awsOptions.DefaultClientConfig.MaxErrorRetry = 8;
           return awsOptions;
         })
-        .AddAWSService<IAmazonS3>()
-        .AddHealthChecks()
-        .AddCheck<S3CachingMiddleware.HealthCheck>(nameof(S3CachingMiddleware));
+        .AddAWSService<IAmazonS3>();
     }
     else
     {

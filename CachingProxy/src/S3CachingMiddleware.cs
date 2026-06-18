@@ -14,7 +14,6 @@ using Amazon.Runtime.Endpoints;
 using Amazon.S3;
 using Amazon.S3.Model;
 using Microsoft.AspNetCore.Http;
-using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Logging;
 
 namespace JetBrains.CachingProxy;
@@ -287,29 +286,6 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
     {
       if (spooled != null) await spooled.DisposeAsync();
       if (spoolPath != null) File.Delete(spoolPath);
-    }
-  }
-
-  public class HealthCheck(IAmazonS3 amazonS3, CachingProxyConfig config) : IHealthCheck
-  {
-    public async Task<HealthCheckResult> CheckHealthAsync(HealthCheckContext context, CancellationToken cancellationToken)
-    {
-      try
-      {
-        var bucketAcl = await amazonS3.GetBucketAclAsync(new GetBucketAclRequest { BucketName = config.S3?.BucketName }, cancellationToken);
-        if (bucketAcl.HttpStatusCode == HttpStatusCode.OK)
-          return HealthCheckResult.Healthy(config.S3?.BucketName);
-      }
-      catch (OperationCanceledException)
-      {
-        throw;
-      }
-      catch (Exception e)
-      {
-        return HealthCheckResult.Unhealthy(e.Message);
-      }
-
-      return HealthCheckResult.Unhealthy();
     }
   }
 }
