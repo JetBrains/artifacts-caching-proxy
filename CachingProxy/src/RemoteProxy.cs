@@ -59,19 +59,6 @@ public partial class RemoteProxy(
     return true;
   }
 
-  /// <summary>
-  /// Processes a request against the given remote server: handles redirects, in-memory cache
-  /// hits, the upstream request and its validation (including Content-Encoding). Writes the full
-  /// response head — status, metadata headers (Content-Length, Last-Modified), representation
-  /// headers (Content-Type, Content-Encoding) and the proxy bookkeeping headers — to
-  /// <paramref name="context"/>. The Content-Type is the one returned by <paramref name="contentType"/>
-  /// when the caller supplies a resolver (the disk backend resolves it from the file extension, so a
-  /// MISS and a later HIT served from disk agree), and the upstream's own Content-Type otherwise. It
-  /// is stored in the in-memory cache so later HEAD hits agree. For a successful GET the open
-  /// upstream response is returned so the caller can stream and persist the body (reading its
-  /// Content-Encoding off the response) and must dispose it; in every other case the request is
-  /// fully handled, the response (if any) is disposed internally, and <c>null</c> is returned.
-  /// </summary>
   // 404 and authentication / access errors are surfaced to the client verbatim (we do not mask
   // them); every other non-success status is masked to 404. Used for both negative cache hits and
   // misses so a replayed entry returns the same status the live response did.
@@ -86,11 +73,24 @@ public partial class RemoteProxy(
     _ => HttpStatusCode.NotFound,
   };
 
+  /// <summary>
+  /// Processes a request against the given remote server: handles redirects, in-memory cache
+  /// hits, the upstream request and its validation (including Content-Encoding). Writes the full
+  /// response head — status, metadata headers (Content-Length, Last-Modified), representation
+  /// headers (Content-Type, Content-Encoding) and the proxy bookkeeping headers — to
+  /// <paramref name="context"/>. The Content-Type is the one returned by <paramref name="contentType"/>
+  /// when the caller supplies a resolver (the disk backend resolves it from the file extension, so a
+  /// MISS and a later HIT served from disk agree), and the upstream's own Content-Type otherwise. It
+  /// is stored in the in-memory cache so later HEAD hits agree. For a successful GET the open
+  /// upstream response is returned so the caller can stream and persist the body (reading its
+  /// Content-Encoding off the response) and must dispose it; in every other case the request is
+  /// fully handled, the response (if any) is disposed internally, and <c>null</c> is returned.
+  /// </summary>
   public async Task<HttpResponseMessage?> ProcessAsync(HttpContext context, string cacheKey, CacheDuration cacheDuration, Uri upstreamUri, string? contentType = null)
   {
     var isHead = HttpMethods.IsHead(context.Request.Method);
 
-    var cachedResponse = responseCache.GetCachedStatusCode(cacheKey);
+    var cachedResponse = await responseCache.GetCachedStatusCode(cacheKey, context.RequestAborted);
     switch (cachedResponse?.StatusCode)
     {
       case >= HttpStatusCode.BadRequest:
@@ -147,7 +147,7 @@ public partial class RemoteProxy(
 
       logger.LogWarning(Event.Timeout, "Timeout requesting {UpstreamUri}", upstreamUri);
 
-      var entry = responseCache.PutStatusCode(cacheKey, HttpStatusCode.GatewayTimeout, cacheDuration);
+      var entry = await responseCache.PutStatusCode(cacheKey, HttpStatusCode.GatewayTimeout, cacheDuration, context.RequestAborted);
       await SetStatusAsync(context, CachingProxyStatus.NEGATIVE_MISS, entry with { StatusCode = HttpStatusCode.NotFound });
       return null;
     }
@@ -155,7 +155,7 @@ public partial class RemoteProxy(
     {
       logger.LogWarning(e, "Exception requesting {UpstreamUri}: {Message}", upstreamUri, e.Message);
 
-      var entry = responseCache.PutStatusCode(cacheKey, HttpStatusCode.ServiceUnavailable, cacheDuration);
+      var entry = await responseCache.PutStatusCode(cacheKey, HttpStatusCode.ServiceUnavailable, cacheDuration, context.RequestAborted);
       await SetStatusAsync(context, CachingProxyStatus.NEGATIVE_MISS, entry with { StatusCode = HttpStatusCode.NotFound });
       return null;
     }
@@ -165,7 +165,7 @@ public partial class RemoteProxy(
     {
       if (!response.IsSuccessStatusCode)
       {
-        var entry = responseCache.PutStatusCode(cacheKey, response.StatusCode, cacheDuration);
+        var entry = await responseCache.PutStatusCode(cacheKey, response.StatusCode, cacheDuration, context.RequestAborted);
         if (ClientFacingStatus(response.StatusCode) is var statusCode and HttpStatusCode.NotFound && response.StatusCode != statusCode)
         {
           logger.LogWarning(Event.NegativeMiss(response.StatusCode),
@@ -198,7 +198,7 @@ public partial class RemoteProxy(
       if (isHead)
       {
         await SetStatusAsync(context, CachingProxyStatus.MISS,
-          responseCache.PutStatusCode(cacheKey, responseEntry, cacheDuration));
+          await responseCache.PutStatusCode(cacheKey, responseEntry, cacheDuration, context.RequestAborted));
         return null;
       }
 

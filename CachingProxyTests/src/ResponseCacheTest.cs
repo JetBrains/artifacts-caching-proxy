@@ -1,14 +1,24 @@
 using System;
 using System.Net;
+using System.Threading.Tasks;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Time.Testing;
 using Xunit;
+using ZiggyCreatures.Caching.Fusion;
 
 namespace JetBrains.CachingProxy.Tests;
 
 public class ResponseCacheTest
 {
-  private readonly FakeTimeProvider _timeProvider = new();
+  // FusionCache has no TimeProvider/clock hook: it computes the L1 entry's AbsoluteExpiration
+  // from the real system clock (DateTimeOffset.UtcNow). The FakeTimeProvider only drives the
+  // MemoryCache's CheckExpired comparison (via TimeProviderClock). For the two clocks to be
+  // coherent, the fake one must start at the real "now" -- otherwise (default epoch is the year
+  // 2000) advancing it by minutes never reaches the real, ~year-2026 expiration and nothing ever
+  // evicts. Starting at DateTimeOffset.UtcNow puts both clocks in the same era; the only real
+  // time that elapses during a test is its own runtime (sub-second), negligible vs the minute-
+  // scale durations under test, so the fake Advance() calls do all the work deterministically.
+  private readonly FakeTimeProvider _timeProvider = new(DateTimeOffset.UtcNow);
   private readonly ResponseCache _cache;
   private readonly CacheDuration _cacheDuration = new()
   {
@@ -21,37 +31,38 @@ public class ResponseCacheTest
     {
       Clock = new TimeProviderClock(_timeProvider)
     });
-    _cache = new ResponseCache(memoryCache, _timeProvider);
+    var fusionCache = new FusionCache(new FusionCacheOptions(), memoryCache);
+    _cache = new ResponseCache(fusionCache, _timeProvider);
   }
 
   [Fact]
-  public void CacheEntry_ExpiresAfterAbsoluteTime()
+  public async Task CacheEntry_ExpiresAfterAbsoluteTime()
   {
     const string key = "test-key";
-    _cache.PutStatusCode(key, HttpStatusCode.OK, _cacheDuration);
+    await _cache.PutStatusCode(key, HttpStatusCode.OK, _cacheDuration);
 
     // Entry should exist immediately
-    Assert.NotNull(_cache.GetCachedStatusCode(key));
+    Assert.NotNull(await _cache.GetCachedStatusCode(key));
 
     // Advance time past 5-minute expiration
     _timeProvider.Advance(TimeSpan.FromMinutes(6));
 
     // Entry should be expired
-    Assert.Null(_cache.GetCachedStatusCode(key));
+    Assert.Null(await _cache.GetCachedStatusCode(key));
   }
 
   [Fact]
-  public void CacheEntry_AccessDoesNotExtendExpiration()
+  public async Task CacheEntry_AccessDoesNotExtendExpiration()
   {
     const string key = "test-key";
-    _cache.PutStatusCode(key, HttpStatusCode.OK, _cacheDuration);
+    await _cache.PutStatusCode(key, HttpStatusCode.OK, _cacheDuration);
 
-    // Simulate high-load access pattern: access every 30 seconds
+    // Simulate a high-load access pattern: access every 30 seconds.
     // With sliding expiration, these repeated accesses would keep extending the entry
     for (int i = 0; i < 9; i++) // 4.5 minutes of accesses (well within 5 min TTL)
     {
       _timeProvider.Advance(TimeSpan.FromSeconds(30));
-      Assert.NotNull(_cache.GetCachedStatusCode(key));
+      Assert.NotNull(await _cache.GetCachedStatusCode(key));
     }
 
     // Advance past the 5-minute expiration (total: 4.5 + 1.5 = 6 minutes)
@@ -59,145 +70,145 @@ public class ResponseCacheTest
 
     // Entry should be expired despite repeated access
     // (with sliding expiration, it would still exist due to repeated access resetting the timer)
-    Assert.Null(_cache.GetCachedStatusCode(key));
+    Assert.Null(await _cache.GetCachedStatusCode(key));
   }
 
   [Theory]
   [InlineData(HttpStatusCode.OK)]
   [InlineData(HttpStatusCode.NotFound)]
-  public void CacheEntry_OkAndNotFound_ExpireAfter5Minutes(HttpStatusCode statusCode)
+  public async Task CacheEntry_OkAndNotFound_ExpireAfter5Minutes(HttpStatusCode statusCode)
   {
     const string key = "test-key";
-    _cache.PutStatusCode(key, statusCode, _cacheDuration);
+    await _cache.PutStatusCode(key, statusCode, _cacheDuration);
 
     // Should exist at 4:59
     _timeProvider.Advance(TimeSpan.FromMinutes(5) - TimeSpan.FromSeconds(1));
-    Assert.NotNull(_cache.GetCachedStatusCode(key));
+    Assert.NotNull(await _cache.GetCachedStatusCode(key));
 
     // Should be gone at 5:01
     _timeProvider.Advance(TimeSpan.FromSeconds(2));
-    Assert.Null(_cache.GetCachedStatusCode(key));
+    Assert.Null(await _cache.GetCachedStatusCode(key));
   }
 
   [Fact]
-  public void CacheEntry_Redirect_ExpiresAfter5Minutes()
+  public async Task CacheEntry_Redirect_ExpiresAfter5Minutes()
   {
     // The S3 "object is in the bucket" redirect must use the positive (5 min) duration, not the
     // 1-minute DefaultDuration, otherwise the redirect is re-probed/re-signed every minute.
     const string key = "test-key";
-    _cache.PutStatusCode(key, HttpStatusCode.RedirectKeepVerb, _cacheDuration);
+    await _cache.PutStatusCode(key, HttpStatusCode.RedirectKeepVerb, _cacheDuration);
 
     _timeProvider.Advance(TimeSpan.FromMinutes(5) - TimeSpan.FromSeconds(1));
-    Assert.NotNull(_cache.GetCachedStatusCode(key));
+    Assert.NotNull(await _cache.GetCachedStatusCode(key));
 
     _timeProvider.Advance(TimeSpan.FromSeconds(2));
-    Assert.Null(_cache.GetCachedStatusCode(key));
+    Assert.Null(await _cache.GetCachedStatusCode(key));
   }
 
   [Theory]
   [InlineData(HttpStatusCode.InternalServerError)]
   [InlineData(HttpStatusCode.ServiceUnavailable)]
   [InlineData(HttpStatusCode.GatewayTimeout)]
-  public void CacheEntry_OtherStatusCodes_ExpireAfter1Minute(HttpStatusCode statusCode)
+  public async Task CacheEntry_OtherStatusCodes_ExpireAfter1Minute(HttpStatusCode statusCode)
   {
     const string key = "test-key";
-    _cache.PutStatusCode(key, statusCode, _cacheDuration);
+    await _cache.PutStatusCode(key, statusCode, _cacheDuration);
 
     // Should exist at 0:59
     _timeProvider.Advance(TimeSpan.FromSeconds(59));
-    Assert.NotNull(_cache.GetCachedStatusCode(key));
+    Assert.NotNull(await _cache.GetCachedStatusCode(key));
 
     // Should be gone at 1:01
     _timeProvider.Advance(TimeSpan.FromSeconds(2));
-    Assert.Null(_cache.GetCachedStatusCode(key));
+    Assert.Null(await _cache.GetCachedStatusCode(key));
   }
 
   [Fact]
-  public void CustomCacheDuration_OverridesDefaultForOk()
+  public async Task CustomCacheDuration_OverridesDefaultForOk()
   {
     const string key = "test-key";
     var customDuration = new CacheDuration(_cacheDuration)
     {
       [HttpStatusCode.OK] = TimeSpan.FromMinutes(30),
     };
-    _cache.PutStatusCode(key, HttpStatusCode.OK, customDuration);
+    await _cache.PutStatusCode(key, HttpStatusCode.OK, customDuration);
 
     // Default OK is 5 minutes - with custom duration, should still exist at 10 minutes
     _timeProvider.Advance(TimeSpan.FromMinutes(10));
-    Assert.NotNull(_cache.GetCachedStatusCode(key));
+    Assert.NotNull(await _cache.GetCachedStatusCode(key));
 
     // Should exist just before 30-minute mark
     _timeProvider.Advance(TimeSpan.FromMinutes(20) - TimeSpan.FromSeconds(1));
-    Assert.NotNull(_cache.GetCachedStatusCode(key));
+    Assert.NotNull(await _cache.GetCachedStatusCode(key));
 
     // Should be expired just after 30-minute mark
     _timeProvider.Advance(TimeSpan.FromSeconds(2));
-    Assert.Null(_cache.GetCachedStatusCode(key));
+    Assert.Null(await _cache.GetCachedStatusCode(key));
   }
 
   [Fact]
-  public void CustomCacheDuration_ShortensExpirationForOk()
+  public async Task CustomCacheDuration_ShortensExpirationForOk()
   {
     const string key = "test-key";
     var customDuration = _cacheDuration.Union(new CacheDuration
     {
       [HttpStatusCode.OK] = TimeSpan.FromSeconds(10),
     });
-    _cache.PutStatusCode(key, HttpStatusCode.OK, customDuration);
+    await _cache.PutStatusCode(key, HttpStatusCode.OK, customDuration);
 
     // Should exist just before 10-second mark
     _timeProvider.Advance(TimeSpan.FromSeconds(9));
-    Assert.NotNull(_cache.GetCachedStatusCode(key));
+    Assert.NotNull(await _cache.GetCachedStatusCode(key));
 
     // Should be expired just after 10-second mark (well before the default 5 minutes)
     _timeProvider.Advance(TimeSpan.FromSeconds(2));
-    Assert.Null(_cache.GetCachedStatusCode(key));
+    Assert.Null(await _cache.GetCachedStatusCode(key));
   }
 
   [Fact]
-  public void CustomCacheDuration_OverridesDefaultForNotFound()
+  public async Task CustomCacheDuration_OverridesDefaultForNotFound()
   {
     const string key = "test-key";
     var customDuration = _cacheDuration.Union(new CacheDuration
     {
       [HttpStatusCode.NotFound] = TimeSpan.FromMinutes(1),
     });
-    _cache.PutStatusCode(key, HttpStatusCode.NotFound, customDuration);
+    await _cache.PutStatusCode(key, HttpStatusCode.NotFound, customDuration);
 
     // Should exist just before 1-minute mark
     _timeProvider.Advance(TimeSpan.FromSeconds(59));
-    Assert.NotNull(_cache.GetCachedStatusCode(key));
+    Assert.NotNull(await _cache.GetCachedStatusCode(key));
 
     // Should be expired just after 1-minute mark (default NotFound is 5 minutes)
     _timeProvider.Advance(TimeSpan.FromSeconds(2));
-    Assert.Null(_cache.GetCachedStatusCode(key));
+    Assert.Null(await _cache.GetCachedStatusCode(key));
   }
 
   [Fact]
-  public void CustomCacheDuration_AppliesToCustomStatusCode()
+  public async Task CustomCacheDuration_AppliesToCustomStatusCode()
   {
     const string key = "test-key";
     var customDuration = _cacheDuration.Union(new CacheDuration
     {
       [HttpStatusCode.InternalServerError] = TimeSpan.FromMinutes(10),
     });
-    _cache.PutStatusCode(key, HttpStatusCode.InternalServerError, customDuration);
+    await _cache.PutStatusCode(key, HttpStatusCode.InternalServerError, customDuration);
 
     // Default 500 falls back to DefaultDuration of 1 minute; custom is 10 minutes
     _timeProvider.Advance(TimeSpan.FromMinutes(5));
-    Assert.NotNull(_cache.GetCachedStatusCode(key));
+    Assert.NotNull(await _cache.GetCachedStatusCode(key));
 
     // Should exist just before 10-minute mark
     _timeProvider.Advance(TimeSpan.FromMinutes(5) - TimeSpan.FromSeconds(1));
-    Assert.NotNull(_cache.GetCachedStatusCode(key));
+    Assert.NotNull(await _cache.GetCachedStatusCode(key));
 
     // Should be expired just after 10-minute mark
     _timeProvider.Advance(TimeSpan.FromSeconds(2));
-    Assert.Null(_cache.GetCachedStatusCode(key));
+    Assert.Null(await _cache.GetCachedStatusCode(key));
   }
 
   [Fact]
-  public void CustomCacheDuration_FallsBackToDefaultsForUnspecifiedStatusCode()
+  public async Task CustomCacheDuration_FallsBackToDefaultsForUnspecifiedStatusCode()
   {
     const string key = "test-key";
     // Custom duration only defines OK; NotFound should fall back to CacheDuration.Default (5 minutes)
@@ -205,19 +216,19 @@ public class ResponseCacheTest
     {
       [HttpStatusCode.OK] = TimeSpan.FromMinutes(30),
     });
-    _cache.PutStatusCode(key, HttpStatusCode.NotFound, customDuration);
+    await _cache.PutStatusCode(key, HttpStatusCode.NotFound, customDuration);
 
     // Should exist just before the 5-minute default for NotFound
     _timeProvider.Advance(TimeSpan.FromMinutes(5) - TimeSpan.FromSeconds(1));
-    Assert.NotNull(_cache.GetCachedStatusCode(key));
+    Assert.NotNull(await _cache.GetCachedStatusCode(key));
 
     // Should be expired just after
     _timeProvider.Advance(TimeSpan.FromSeconds(2));
-    Assert.Null(_cache.GetCachedStatusCode(key));
+    Assert.Null(await _cache.GetCachedStatusCode(key));
   }
 
   [Fact]
-  public void CustomCacheDuration_FallsBackToDefaultDurationForUnknownStatusCode()
+  public async Task CustomCacheDuration_FallsBackToDefaultDurationForUnknownStatusCode()
   {
     const string key = "test-key";
     // Custom duration defines only OK; 500 is not in custom or in CacheDuration.Default,
@@ -226,22 +237,22 @@ public class ResponseCacheTest
     {
       [HttpStatusCode.OK] = TimeSpan.FromMinutes(30),
     });
-    _cache.PutStatusCode(key, HttpStatusCode.InternalServerError, customDuration);
+    await _cache.PutStatusCode(key, HttpStatusCode.InternalServerError, customDuration);
 
     // Should exist just before 1-minute mark
     _timeProvider.Advance(TimeSpan.FromSeconds(59));
-    Assert.NotNull(_cache.GetCachedStatusCode(key));
+    Assert.NotNull(await _cache.GetCachedStatusCode(key));
 
     // Should be expired just after
     _timeProvider.Advance(TimeSpan.FromSeconds(2));
-    Assert.Null(_cache.GetCachedStatusCode(key));
+    Assert.Null(await _cache.GetCachedStatusCode(key));
   }
 
   [Theory]
   [InlineData(HttpStatusCode.OK)]
   [InlineData(HttpStatusCode.NotFound)]
   [InlineData(HttpStatusCode.InternalServerError)]
-  public void CustomCacheDuration_AppliedFromCachingProxyPrefix(HttpStatusCode statusCode)
+  public async Task CustomCacheDuration_AppliedFromCachingProxyPrefix(HttpStatusCode statusCode)
   {
     const string key = "test-key";
     // Simulate prefix-level configuration: a CachingProxyPrefix carries a CacheDuration
@@ -252,14 +263,14 @@ public class ResponseCacheTest
       [HttpStatusCode.NotFound] = TimeSpan.FromHours(1),
       [HttpStatusCode.InternalServerError] = TimeSpan.FromHours(1),
     }));
-    _cache.PutStatusCode(key, statusCode, prefix.CacheDuration!);
+    await _cache.PutStatusCode(key, statusCode, prefix.CacheDuration!);
 
     // All three should remain past the defaults (5 min / 1 min) thanks to the 1-hour override
     _timeProvider.Advance(TimeSpan.FromMinutes(30));
-    Assert.NotNull(_cache.GetCachedStatusCode(key));
+    Assert.NotNull(await _cache.GetCachedStatusCode(key));
 
     // Should be expired just after the 1-hour mark
     _timeProvider.Advance(TimeSpan.FromMinutes(30) + TimeSpan.FromSeconds(1));
-    Assert.Null(_cache.GetCachedStatusCode(key));
+    Assert.Null(await _cache.GetCachedStatusCode(key));
   }
 }

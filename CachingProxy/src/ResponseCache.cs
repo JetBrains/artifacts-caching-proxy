@@ -2,11 +2,12 @@ using System;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
+using System.Threading;
 using System.Threading.Tasks;
 using Amazon.S3.Model;
 using Microsoft.AspNetCore.Http;
-using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Primitives;
+using ZiggyCreatures.Caching.Fusion;
 
 namespace JetBrains.CachingProxy;
 
@@ -59,23 +60,25 @@ public sealed record CachedResponse(HttpStatusCode StatusCode, IHeaderDictionary
   public static readonly CachedResponse Blacklisted = new(HttpStatusCode.NotFound, new HeaderDictionary(), [.. "Blacklisted"u8]);
 }
 
-public class ResponseCache(IMemoryCache cache, TimeProvider timeProvider)
+public class ResponseCache(IFusionCache cache, TimeProvider timeProvider)
 {
-  public CachedResponse? GetCachedStatusCode(string cacheKey) =>
-    cache.TryGetValue<CachedResponse>(cacheKey, out var entry) ? entry : null;
+  public ValueTask<CachedResponse?> GetCachedStatusCode(string cacheKey, CancellationToken cancellationToken = default) =>
+    cache.GetOrDefaultAsync<CachedResponse>(cacheKey, token: cancellationToken);
 
-  public CachedResponse PutStatusCode(string cacheKey, HttpStatusCode statusCode, CacheDuration cacheDuration) =>
-    PutStatusCode(cacheKey, new CachedResponse(statusCode, new HeaderDictionary()), cacheDuration);
+  public ValueTask<CachedResponse> PutStatusCode(string cacheKey, HttpStatusCode statusCode, CacheDuration cacheDuration, CancellationToken cancellationToken = default) =>
+    PutStatusCode(cacheKey, new CachedResponse(statusCode, new HeaderDictionary()), cacheDuration, cancellationToken);
 
-  public CachedResponse PutStatusCode(string cacheKey, CachedResponse entry, CacheDuration cacheDuration)
+  public async ValueTask<CachedResponse> PutStatusCode(string cacheKey, CachedResponse entry, CacheDuration cacheDuration, CancellationToken cancellationToken = default)
   {
     var cachingTime = cacheDuration.GetDuration(entry.StatusCode);
     entry.Headers[CachingProxyConstants.CachedStatusHeader] = entry.StatusCode.ToString("D");
     entry.Headers[CachingProxyConstants.CachedUntilHeader] = (timeProvider.GetUtcNow() + cachingTime).ToString("R");
 
-    return cache.Set(cacheKey, entry, new MemoryCacheEntryOptions
+    await cache.SetAsync(cacheKey, entry, new FusionCacheEntryOptions
     {
-      AbsoluteExpirationRelativeToNow = cachingTime,
-    });
+      MemoryCacheDuration = cachingTime,
+      DistributedCacheDuration = cachingTime,
+    }, token: cancellationToken);
+    return entry;
   }
 }

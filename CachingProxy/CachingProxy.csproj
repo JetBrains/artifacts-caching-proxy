@@ -16,6 +16,7 @@
     <PackageReference Include="AWSSDK.SSO" />
     <PackageReference Include="AWSSDK.SSOOIDC" />
     <PackageReference Include="Cronos" />
+    <PackageReference Include="Microsoft.Extensions.Caching.StackExchangeRedis" />
     <PackageReference Include="Microsoft.Extensions.Http.Polly" />
     <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" />
     <PackageReference Include="OpenTelemetry.Exporter.Prometheus.AspNetCore" />
@@ -23,6 +24,8 @@
     <PackageReference Include="OpenTelemetry.Instrumentation.AspNetCore" />
     <PackageReference Include="OpenTelemetry.Instrumentation.Runtime" />
     <PackageReference Include="Sentry.AspNetCore" />
+    <PackageReference Include="ZiggyCreatures.FusionCache" />
+    <PackageReference Include="ZiggyCreatures.FusionCache.Serialization.CysharpMemoryPack" />
   </ItemGroup>
 
 </Project>

@@ -19,6 +19,8 @@ using Microsoft.Extensions.Options;
 using OpenTelemetry.Metrics;
 using OpenTelemetry.Resources;
 using Polly;
+using ZiggyCreatures.Caching.Fusion;
+using ZiggyCreatures.Caching.Fusion.Serialization.CysharpMemoryPack;
 
 namespace JetBrains.CachingProxy;
 
@@ -109,6 +111,34 @@ public static class Program
       .ConfigureOptions<HealthCheck>()
       .AddHealthChecks()
       .AddCheck<HealthCheck>(nameof(HealthCheck));
+
+    var fusionCacheBuilder = services
+      .AddFusionCache()
+      // Use the DI-registered IMemoryCache (configured below with a TimeProvider-backed clock)
+      // instead of FusionCache's own internal MemoryCache, so the configured clock actually applies.
+      .WithRegisteredMemoryCache();
+
+    // Opt-in L2 (distributed) cache: wired only when a Redis connection string is configured, so
+    // disk/dev runs stay L1-only with no Redis dependency. Mirrors the S3 conditional below. The
+    // DistributedCacheDuration already set in ResponseCache.PutStatusCode takes effect once this runs.
+    var redis = configuration.Get<CachingProxyConfig>()?.Redis;
+    if (!string.IsNullOrEmpty(redis?.ConnectionString))
+    {
+      // CachedResponse holds an IHeaderDictionary that MemoryPack can't serialize on its own, so a
+      // custom formatter (registered globally) maps it to/from a serializable surrogate.
+      CachedResponseFormatter.Register();
+
+      services.AddStackExchangeRedisCache(options =>
+      {
+        options.Configuration = redis.ConnectionString;
+        if (!string.IsNullOrEmpty(redis.InstanceName))
+          options.InstanceName = redis.InstanceName;
+      });
+
+      fusionCacheBuilder
+        .WithSerializer(new FusionCacheCysharpMemoryPackSerializer())
+        .WithRegisteredDistributedCache();
+    }
 
     services
       .AddRouting()

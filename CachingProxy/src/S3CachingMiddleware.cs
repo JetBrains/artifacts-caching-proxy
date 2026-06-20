@@ -75,7 +75,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
     {
       // Replay the verb-specific head: a HEAD's cached metadata, or a GET's cached redirect. Kept
       // outside the per-key lock so steady-state HITs never contend on the semaphore.
-      if (responseCache.GetCachedStatusCode(verbKey) is { } verbEntry)
+      if (await responseCache.GetCachedStatusCode(verbKey, context.RequestAborted) is { } verbEntry)
       {
         await remoteProxy.SetStatusAsync(context, CachingProxyStatus.HIT, verbEntry);
         return;
@@ -92,7 +92,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
 
       // Re-check after acquiring (double-checked locking): a prior leader may have populated the
       // verb-specific head (a large-object redirect or HEAD metadata) while we waited.
-      if (responseCache.GetCachedStatusCode(verbKey) is { } cachedVerbEntry)
+      if (await responseCache.GetCachedStatusCode(verbKey, context.RequestAborted) is { } cachedVerbEntry)
       {
         await remoteProxy.SetStatusAsync(context, CachingProxyStatus.HIT, cachedVerbEntry);
         return;
@@ -101,7 +101,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
       // Nothing known yet for this object: probe S3 with the ranged prefetch (HEAD and GET alike).
       // The shared-key check also serves as the post-lock re-check for the verb-agnostic values (a
       // leader's inlined small object or negative result), so waiters serve those without re-probing.
-      if (responseCache.GetCachedStatusCode(s3Key) == null)
+      if (await responseCache.GetCachedStatusCode(s3Key, context.RequestAborted) == null)
       {
         try
         {
@@ -127,7 +127,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
             var cachingResponse = new CachedResponse(s3Object) { StatusCode = HttpStatusCode.OK, Body = body };
 
             await remoteProxy.SetStatusAsync(context, CachingProxyStatus.MISS,
-              responseCache.PutStatusCode(s3Key, cachingResponse, remoteServer.CacheDuration));
+              await responseCache.PutStatusCode(s3Key, cachingResponse, remoteServer.CacheDuration, context.RequestAborted));
             return;
           }
 
@@ -145,7 +145,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
               }
             };
             await remoteProxy.SetStatusAsync(context, CachingProxyStatus.MISS,
-              responseCache.PutStatusCode(verbKey, head, remoteServer.CacheDuration));
+              await responseCache.PutStatusCode(verbKey, head, remoteServer.CacheDuration, context.RequestAborted));
             return;
           }
 
@@ -235,7 +235,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
       // Only a GET redirects (a HEAD is served from memory), so the redirect always belongs under the
       // verb-specific key and is never replayed to a HEAD.
       await remoteProxy.SetStatusAsync(context, CachingProxyStatus.MISS,
-        responseCache.PutStatusCode(verbKey, cachingResponse, remoteServer.CacheDuration));
+        await responseCache.PutStatusCode(verbKey, cachingResponse, remoteServer.CacheDuration, context.RequestAborted));
     }
   }
 

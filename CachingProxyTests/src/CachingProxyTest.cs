@@ -69,7 +69,11 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
       CleanupPeriod =  TimeSpan.FromDays(1)
     };
 
-    myTimeProvider = new FakeTimeProvider();
+    // Start the fake clock at the real "now" so it shares an era with FusionCache, which derives
+    // its L1 entry AbsoluteExpiration from the real system clock (it has no TimeProvider hook).
+    // With the default year-2000 epoch, advancing the fake clock would never reach the ~year-2026
+    // expiration and cache entries would never evict. See ResponseCacheTest for the full rationale.
+    myTimeProvider = new FakeTimeProvider(DateTimeOffset.UtcNow);
     myHost = new HostBuilder()
       .ConfigureWebHost(webHostBuilder =>
       {
@@ -785,14 +789,34 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
     await myServer.CreateRequest("/real/a.jar").GetAsync();
     var cachedFile = Assert.Single(GetFiles());
     File.SetLastAccessTimeUtc(cachedFile, myTimeProvider.Start.UtcDateTime);
+
+    // Within the retention period: advancing by half of it must not delete the freshly-accessed file.
     myTimeProvider.Advance(myConfig.CleanupPeriod / 2);
+    await DrainAsync();
     Assert.Single(GetFiles());
-    myTimeProvider.Advance(myConfig.CleanupPeriod / 2 + TimeSpan.FromSeconds(1));
-    await Task.Delay(TimeSpan.FromSeconds(1)); // wait for file deletion
+
+    // Past the retention period: the cron-driven cleanup runs on a background task whose cutoff is
+    // computed from GetUtcNow() when its FakeTimeProvider timer continuation runs. Advance a cron
+    // period at a time and let that continuation run, polling until the now-expired file is deleted.
+    // Polling (rather than a single fixed delay) keeps this independent of the wall-clock hour the
+    // test starts at and of the timer-scheduling race between advances.
+    for (var i = 0; i < 10 && GetFiles().Any(); i++)
+    {
+      myTimeProvider.Advance(myConfig.CleanupPeriod);
+      await DrainAsync();
+    }
     Assert.Empty(GetFiles());
     return;
+
     IEnumerable<string> GetFiles() =>
       Directory.EnumerateFiles(myConfig.LocalCachePath, "*", SearchOption.AllDirectories);
+
+    // Yield repeatedly so the background cleanup loop's continuation can run after a clock change.
+    static async Task DrainAsync()
+    {
+      for (var i = 0; i < 20; i++)
+        await Task.Delay(TimeSpan.FromMilliseconds(25));
+    }
   }
 
   private async Task AssertGetResponse(string url, HttpStatusCode expectedCode, Action<HttpResponseMessage, byte[]> assertions)

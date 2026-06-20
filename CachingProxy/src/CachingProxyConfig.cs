@@ -14,8 +14,15 @@ public class CachingProxyConfig
     public TimeSpan CacheOffsetDuration { get; init; } = TimeSpan.FromSeconds(5);
   }
 
+  public record RedisConfig(string? ConnectionString = null)
+  {
+    // Optional key prefix, useful when several apps share one Redis instance.
+    public string? InstanceName { get; init; }
+  }
+
   public CachingProxyPrefix[] Prefixes { get; init; } = [];
   public S3Config? S3 { get; init; }
+  public RedisConfig? Redis { get; init; }
   public string LocalCachePath { get; init; } = Path.Combine(Path.GetTempPath(), "artifacts-caching-proxy");
   public string? BlacklistUrlRegex { get; init; }
   public long MinimumFreeDiskSpaceMb { get; init; } = 2048;
