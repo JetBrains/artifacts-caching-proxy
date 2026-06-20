@@ -37,4 +37,10 @@ public class CachingProxyConfig
   public TimeSpan CleanupPeriod { get; init; } = TimeSpan.FromDays(7);
 
   public CacheDuration CacheDuration { get; init; } = new();
+
+  // Global per-status TTLs for the L2 (distributed/Redis) cache, mirroring CacheDuration (same
+  // defaults). Configured globally only, never per prefix. The effective L2 duration for a status
+  // code is max(L1, L2): L2 is never shorter than L1, so the durable backing store never expires
+  // before the in-process copy.
+  public CacheDuration DistributedCacheDuration { get; init; } = new();
 }

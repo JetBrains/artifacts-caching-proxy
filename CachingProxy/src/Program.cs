@@ -123,7 +123,7 @@ public static class Program
 
     // Opt-in L2 (distributed) cache: wired only when a Redis connection string is configured, so
     // disk/dev runs stay L1-only with no Redis dependency. Mirrors the S3 conditional below. The
-    // DistributedCacheDuration already set in ResponseCache.PutStatusCode takes effect once this runs.
+    // per-status DistributedCacheDuration applied in ResponseCache.PutStatusCode takes effect once this runs.
     var redis = configuration.Get<CachingProxyConfig>()?.Redis;
     if (!string.IsNullOrEmpty(redis?.ConnectionString))
     {

@@ -60,7 +60,7 @@ public sealed record CachedResponse(HttpStatusCode StatusCode, IHeaderDictionary
   public static readonly CachedResponse Blacklisted = new(HttpStatusCode.NotFound, new HeaderDictionary(), [.. "Blacklisted"u8]);
 }
 
-public class ResponseCache(IFusionCache cache, TimeProvider timeProvider)
+public class ResponseCache(IFusionCache cache, TimeProvider timeProvider, CachingProxyConfig config)
 {
   public ValueTask<CachedResponse?> GetCachedStatusCode(string cacheKey, CancellationToken cancellationToken = default) =>
     cache.GetOrDefaultAsync<CachedResponse>(cacheKey, token: cancellationToken);
@@ -71,10 +71,10 @@ public class ResponseCache(IFusionCache cache, TimeProvider timeProvider)
   public async ValueTask<CachedResponse> PutStatusCode(string cacheKey, CachedResponse entry, CacheDuration cacheDuration, CancellationToken cancellationToken = default)
   {
     var cachingTime = cacheDuration.GetDuration(entry.StatusCode);
-    // A 200 OK is an immutable, fully resolved artifact: keep its shared L2 (Redis) copy alive
-    // twice as long as the per-instance L1 copy, so that once L1 expires an instance can repopulate
-    // from L2 instead of going back upstream.
-    var distributedCachingTime = entry.StatusCode == HttpStatusCode.OK ? cachingTime * 2 : cachingTime;
+    // L2 (distributed/Redis) TTL is controlled by the global DistributedCacheDuration, but it is never
+    // allowed to be shorter than the L1 TTL: the durable backing store must outlive the in-process copy.
+    var l2CachingTime = config.DistributedCacheDuration.GetDuration(entry.StatusCode);
+    var distributedCachingTime = l2CachingTime > cachingTime ? l2CachingTime : cachingTime;
     entry.Headers[CachingProxyConstants.CachedStatusHeader] = entry.StatusCode.ToString("D");
     entry.Headers[CachingProxyConstants.CachedUntilHeader] = (timeProvider.GetUtcNow() + cachingTime).ToString("R");
 

@@ -32,7 +32,7 @@ public class ResponseCacheTest
       Clock = new TimeProviderClock(_timeProvider)
     });
     var fusionCache = new FusionCache(new FusionCacheOptions(), memoryCache);
-    _cache = new ResponseCache(fusionCache, _timeProvider);
+    _cache = new ResponseCache(fusionCache, _timeProvider, new CachingProxyConfig());
   }
 
   [Fact]
