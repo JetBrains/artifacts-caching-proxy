@@ -71,13 +71,17 @@ public class ResponseCache(IFusionCache cache, TimeProvider timeProvider)
   public async ValueTask<CachedResponse> PutStatusCode(string cacheKey, CachedResponse entry, CacheDuration cacheDuration, CancellationToken cancellationToken = default)
   {
     var cachingTime = cacheDuration.GetDuration(entry.StatusCode);
+    // A 200 OK is an immutable, fully resolved artifact: keep its shared L2 (Redis) copy alive
+    // twice as long as the per-instance L1 copy, so that once L1 expires an instance can repopulate
+    // from L2 instead of going back upstream.
+    var distributedCachingTime = entry.StatusCode == HttpStatusCode.OK ? cachingTime * 2 : cachingTime;
     entry.Headers[CachingProxyConstants.CachedStatusHeader] = entry.StatusCode.ToString("D");
     entry.Headers[CachingProxyConstants.CachedUntilHeader] = (timeProvider.GetUtcNow() + cachingTime).ToString("R");
 
     await cache.SetAsync(cacheKey, entry, new FusionCacheEntryOptions
     {
       MemoryCacheDuration = cachingTime,
-      DistributedCacheDuration = cachingTime,
+      DistributedCacheDuration = distributedCachingTime,
     }, token: cancellationToken);
     return entry;
   }
