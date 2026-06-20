@@ -11,14 +11,17 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.Caching.StackExchangeRedis;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using OpenTelemetry.Metrics;
 using OpenTelemetry.Resources;
 using Polly;
+using StackExchange.Redis;
 using ZiggyCreatures.Caching.Fusion;
 using ZiggyCreatures.Caching.Fusion.Serialization.CysharpMemoryPack;
 
@@ -128,12 +131,22 @@ public static class Program
       // custom formatter (registered globally) maps it to/from a serializable surrogate.
       CachedResponseFormatter.Register();
 
-      services.AddStackExchangeRedisCache(options =>
-      {
-        options.Configuration = redis.ConnectionString;
-        if (!string.IsNullOrEmpty(redis.InstanceName))
-          options.InstanceName = redis.InstanceName;
-      });
+      // Single shared connection used by both the L2 cache and the health check below. Resolves
+      // lazily (on first cache/health-check use), so startup is not blocked on connecting to Redis.
+      services.AddSingleton<IConnectionMultiplexer>(
+        _ => ConnectionMultiplexer.Connect(redis.ConnectionString));
+
+      services.AddStackExchangeRedisCache(_ => { });
+      services.AddOptions<RedisCacheOptions>()
+        .Configure<IConnectionMultiplexer>((options, mux) =>
+        {
+          options.ConnectionMultiplexerFactory = () => Task.FromResult(mux);
+          if (!string.IsNullOrEmpty(redis.InstanceName))
+            options.InstanceName = redis.InstanceName;
+        });
+
+      services.AddHealthChecks()
+        .AddRedis(sp => sp.GetRequiredService<IConnectionMultiplexer>(), failureStatus: HealthStatus.Degraded, name: "redis");
 
       fusionCacheBuilder
         .WithSerializer(new FusionCacheCysharpMemoryPackSerializer())

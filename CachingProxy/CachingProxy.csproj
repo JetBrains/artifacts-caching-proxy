@@ -11,6 +11,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="AspNetCore.HealthChecks.Redis" />
     <PackageReference Include="AWSSDK.Extensions.NETCore.Setup" />
     <PackageReference Include="AWSSDK.S3" />
     <PackageReference Include="AWSSDK.SSO" />
