@@ -154,12 +154,11 @@ public static class Program
           // AWSOptions resolves the configured profile (including SSO) into credentials when the client is
           // created, so a named profile and the default credential chain go through the same registration.
           var awsOptions = provider.GetRequiredService<IConfiguration>().GetAWSOptions();
-          // S3 answers sustained write load with "SlowDown" (HTTP 503). Adaptive retry adds Standard's
-          // jittered exponential backoff plus a client-side rate limiter that paces requests when it
-          // observes throttling — the AWS-recommended response to SlowDown. Raise MaxErrorRetry so brief
+          // S3 answers sustained write load with "SlowDown" (HTTP 503). Standard retry handles this with
+          // jittered exponential backoff (no client-side rate limiter). Raise MaxErrorRetry so brief
           // throttling bursts are absorbed by the SDK instead of escaping to the client. (Applies to the
           // whole client, so the prefetch GetObject is protected too, not just PutObject.)
-          awsOptions.DefaultClientConfig.RetryMode = RequestRetryMode.Adaptive;
+          awsOptions.DefaultClientConfig.RetryMode = RequestRetryMode.Standard;
           awsOptions.DefaultClientConfig.MaxErrorRetry = 8;
           return awsOptions;
         })

@@ -185,9 +185,6 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
         case AmazonServiceException ase:
           logger.LogError(Event.FailedToCacheInS3,"Failed to cache {RequestPath} with S3 error {s3ErrorCode}: {s3ErrorMessage}", context.Request.Path, ase.ErrorCode, ase.Message);
           break;
-        case AmazonClientException ace:
-          logger.LogError(Event.FailedToCacheInS3,"Failed to cache {RequestPath} with S3 error {s3ErrorMessage}", context.Request.Path, ace.Message);
-          break;
         default:
           logger.LogError(Event.FailedToCacheInS3, e, "Failed to cache {RequestPath}", context.Request.Path);
           break;
