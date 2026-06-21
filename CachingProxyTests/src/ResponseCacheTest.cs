@@ -1,10 +1,13 @@
 using System;
 using System.Net;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.Options;
 using Microsoft.Extensions.Time.Testing;
 using Xunit;
 using ZiggyCreatures.Caching.Fusion;
+using ZiggyCreatures.Caching.Fusion.Serialization.CysharpMemoryPack;
 
 namespace JetBrains.CachingProxy.Tests;
 
@@ -272,5 +275,35 @@ public class ResponseCacheTest
     // Should be expired just after the 1-hour mark
     _timeProvider.Advance(TimeSpan.FromMinutes(30) + TimeSpan.FromSeconds(1));
     Assert.Null(await _cache.GetCachedStatusCode(key));
+  }
+
+  [Fact]
+  public async Task CachedUntilHeader_UsesDistributedDuration_WhenL2IsWired()
+  {
+    // When a distributed (L2) cache is configured, the durable lifetime is the (longer) L2 TTL:
+    // the entry survives L1 eviction and keeps being served from L2 until then. The Cached-Until
+    // header must report that durable expiration, not the shorter L1 duration -- otherwise it goes
+    // stale (a timestamp in the past) once the in-memory copy is evicted but the entry is re-served.
+    var memoryCache = new MemoryCache(new MemoryCacheOptions
+    {
+      Clock = new TimeProviderClock(_timeProvider)
+    });
+    CachedResponseFormatter.Register();
+    var fusionCache = new FusionCache(new FusionCacheOptions(), memoryCache);
+    fusionCache.SetupDistributedCache(
+      new MemoryDistributedCache(Options.Create(new MemoryDistributedCacheOptions())),
+      new FusionCacheCysharpMemoryPackSerializer());
+
+    var l1Duration = new CacheDuration { [HttpStatusCode.OK] = TimeSpan.FromMinutes(5) };
+    var config = new CachingProxyConfig
+    {
+      DistributedCacheDuration = new CacheDuration { [HttpStatusCode.OK] = TimeSpan.FromMinutes(10) }
+    };
+    var cache = new ResponseCache(fusionCache, _timeProvider, config);
+
+    var entry = await cache.PutStatusCode("test-key", HttpStatusCode.OK, l1Duration);
+
+    var expected = (_timeProvider.GetUtcNow() + TimeSpan.FromMinutes(10)).ToString("R");
+    Assert.Equal(expected, entry.Headers[CachingProxyConstants.CachedUntilHeader].ToString());
   }
 }
