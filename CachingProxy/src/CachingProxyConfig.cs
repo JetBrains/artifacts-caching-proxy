@@ -12,6 +12,12 @@ public class CachingProxyConfig
     // Added to the S3 redirect cache duration so a presigned link stays valid slightly longer than the
     // cached redirect itself, avoiding a race where the link expires right as the redirect is replayed.
     public TimeSpan CacheOffsetDuration { get; init; } = TimeSpan.FromSeconds(5);
+
+    // Objects whose body fits within this many bytes are probed in a single ranged GET and served
+    // inline (200 + body, cached in L1/L2); larger objects are redirected to S3. Raising it trades
+    // more probe bandwidth and cache footprint for fewer client round-trips on small/medium artifacts
+    // (e.g. dependency metadata). Hosts have ample RAM headroom; the cost dimension is the L2 cache.
+    public int InlineThresholdBytes { get; init; } = 32 * 1024;
   }
 
   public record RedisConfig(string? ConnectionString = null)

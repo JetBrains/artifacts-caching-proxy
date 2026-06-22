@@ -21,7 +21,10 @@ namespace JetBrains.CachingProxy;
 [SuppressMessage("ReSharper", "ClassNeverInstantiated.Global")]
 public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amazonS3, CachingProxyConfig config, RemoteProxy remoteProxy, ResponseCache responseCache, TimeProvider timeProvider, ILogger<S3CachingMiddleware>  logger)
 {
-  private static readonly ByteRange ourPrefetchSize = new(0, 16 * 1024 - 1);
+  // The ranged-probe window: a body that fits is served inline, a larger one is redirected. Sized from
+  // S3.InlineThresholdBytes (default 32 KiB). config.S3 is non-null here — the middleware is only wired
+  // when S3.BucketName is set (see Program.ConfigureOurApp).
+  private readonly ByteRange myPrefetchSize = new(0, config.S3!.InlineThresholdBytes - 1);
 
   // Single-flight coalescing of S3 misses, partitioned by the object key's "aa/bb" prefix (see
   // ManglePath) rather than by the full key. Each prefix-partition is a single-permit concurrency
@@ -109,7 +112,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
           {
             BucketName = config.S3!.BucketName,
             Key = s3Key,
-            ByteRange = ourPrefetchSize
+            ByteRange = myPrefetchSize
           }, context.RequestAborted);
 
           // Did the probe return the whole object, or only the first slice? Decide purely from

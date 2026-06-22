@@ -29,21 +29,27 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
 {
   private const string BucketName = "test-bucket";
 
-  // An object larger than the middleware's prefetch window (16 KiB) is redirected rather than
-  // served inline; an object that fits inside the window is read and served from memory.
+  // The prefetch window these tests pin via CreateServer, independent of the production default
+  // (S3Config.InlineThresholdBytes) so raising that default never silently flips the inline/redirect
+  // expectations below. Objects up to this size inline; larger ones redirect.
+  private const int TestInlineThresholdBytes = 16 * 1024;
+
+  // 32 KiB: larger than the pinned test window (so it redirects in most tests), and exactly a raised
+  // 32 KiB window (so Inline_Threshold_Is_Configurable inlines it).
   private static readonly byte[] ourLargeBody = new byte[32 * 1024];
 
   private readonly FakeAmazonS3 myS3 = new();
   private readonly List<IHost> myHosts = [];
   private readonly RemoteServers.RemoteServer myRemoteServer = new("/real", upstreamServer.Url, new CacheDuration());
 
-  private TestServer CreateServer(bool signedLinks, TimeSpan? cacheOffsetDuration = null)
+  private TestServer CreateServer(bool signedLinks, TimeSpan? cacheOffsetDuration = null, int inlineThresholdBytes = TestInlineThresholdBytes)
   {
     var config = new CachingProxyConfig
     {
       S3 = new CachingProxyConfig.S3Config(BucketName, signedLinks)
       {
         CacheOffsetDuration = cacheOffsetDuration ?? TimeSpan.FromSeconds(5),
+        InlineThresholdBytes = inlineThresholdBytes,
       },
       Prefixes = [$"/real={upstreamServer.Url}"],
     };
@@ -211,11 +217,11 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   [Fact]
   public async Task Object_Exactly_Prefetch_Window_Size_Is_Inlined()
   {
-    // Boundary: an object whose size equals the 16 KiB prefetch window is fully returned by the
-    // probe (received bytes == total), so it must be inlined — not redirected. A "last byte <
-    // window end" check would wrongly redirect at exactly this size.
+    // Boundary: an object whose size equals the prefetch window is fully returned by the probe
+    // (received bytes == total), so it must be inlined — not redirected. A "last byte < window end"
+    // check would wrongly redirect at exactly this size.
     var server = CreateServer(signedLinks: true);
-    var exact = new byte[16 * 1024];
+    var exact = new byte[TestInlineThresholdBytes];
     myS3.Objects[GetPathKey("/real/a.jar")] = (exact, "application/java-archive", null);
 
     using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
@@ -225,6 +231,23 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     Assert.Null(response.Headers.Location);
     Assert.Equal(exact.Length, (await response.Content.ReadAsByteArrayAsync()).Length);
     Assert.Equal(0, myS3.PutObjectCalls);
+  }
+
+  [Fact]
+  public async Task Inline_Threshold_Is_Configurable()
+  {
+    // Raising S3.InlineThresholdBytes widens the inline window: a 32 KiB object that would redirect at
+    // the default test window is instead served inline (200 + full body) once the window is 32 KiB.
+    var server = CreateServer(signedLinks: false, inlineThresholdBytes: 32 * 1024);
+    myS3.Objects[GetPathKey("/real/a.jar")] = (ourLargeBody, "application/java-archive", null);
+
+    using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
+
+    Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    AssertStatusHeader(response, CachingProxyStatus.MISS);
+    Assert.Null(response.Headers.Location); // inlined, not redirected
+    Assert.Equal(ourLargeBody.Length, (await response.Content.ReadAsByteArrayAsync()).Length);
+    Assert.Equal(0, myS3.PutObjectCalls); // already in the bucket, served straight from the probe
   }
 
   [Fact]
