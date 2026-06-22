@@ -71,6 +71,9 @@ public class ResponseCache(IFusionCache cache, TimeProvider timeProvider, Cachin
   public async ValueTask<CachedResponse> PutStatusCode(string cacheKey, CachedResponse entry, CacheDuration cacheDuration, CancellationToken cancellationToken = default)
   {
     var cachingTime = cacheDuration.GetDuration(entry.StatusCode);
+    if (cachingTime == TimeSpan.Zero)
+      return entry;
+
     // L2 (distributed/Redis) TTL is controlled by the global DistributedCacheDuration, but it is never
     // allowed to be shorter than the L1 TTL: the durable backing store must outlive the in-process copy.
     var l2CachingTime = config.DistributedCacheDuration.GetDuration(entry.StatusCode);

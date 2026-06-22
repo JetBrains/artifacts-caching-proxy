@@ -66,6 +66,16 @@ public class UpstreamTestServer : IAsyncLifetime
         res.StatusCode = StatusCodes.Status500InternalServerError;
         return res.WriteAsync("Some Error");
       })
+      .MapGet("401.jar", (req, res, data) =>
+      {
+        res.StatusCode = StatusCodes.Status401Unauthorized;
+        return res.WriteAsync("Unauthorized");
+      })
+      .MapGet("402.jar", (req, res, data) =>
+      {
+        res.StatusCode = StatusCodes.Status402PaymentRequired;
+        return res.WriteAsync("Payment Required");
+      })
       .MapGet("403.jar", (req, res, data) =>
       {
         res.StatusCode = StatusCodes.Status403Forbidden;

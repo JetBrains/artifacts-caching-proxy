@@ -277,6 +277,47 @@ public class ResponseCacheTest
     Assert.Null(await _cache.GetCachedStatusCode(key));
   }
 
+  [Theory]
+  [InlineData(HttpStatusCode.Unauthorized)]
+  [InlineData(HttpStatusCode.PaymentRequired)]
+  [InlineData(HttpStatusCode.Forbidden)]
+  public async Task CacheEntry_ZeroDurationStatusCodes_AreNotCached(HttpStatusCode statusCode)
+  {
+    // Auth / access errors have a zero cache duration: they must never be stored, so every request
+    // re-probes upstream. PutStatusCode returns immediately without writing to the cache.
+    const string key = "test-key";
+    await _cache.PutStatusCode(key, statusCode, _cacheDuration);
+
+    Assert.Null(await _cache.GetCachedStatusCode(key));
+  }
+
+  [Fact]
+  public async Task CacheEntry_ZeroDuration_EntryReturnedWithoutBookkeepingHeaders()
+  {
+    // A non-cached entry is returned verbatim, without the proxy bookkeeping headers that only make
+    // sense for a stored entry (there is no cache expiration to report).
+    const string key = "test-key";
+    var entry = await _cache.PutStatusCode(key, HttpStatusCode.Forbidden, _cacheDuration);
+
+    Assert.False(entry.Headers.ContainsKey(CachingProxyConstants.CachedStatusHeader));
+    Assert.False(entry.Headers.ContainsKey(CachingProxyConstants.CachedUntilHeader));
+  }
+
+  [Fact]
+  public async Task CustomCacheDuration_ZeroDurationOverride_DisablesCachingForOk()
+  {
+    // Caching is driven purely by the duration, not by a hardcoded status list: a custom zero
+    // duration for an otherwise-cacheable 200 disables caching for it too.
+    const string key = "test-key";
+    var customDuration = _cacheDuration.Union(new CacheDuration
+    {
+      [HttpStatusCode.OK] = TimeSpan.Zero,
+    });
+    await _cache.PutStatusCode(key, HttpStatusCode.OK, customDuration);
+
+    Assert.Null(await _cache.GetCachedStatusCode(key));
+  }
+
   [Fact]
   public async Task CachedUntilHeader_UsesDistributedDuration_WhenL2IsWired()
   {

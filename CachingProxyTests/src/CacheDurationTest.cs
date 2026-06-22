@@ -49,4 +49,15 @@ public class CacheDurationTest
     // BadGateway is in neither the defaults nor any override.
     Assert.Equal(TimeSpan.FromMinutes(1), new CacheDuration().GetDuration(HttpStatusCode.BadGateway));
   }
+
+  [Theory]
+  [InlineData(HttpStatusCode.Unauthorized)]
+  [InlineData(HttpStatusCode.PaymentRequired)]
+  [InlineData(HttpStatusCode.Forbidden)]
+  public void GetDuration_AuthAndAccessErrors_ReturnZero(HttpStatusCode statusCode)
+  {
+    // Auth / access errors are non-cacheable by default: a zero duration tells ResponseCache to skip
+    // storing them so each request re-probes upstream.
+    Assert.Equal(TimeSpan.Zero, new CacheDuration().GetDuration(statusCode));
+  }
 }

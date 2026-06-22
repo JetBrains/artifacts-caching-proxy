@@ -11,6 +11,9 @@ public class CacheDuration : Dictionary<HttpStatusCode, TimeSpan>
   {
     // Clear reply from a server
     this[HttpStatusCode.OK] = TimeSpan.FromMinutes(5);
+    this[HttpStatusCode.Unauthorized] = TimeSpan.Zero;
+    this[HttpStatusCode.PaymentRequired] = TimeSpan.Zero;
+    this[HttpStatusCode.Forbidden] = TimeSpan.Zero;
     this[HttpStatusCode.NotFound] = TimeSpan.FromMinutes(5);
   }
 

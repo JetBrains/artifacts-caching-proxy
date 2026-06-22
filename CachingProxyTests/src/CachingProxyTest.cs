@@ -639,26 +639,24 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
       });
   }
 
-  [Fact]
-  public async Task Remote_Forbidden()
+  [Theory]
+  [InlineData("/real/401.jar", HttpStatusCode.Unauthorized)]
+  [InlineData("/real/402.jar", HttpStatusCode.PaymentRequired)]
+  [InlineData("/real/403.jar", HttpStatusCode.Forbidden)]
+  public async Task Remote_AuthErrors_AreSurfacedVerbatim_AndNeverNegativelyCached(string url, HttpStatusCode status)
   {
-    // Authentication / access errors must be surfaced to the client verbatim (not masked to 404),
-    // both on the live miss and on the replayed negative-cache hit.
-    await AssertGetResponse("/real/403.jar", HttpStatusCode.Forbidden,
-      (message, bytes) =>
-      {
-        AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_MISS);
-        AssertCachedStatusHeader(message, HttpStatusCode.Forbidden);
-        Assert.Null(message.Headers.CacheControl);
-      });
-
-    await AssertGetResponse("/real/403.jar", HttpStatusCode.Forbidden,
-      (message, bytes) =>
-      {
-        AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_HIT);
-        AssertCachedStatusHeader(message, HttpStatusCode.Forbidden);
-        Assert.Null(message.Headers.CacheControl);
-      });
+    // Authentication / access errors must be surfaced to the client verbatim (not masked to 404).
+    // They are also never negatively cached (their cache duration is zero): every request re-probes
+    // upstream, so both requests are live NEGATIVE_MISS responses and neither carries the
+    // Cached-Status header (the entry is never stored).
+    for (var i = 0; i < 2; i++)
+      await AssertGetResponse(url, status,
+        (message, bytes) =>
+        {
+          AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_MISS);
+          AssertNoCachedStatusHeader(message);
+          Assert.Null(message.Headers.CacheControl);
+        });
   }
 
   [Fact]
@@ -881,6 +879,14 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
     if (response.Headers.TryGetValues(CachingProxyConstants.StatusHeader, out var headers))
     {
       throw new Exception($"Expected no {CachingProxyConstants.StatusHeader} header, but got: " + string.Join(", ", headers));
+    }
+  }
+
+  private static void AssertNoCachedStatusHeader(HttpResponseMessage response)
+  {
+    if (response.Headers.TryGetValues(CachingProxyConstants.CachedStatusHeader, out var headers))
+    {
+      throw new Exception($"Expected no {CachingProxyConstants.CachedStatusHeader} header, but got: " + string.Join(", ", headers));
     }
   }
 
