@@ -17,6 +17,7 @@
     <PackageReference Include="AWSSDK.SSO" />
     <PackageReference Include="AWSSDK.SSOOIDC" />
     <PackageReference Include="Cronos" />
+    <PackageReference Include="Duende.AccessTokenManagement" />
     <PackageReference Include="Microsoft.Extensions.Caching.StackExchangeRedis" />
     <PackageReference Include="Microsoft.Extensions.Http.Polly" />
     <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" />

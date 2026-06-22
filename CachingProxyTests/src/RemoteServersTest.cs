@@ -1,3 +1,4 @@
+using System;
 using System.Linq;
 using Xunit;
 
@@ -44,5 +45,31 @@ public class RemoteServersTest
   {
     var server = Assert.Single(Build("/p=http://example.org/sub"));
     Assert.Equal("http://example.org/sub/", server.RemoteUri.ToString());
+  }
+
+  [Fact]
+  public void Upstream_Auth_Matches_By_Longest_Url_Prefix()
+  {
+    var hostWide = new UpstreamAuth { UrlPrefix = "https://repo.example.com/", TokenEndpoint = new Uri("https://repo.example.com/"), ClientId = "host", ClientSecret = "" };
+    var pathScoped = new UpstreamAuth { UrlPrefix = "https://repo.example.com/secure/", TokenEndpoint = new Uri("https://repo.example.com/"), ClientSecret = "", ClientId = "scoped" };
+
+    var config = new CachingProxyConfig
+    {
+      Prefixes =
+      [
+        "/a=repo.example.com/maven",        // → host-wide entry
+        "/b=repo.example.com/secure/maven", // → longer, more specific entry wins
+        "/c=other.example.com",             // → no match
+      ],
+      UpstreamAuth = [hostWide, pathScoped],
+    };
+
+    var servers = new RemoteServers(config).Endpoints
+      .Select(e => e.Metadata.GetMetadata<RemoteServers.RemoteServer>()!)
+      .ToArray();
+
+    Assert.Same(hostWide, servers.Single(s => s.Prefix == "/a").Auth);
+    Assert.Same(pathScoped, servers.Single(s => s.Prefix == "/b").Auth);
+    Assert.Null(servers.Single(s => s.Prefix == "/c").Auth);
   }
 }

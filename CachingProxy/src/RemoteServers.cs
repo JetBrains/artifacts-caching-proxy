@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
@@ -25,10 +26,10 @@ public class RemoteServers : EndpointDataSource
 
       var target = index < 0 ? trimmed : trimmed[(index + 1)..];
       target = target.TrimEnd('/') + '/';
-      var remoteServer = new RemoteServer(trimmedPrefix,
-        Uri.TryCreate(target, UriKind.Absolute, out var targetUri) ? targetUri :
-          new Uri(Uri.UriSchemeHttps + Uri.SchemeDelimiter + target, UriKind.Absolute),
-            config.CacheDuration.Union(prefix.CacheDuration));
+      var remoteUri = Uri.TryCreate(target, UriKind.Absolute, out var targetUri) ? targetUri :
+        new Uri(Uri.UriSchemeHttps + Uri.SchemeDelimiter + target, UriKind.Absolute);
+      var remoteServer = new RemoteServer(trimmedPrefix, remoteUri,
+        config.CacheDuration.Union(prefix.CacheDuration), MatchAuth(remoteUri, config.UpstreamAuth));
 
       // Overlapping prefixes (e.g. "/aprefix" and "/aprefix/too") both match via their {**path}
       // catch-all, and routing breaks such ties by Endpoint.Order, NOT by specificity. So order by
@@ -48,13 +49,22 @@ public class RemoteServers : EndpointDataSource
 
   private const string ourPathParameterName = "path";
 
+  // Among the auth entries whose UrlPrefix is a prefix of the upstream URL, the longest (most
+  // specific) one wins, so a host-wide block and a path-scoped block can coexist. Returns null when
+  // nothing matches, leaving the upstream unauthenticated.
+  private static UpstreamAuth? MatchAuth(Uri remoteUri, UpstreamAuth[] auths) =>
+    auths
+      .Where(a => remoteUri.AbsoluteUri.StartsWith(a.UrlPrefix, StringComparison.OrdinalIgnoreCase))
+      .OrderByDescending(a => a.UrlPrefix.Length)
+      .FirstOrDefault();
+
   public static RemoteServer? GetRemoteServer(HttpContext context, out string? path)
   {
     path = context.GetRouteValue(ourPathParameterName)?.ToString();
     return context.GetEndpoint()?.Metadata.GetMetadata<RemoteServer>();
   }
 
-  public record RemoteServer(PathString Prefix, Uri RemoteUri, CacheDuration CacheDuration)
+  public record RemoteServer(PathString Prefix, Uri RemoteUri, CacheDuration CacheDuration, UpstreamAuth? Auth = null)
   {
     public Uri GetUpstreamUri(string? remainingPath) =>
       string.IsNullOrEmpty(remainingPath) ? RemoteUri : new Uri(RemoteUri, remainingPath);

@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 using Amazon.Extensions.NETCore.Setup;
 using Amazon.Runtime;
 using Amazon.S3;
+using Duende.AccessTokenManagement;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.StaticFiles;
@@ -206,6 +207,28 @@ public static class Program
         .AddHostedService<CleanupService>()
         .AddHealthChecks()
         .AddCheck<CachingProxy.HealthCheck>(nameof(CachingProxy));
+    }
+
+    // Per-upstream OAuth client-credentials auth. One token-management client per UpstreamAuth entry,
+    // named by its UrlPrefix so IClientCredentialsTokenManager.GetUpstreamAuthorizationHeaderAsync can
+    // look the token up by the same key. Registered only when something is configured, so unauthenticated
+    // deployments pull in nothing extra (RemoteProxy resolves the token manager optionally). The token
+    // manager defaults to authenticating the client on the token endpoint with HTTP Basic.
+    var upstreamAuth = configuration.Get<CachingProxyConfig>()?.UpstreamAuth ?? [];
+    if (upstreamAuth.Length > 0)
+    {
+      var tokenManagement = services.AddClientCredentialsTokenManagement();
+      foreach (var auth in upstreamAuth)
+      {
+        tokenManagement.AddClient(auth.ClientId, client =>
+        {
+          client.TokenEndpoint = auth.TokenEndpoint;
+          client.ClientId = ClientId.Parse(auth.ClientId);
+          client.ClientSecret = ClientSecret.Parse(auth.ClientSecret);
+          if (!string.IsNullOrEmpty(auth.Scope))
+            client.Scope = Scope.Parse(auth.Scope);
+        });
+      }
     }
 
     services

@@ -27,6 +27,12 @@ public class CachingProxyConfig
   }
 
   public CachingProxyPrefix[] Prefixes { get; init; } = [];
+
+  // OAuth client-credentials auth for private upstreams, matched to each prefix by longest URL
+  // prefix (see RemoteServers). Empty by default: upstreams without a matching entry are requested
+  // unauthenticated, exactly as before.
+  public UpstreamAuth[] UpstreamAuth { get; init; } = [];
+
   public S3Config? S3 { get; init; }
   public RedisConfig? Redis { get; init; }
   public string LocalCachePath { get; init; } = Path.Combine(Path.GetTempPath(), "artifacts-caching-proxy");

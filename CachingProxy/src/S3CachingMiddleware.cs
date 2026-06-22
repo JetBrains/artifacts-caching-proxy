@@ -159,7 +159,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
         catch (AmazonServiceException ex) when (ex.StatusCode is HttpStatusCode.NotFound) { }
       }
 
-      using var response = await remoteProxy.ProcessAsync(context, s3Key, remoteServer.CacheDuration, upstreamUri);
+      using var response = await remoteProxy.ProcessAsync(context, s3Key, remoteServer.CacheDuration, upstreamUri, auth: remoteServer.Auth);
 
       // A non-null response is a GET MISS body for us to stream and persist; otherwise it is handled.
       if (response == null) return;

@@ -6,6 +6,7 @@ using System.Net.Http;
 using System.Net.Mime;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
+using Duende.AccessTokenManagement;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
 
@@ -24,7 +25,8 @@ public partial class RemoteProxy(
   ProxyHttpClient httpClient,
   ResponseCache responseCache,
   CachingProxyMetrics metrics,
-  ILogger<RemoteProxy> logger)
+  ILogger<RemoteProxy> logger,
+  IClientCredentialsTokenManager? tokenManager = null)
 {
   [GeneratedRegex(@"^([\x20a-zA-Z_\-0-9./+@]|%[0-9a-fA-F]{2})+$", RegexOptions.Compiled)]
   private static partial Regex OurGoodPathChars { get; }
@@ -100,7 +102,7 @@ public partial class RemoteProxy(
   /// Content-Encoding off the response) and must dispose it; in every other case the request is
   /// fully handled, the response (if any) is disposed internally, and <c>null</c> is returned.
   /// </summary>
-  public async Task<HttpResponseMessage?> ProcessAsync(HttpContext context, string cacheKey, CacheDuration cacheDuration, Uri upstreamUri, string? contentType = null)
+  public async Task<HttpResponseMessage?> ProcessAsync(HttpContext context, string cacheKey, CacheDuration cacheDuration, Uri upstreamUri, string? contentType = null, UpstreamAuth? auth = null)
   {
     var isHead = HttpMethods.IsHead(context.Request.Method);
 
@@ -130,6 +132,10 @@ public partial class RemoteProxy(
       return null;
     }
 
+    // Mutable / non-cacheable paths (SNAPSHOTs, maven-metadata.xml, npm security) are redirected to the
+    // origin with 307 (RedirectKeepVerb) instead of being cached - this holds for authenticated upstreams
+    // too: a 307 preserves the method and the client reuses its own credentials for the origin, so there
+    // is no need to proxy these through (which would wrongly cache mutable content for protected sources).
     var isRedirectToRemoteUrl = myRedirectToRemoteUrlsRegex != null && myRedirectToRemoteUrlsRegex.IsMatch(requestPath);
     if (isRedirectToRemoteUrl)
     {
@@ -151,6 +157,8 @@ public partial class RemoteProxy(
     HttpResponseMessage response;
     try
     {
+      if (tokenManager != null && auth != null)
+        request.Headers.Authorization = await tokenManager.GetUpstreamAuthorizationHeaderAsync(auth, context.RequestAborted);
       response = await httpClient.Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, context.RequestAborted);
     }
     catch (OperationCanceledException canceledException)
@@ -164,6 +172,10 @@ public partial class RemoteProxy(
       var entry = await responseCache.PutStatusCode(cacheKey, HttpStatusCode.GatewayTimeout, cacheDuration, context.RequestAborted);
       await SetStatusAsync(context, CachingProxyStatus.NEGATIVE_MISS, entry with { StatusCode = HttpStatusCode.NotFound });
       return null;
+    }
+    catch (InvalidOperationException e)
+    {
+      return await InternalServerError(context, Event.RemoteProxy, "Remote proxy error", e);
     }
     catch (Exception e)
     {
@@ -193,12 +205,12 @@ public partial class RemoteProxy(
 
       var headersContentEncoding = response.Content.Headers.ContentEncoding;
       if (headersContentEncoding.Count > 1)
-        return await RejectUpstreamEncoding(context, Event.MultipleContentTypes,
+        return await InternalServerError(context, Event.MultipleContentTypes,
           $"{upstreamUri} returned multiple Content-Encoding which is not allowed: {string.Join(", ", headersContentEncoding)}");
 
       var contentEncoding = headersContentEncoding.Count == 0 ? null : headersContentEncoding.Single();
       if (contentEncoding != null && contentEncoding != "gzip")
-        return await RejectUpstreamEncoding(context, Event.NotSupportedContentType,
+        return await InternalServerError(context, Event.NotSupportedContentType,
           $"{upstreamUri} returned Content-Encoding '{contentEncoding}' which is not supported");
 
       var responseEntry = new CachedResponse(response)
@@ -239,9 +251,9 @@ public partial class RemoteProxy(
     metrics.IncrementRequests(status);
   }
 
-  private async Task<HttpResponseMessage?> RejectUpstreamEncoding(HttpContext context, EventId eventId, string message)
+  private async Task<HttpResponseMessage?> InternalServerError(HttpContext context, EventId eventId, string message, Exception? exception = null)
   {
-    logger.LogError(eventId, "{Message}", message);
+    logger.LogError(eventId, exception, "{Message}", message);
     // return 503 Service Unavailable, since the client will most likely not retry it with 5xx error codes
     context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
     context.Response.ContentType = MediaTypeNames.Text.Plain;

@@ -83,7 +83,7 @@ public class CachingProxy
     try
     {
       using var response = await myRemoteProxy.ProcessAsync(context, upstreamUri.ManglePath(),
-        remoteServer.CacheDuration, upstreamUri, contentType);
+        remoteServer.CacheDuration, upstreamUri, contentType, remoteServer.Auth);
 
       // A non-null response is a GET MISS body for us to stream and persist; otherwise it is handled.
       if (response == null) return;
