@@ -3,14 +3,19 @@ using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Reflection;
+using System.Text;
 using System.Threading.Tasks;
 using Amazon.Extensions.NETCore.Setup;
 using Amazon.Runtime;
 using Amazon.S3;
 using Duende.AccessTokenManagement;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.StaticFiles;
+using Microsoft.IdentityModel.Protocols;
+using Microsoft.IdentityModel.Protocols.OpenIdConnect;
+using Microsoft.IdentityModel.Tokens;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Caching.StackExchangeRedis;
 using Microsoft.Extensions.Configuration;
@@ -118,6 +123,7 @@ public static class Program
 
     var fusionCacheBuilder = services
       .AddFusionCache()
+      .AsHybridCache()
       // Use the DI-registered IMemoryCache (configured below with a TimeProvider-backed clock)
       // instead of FusionCache's own internal MemoryCache, so the configured clock actually applies.
       .WithRegisteredMemoryCache();
@@ -231,6 +237,49 @@ public static class Program
       }
     }
 
+    // Inbound JWT bearer validation. Registered only when InboundAuth is configured, so deployments
+    // without inbound auth pull in nothing extra. Issuer/audience/lifetime are validated explicitly;
+    // the signing keys come from the configured JWKS endpoint via a ConfigurationManager that caches
+    // and auto-refreshes them (so key rotation needs no redeploy). The matching AuthorizeAttribute is
+    // attached per prefix in RemoteServers when the prefix's upstream requires auth.
+    var inboundAuth = configuration.Get<CachingProxyConfig>()?.InboundAuth;
+    if (inboundAuth != null)
+    {
+      var jwks = new ConfigurationManager<OpenIdConnectConfiguration>(
+        inboundAuth.JwksUrl.AbsoluteUri,
+        new JwksConfigurationRetriever(),
+        new HttpDocumentRetriever { RequireHttps = inboundAuth.JwksUrl.Scheme == Uri.UriSchemeHttps });
+
+      services
+        .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+        .AddJwtBearer(options =>
+        {
+          options.ConfigurationManager = jwks;
+          options.TokenValidationParameters = new TokenValidationParameters
+          {
+            ValidateIssuer = true,
+            ValidIssuer = inboundAuth.Issuer,
+            ValidateAudience = true,
+            ValidAudience = inboundAuth.Audience,
+            ValidateIssuerSigningKey = true,
+            ValidateLifetime = true,
+            RequireExpirationTime = inboundAuth.RequireExpiration,
+          };
+          // Accept the JWT carried as the HTTP Basic password too, not just "Authorization: Bearer
+          // <jwt>". Clients that only speak Basic (Maven/Gradle/npm) put the token in the password.
+          options.Events = new JwtBearerEvents
+          {
+            OnMessageReceived = context =>
+            {
+              if (string.IsNullOrEmpty(context.Token))
+                context.Token = GetTokenFromBasicPassword(context.Request.Headers.Authorization.ToString());
+              return Task.CompletedTask;
+            },
+          };
+        });
+      services.AddAuthorization();
+    }
+
     services
       .AddHttpClient<ProxyHttpClient>(static (provider, client) =>
       {
@@ -266,11 +315,41 @@ public static class Program
     return services;
   }
 
+  // Extracts the password from an "Authorization: Basic base64(user:password)" header, used to accept
+  // a JWT that a Basic-only client (Maven/Gradle/npm) sent as the password. Returns null when the
+  // header is absent, not Basic, malformed, or carries no password.
+  private static string? GetTokenFromBasicPassword(string? authorizationHeader)
+  {
+    if (!AuthenticationHeaderValue.TryParse(authorizationHeader, out var header) ||
+        !"Basic".Equals(header.Scheme, StringComparison.OrdinalIgnoreCase) ||
+        header.Parameter is not { Length: > 0 } parameter)
+      return null;
+
+    try
+    {
+      var decoded = Encoding.UTF8.GetString(Convert.FromBase64String(parameter));
+      var separator = decoded.IndexOf(':');
+      return separator >= 0 && separator < decoded.Length - 1 ? decoded[(separator + 1)..] : null;
+    }
+    catch (FormatException)
+    {
+      return null;
+    }
+  }
+
   public static void ConfigureOurApp(this IApplicationBuilder app, IConfiguration configuration)
   {
     var cachingProxyConfig = configuration.Get<CachingProxyConfig>()!;
     app.UseRouting();
     app.UseHealthChecks("/health");
+    // After UseRouting (so the matched endpoint's AuthorizeAttribute metadata is available) and before
+    // the proxy middleware below (which does the real work and would otherwise serve unauthenticated
+    // requests). /health is already handled above, so it stays public.
+    if (cachingProxyConfig.InboundAuth != null)
+    {
+      app.UseAuthentication();
+      app.UseAuthorization();
+    }
     if (!string.IsNullOrEmpty(cachingProxyConfig.S3?.BucketName))
     {
       app.UseMiddleware<S3CachingMiddleware>();

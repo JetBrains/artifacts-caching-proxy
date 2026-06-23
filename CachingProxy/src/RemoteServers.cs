@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.AspNetCore.Routing.Patterns;
@@ -31,6 +32,24 @@ public class RemoteServers : EndpointDataSource
       var remoteServer = new RemoteServer(trimmedPrefix, remoteUri,
         config.CacheDuration.Union(prefix.CacheDuration), MatchAuth(remoteUri, config.UpstreamAuth));
 
+      // A prefix whose upstream requires auth serves private artifacts, so its inbound route must
+      // require a validated client JWT too (enforced by UseAuthentication/UseAuthorization). Attaching
+      // an AuthorizeAttribute without inbound validation configured would silently leave it unenforced,
+      // so fail fast instead.
+      EndpointMetadataCollection metadata;
+      if (remoteServer.Auth != null)
+      {
+        if (config.InboundAuth == null)
+          throw new ArgumentException(
+            $"Prefix '{prefix}' has a matching UpstreamAuth but InboundAuth is not configured; " +
+            "its route would be served without client authentication. Configure InboundAuth.");
+        metadata = new EndpointMetadataCollection(remoteServer, new AuthorizeAttribute());
+      }
+      else
+      {
+        metadata = new EndpointMetadataCollection(remoteServer);
+      }
+
       // Overlapping prefixes (e.g. "/aprefix" and "/aprefix/too") both match via their {**path}
       // catch-all, and routing breaks such ties by Endpoint.Order, NOT by specificity. So order by
       // descending prefix length here, making the longer (more specific) prefix win regardless of the
@@ -40,7 +59,7 @@ public class RemoteServers : EndpointDataSource
         requestDelegate: static _ => Task.CompletedTask,
         routePattern: RoutePatternFactory.Parse(trimmedPrefix + $"/{{**{ourPathParameterName}}}"),
         order: 0, // Yes, the same order for everything. Real order will be determined by the ASP.NET in runtime according to prefixes topology.
-        metadata: new EndpointMetadataCollection(remoteServer),
+        metadata: metadata,
         displayName: $"Metadata-only {prefix}");
     }
 

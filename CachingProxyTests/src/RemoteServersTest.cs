@@ -62,6 +62,9 @@ public class RemoteServersTest
         "/c=other.example.com",             // → no match
       ],
       UpstreamAuth = [hostWide, pathScoped],
+      // A matched UpstreamAuth requires InboundAuth to be configured (see RemoteServers); supply a
+      // minimal block so construction succeeds and we can assert the matching itself.
+      InboundAuth = new CachingProxyConfig.InboundAuthConfig { Issuer = "i", Audience = "a", JwksUrl = new Uri("https://issuer.example.com/jwks.json") },
     };
 
     var servers = new RemoteServers(config).Endpoints

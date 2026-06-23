@@ -1,9 +1,12 @@
 using System;
 using System.Collections.Concurrent;
+using System.IdentityModel.Tokens.Jwt;
 using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -18,6 +21,7 @@ using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.IdentityModel.Tokens;
 using Xunit;
 
 namespace JetBrains.CachingProxy.Tests;
@@ -33,7 +37,16 @@ public class UpstreamAuthTest : IAsyncLifetime
   private const string ClientSecret = "s3cr3t";
   private const string AccessToken = "issued-access-token";
 
-  private readonly WebApplication myTokenServer;
+  // The /private prefix has a matching UpstreamAuth, so it now also requires a validated inbound JWT,
+  // whose RSA signing key is published by the auth server's JWKS endpoint below.
+  private const string Issuer = "https://issuer.example.com";
+  private const string Audience = "artifacts-caching-proxy";
+  private const string Kid = "test-key-1";
+  private readonly RSA myRsa = RSA.Create(2048);
+
+  // One server modelling the OAuth identity provider: it serves both the token endpoint (outbound
+  // upstream auth) and the JWKS (inbound validation), as a real provider like JetBrains hub does.
+  private readonly WebApplication myAuthServer;
   private readonly WebApplication myUpstreamServer;
   private string myTempDirectory = "";
   private IHost? myProxyHost;
@@ -45,21 +58,29 @@ public class UpstreamAuthTest : IAsyncLifetime
 
   public UpstreamAuthTest()
   {
-    myTokenServer = BuildKestrel(router => router.MapPost("token", async (req, res, _) =>
+    myAuthServer = BuildKestrel(router =>
     {
-      Interlocked.Increment(ref myTokenRequests);
-      myTokenAuthHeader = req.Headers.Authorization.ToString();
-      var form = await req.ReadFormAsync();
-      myTokenGrantType = form["grant_type"].ToString();
-
-      res.ContentType = "application/json";
-      await res.WriteAsync(JsonSerializer.Serialize(new
+      router.MapGet("jwks.json", (_, res, _) =>
       {
-        access_token = AccessToken,
-        token_type = "Bearer",
-        expires_in = 3600,
-      }));
-    }));
+        res.ContentType = "application/json";
+        return res.WriteAsync(JwksJson(myRsa));
+      });
+      router.MapPost("token", async (req, res, _) =>
+      {
+        Interlocked.Increment(ref myTokenRequests);
+        myTokenAuthHeader = req.Headers.Authorization.ToString();
+        var form = await req.ReadFormAsync();
+        myTokenGrantType = form["grant_type"].ToString();
+
+        res.ContentType = "application/json";
+        await res.WriteAsync(JsonSerializer.Serialize(new
+        {
+          access_token = AccessToken,
+          token_type = "Bearer",
+          expires_in = 3600,
+        }));
+      });
+    });
 
     myUpstreamServer = BuildKestrel(router => router.MapGet("{*path}", (req, res, data) =>
     {
@@ -72,6 +93,7 @@ public class UpstreamAuthTest : IAsyncLifetime
   public async Task Token_Is_Used_As_Basic_Password_And_Cached()
   {
     using var client = myProxyHost!.GetTestServer().CreateClient();
+    client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", MintToken());
 
     var first = await client.GetAsync("/private/one.jar");
     var second = await client.GetAsync("/private/two.jar");
@@ -100,7 +122,9 @@ public class UpstreamAuthTest : IAsyncLifetime
     // it must be redirected to the origin with 307 rather than proxied/cached: a 307 preserves the method
     // and the client reuses its own credentials for the origin. The proxy must therefore NOT fetch it
     // upstream (caching it would pin a stale copy for a protected source).
-    var response = await myProxyHost!.GetTestServer().CreateRequest("/private/maven-metadata.xml").GetAsync();
+    var response = await myProxyHost!.GetTestServer().CreateRequest("/private/maven-metadata.xml")
+      .AddHeader("Authorization", "Bearer " + MintToken())
+      .GetAsync();
 
     Assert.Equal(HttpStatusCode.TemporaryRedirect, response.StatusCode); // 307, == RedirectKeepVerb
     Assert.Equal(new Uri(UrlOf(myUpstreamServer), "secure/maven-metadata.xml"), response.Headers.Location);
@@ -126,7 +150,7 @@ public class UpstreamAuthTest : IAsyncLifetime
     myTempDirectory = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
     Directory.CreateDirectory(myTempDirectory);
 
-    await myTokenServer.StartAsync();
+    await myAuthServer.StartAsync();
     await myUpstreamServer.StartAsync();
 
     var upstreamUrl = UrlOf(myUpstreamServer);
@@ -145,12 +169,18 @@ public class UpstreamAuthTest : IAsyncLifetime
         {
           // Scoped to the /secure subtree so the /public prefix (same host) is unauthenticated.
           UrlPrefix = new Uri(upstreamUrl, "secure/").AbsoluteUri,
-          TokenEndpoint = new Uri(UrlOf(myTokenServer), "token"),
+          TokenEndpoint = new Uri(UrlOf(myAuthServer), "token"),
           ClientId = ClientId,
           ClientSecret = ClientSecret,
           Scope = "read:artifacts",
         },
       ],
+      InboundAuth = new CachingProxyConfig.InboundAuthConfig
+      {
+        Issuer = Issuer,
+        Audience = Audience,
+        JwksUrl = new Uri(UrlOf(myAuthServer), "jwks.json"),
+      },
     };
 
     myProxyHost = new HostBuilder()
@@ -171,8 +201,41 @@ public class UpstreamAuthTest : IAsyncLifetime
     if (myProxyHost != null) await myProxyHost.StopAsync();
     myProxyHost?.Dispose();
     await myUpstreamServer.StopAsync();
-    await myTokenServer.StopAsync();
+    await myAuthServer.StopAsync();
+    myRsa.Dispose();
     try { Directory.Delete(myTempDirectory, recursive: true); } catch { /* best effort */ }
+  }
+
+  private string MintToken()
+  {
+    var key = new RsaSecurityKey(myRsa) { KeyId = Kid };
+    var token = new JwtSecurityToken(
+      issuer: Issuer,
+      audience: Audience,
+      expires: DateTime.UtcNow.AddMinutes(5),
+      signingCredentials: new SigningCredentials(key, SecurityAlgorithms.RsaSha256));
+    return new JwtSecurityTokenHandler().WriteToken(token);
+  }
+
+  // Minimal JWKS document publishing the RSA public key under our Kid.
+  private static string JwksJson(RSA rsa)
+  {
+    var p = rsa.ExportParameters(includePrivateParameters: false);
+    return JsonSerializer.Serialize(new
+    {
+      keys = new[]
+      {
+        new
+        {
+          kty = "RSA",
+          use = "sig",
+          kid = Kid,
+          alg = "RS256",
+          n = Base64UrlEncoder.Encode(p.Modulus),
+          e = Base64UrlEncoder.Encode(p.Exponent),
+        },
+      },
+    });
   }
 
   private static WebApplication BuildKestrel(Action<IRouteBuilder> configure)
