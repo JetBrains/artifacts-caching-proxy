@@ -60,10 +60,11 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
       return;
     }
 
-    if (!await remoteProxy.ValidateRequestAsync(context))
+    var upstreamUri = await remoteProxy.ValidateRequestAsync(context, remoteServer, remainingPath);
+    if (upstreamUri == null)
       return;
 
-    var s3Key = remoteServer.ManglePath(remainingPath);
+    var s3Key = upstreamUri.ManglePath();
 
     // A HEAD is always answered from memory with the object's metadata (never redirected), and a
     // redirect is therefore produced only for a GET. So the verb-specific key holds, per verb, a
@@ -158,7 +159,6 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
         catch (AmazonServiceException ex) when (ex.StatusCode is HttpStatusCode.NotFound) { }
       }
 
-      var upstreamUri = remoteServer.GetUpstreamUri(remainingPath);
       using var response = await remoteProxy.ProcessAsync(context, s3Key, remoteServer.CacheDuration, upstreamUri);
 
       // A non-null response is a GET MISS body for us to stream and persist; otherwise it is handled.

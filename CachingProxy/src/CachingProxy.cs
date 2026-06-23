@@ -57,7 +57,8 @@ public class CachingProxy
       return;
     }
 
-    if (!await myRemoteProxy.ValidateRequestAsync(context))
+    var upstreamUri = await myRemoteProxy.ValidateRequestAsync(context, remoteServer, remainingPath);
+    if (upstreamUri == null)
       return;
 
     IResult? cachedFileResult = null;
@@ -67,8 +68,7 @@ public class CachingProxy
       var contentType = GetContentType(remainingPath);
       foreach (var contentEncoding in GetCacheLookupContentEncodings(context))
       {
-        var cachedFile = Path.Combine(myLocalCachePath,
-          remoteServer.GetFutureCacheFileLocation(remainingPath!, contentEncoding));
+        var cachedFile = Path.Combine(myLocalCachePath, upstreamUri.GetFutureCacheFileLocation(contentEncoding));
         if (File.Exists(cachedFile))
         {
           cachedContentEncoding = contentEncoding;
@@ -88,8 +88,8 @@ public class CachingProxy
       return;
     }
 
-    using var response = await myRemoteProxy.ProcessAsync(context, remoteServer.ManglePath(remainingPath),
-      remoteServer.CacheDuration, remoteServer.GetUpstreamUri(remainingPath), GetContentType(remainingPath));
+    using var response = await myRemoteProxy.ProcessAsync(context, upstreamUri.ManglePath(),
+      remoteServer.CacheDuration, upstreamUri, GetContentType(remainingPath));
 
     // A non-null response is a GET MISS body for us to stream and persist; otherwise it is handled.
     if (response == null) return;
@@ -98,7 +98,7 @@ public class CachingProxy
     var contentLength = response.Content.Headers.ContentLength;
     var contentLastModified = response.Content.Headers.LastModified;
 
-    var cachePath = Path.Combine(myLocalCachePath, remoteServer.GetFutureCacheFileLocation(remainingPath, contentEncoding));
+    var cachePath = Path.Combine(myLocalCachePath, upstreamUri.GetFutureCacheFileLocation(contentEncoding));
     var tempFile = cachePath + ".tmp." + Guid.NewGuid();
     try
     {

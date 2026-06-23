@@ -10,29 +10,25 @@ public static class CacheFileProvider
 {
   private static readonly string ourGzippedContentSuffix = "-gzip-Ege4dHyCEA7IM";
 
-  extension(RemoteServers.RemoteServer remoteServer)
+  extension(Uri upstreamUri)
   {
-    public string GetFutureCacheFileLocation(string? remainingPart, string? contentEncoding = null) =>
-      remoteServer.ManglePath(remainingPart)
-        + Path.GetExtension(remainingPart)
-        + contentEncoding switch
-        {
-          "gzip" => ourGzippedContentSuffix,
-          "" or null => null,
-          _ => throw new ArgumentException("Invalid content encoding", nameof(contentEncoding)),
-        };
+    public string GetFutureCacheFileLocation(string? contentEncoding = null) =>
+      upstreamUri.ManglePath()
+      + Path.GetExtension(upstreamUri.AbsolutePath)
+      + contentEncoding switch
+      {
+        "gzip" => ourGzippedContentSuffix,
+        "" or null => null,
+        _ => throw new ArgumentException("Invalid content encoding", nameof(contentEncoding)),
+      };
 
-    public string ManglePath(string? remainingPart)
+    public string ManglePath()
     {
-      var path = remoteServer
-        .GetUpstreamUri(remainingPart)
-        .GetComponents(UriComponents.Host | UriComponents.Port | UriComponents.Path, UriFormat.UriEscaped);
+      var path = upstreamUri.GetComponents(UriComponents.Host | UriComponents.Port | UriComponents.Path, UriFormat.UriEscaped);
       var maxBytes = Encoding.UTF8.GetMaxByteCount(path.Length);
 
       byte[]? rented = null;
-      var buffer = maxBytes <= 512
-        ? stackalloc byte[512]
-        : rented = ArrayPool<byte>.Shared.Rent(maxBytes);
+      var buffer = maxBytes <= 512 ? stackalloc byte[512] : rented = ArrayPool<byte>.Shared.Rent(maxBytes);
 
       try
       {

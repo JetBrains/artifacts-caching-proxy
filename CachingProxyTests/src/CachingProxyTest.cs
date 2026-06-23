@@ -290,6 +290,20 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
   }
 
   [Fact]
+  public async Task Path_With_Multiple_Slashes_Is_Bad_Request()
+  {
+    // A degenerate URL such as "/maven-central////-.jar": the catch-all captures "///-.jar",
+    // whose leading "//" makes new Uri(base, ...) resolve to an empty authority (invalid for
+    // http(s)). The proxy must reject it as 400 BAD_REQUEST, not crash with a 500.
+    await AssertGetResponse("/real////-.jar", HttpStatusCode.BadRequest,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.BAD_REQUEST);
+        Assert.Equal("Invalid request path", Encoding.UTF8.GetString(bytes));
+      });
+  }
+
+  [Fact]
   public async Task Empty_File_Extension_Is_Cached()
   {
     // MRI-4508: extensionless paths are no longer redirected to the remote;

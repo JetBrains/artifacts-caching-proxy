@@ -36,27 +36,41 @@ public partial class RemoteProxy(
     new Regex(config.RedirectToRemoteUrlsRegex, RegexOptions.Compiled) : null;
 
   /// <summary>
-  /// Validates the request method (only GET/HEAD are allowed) and path (no traversal, only safe
-  /// characters). On a failure it writes the appropriate response (405 or 400 BAD_REQUEST) and
-  /// returns <c>false</c>; otherwise returns <c>true</c>. Both this layer and storage middlewares
-  /// (disk, S3) call it before doing any upstream/storage work so the checks are applied uniformly.
+  /// Validates the request method (only GET/HEAD are allowed), the path (no traversal, only safe
+  /// characters) and that the path resolves to a well-formed upstream target. On a failure it writes
+  /// the appropriate response (405 or 400 BAD_REQUEST) and returns <c>false</c>; otherwise returns
+  /// <c>true</c>. Both this layer and storage middlewares (disk, S3) call it before doing any
+  /// upstream/storage work so the checks are applied uniformly.
   /// </summary>
-  public async ValueTask<bool> ValidateRequestAsync(HttpContext context)
+  /// <returns>Upstream URI</returns>
+  public async ValueTask<Uri?> ValidateRequestAsync(HttpContext context, RemoteServers.RemoteServer remoteServer, string? remainingPath)
   {
     if (!HttpMethods.IsHead(context.Request.Method) && !HttpMethods.IsGet(context.Request.Method))
     {
       await SetStatusAsync(context, CachingProxyStatus.BAD_REQUEST, CachedResponse.MethodNotAllowed);
-      return false;
+      return null;
     }
 
     var requestPath = context.Request.Path.Value!;
     if (requestPath.Contains("..", StringComparison.Ordinal) || !OurGoodPathChars.IsMatch(requestPath))
     {
       await SetStatusAsync(context, CachingProxyStatus.BAD_REQUEST, CachedResponse.InvalidPath);
-      return false;
+      return null;
     }
 
-    return true;
+    // The remainder after the prefix is resolved against the upstream base via new Uri(base, ...).
+    // A remainder with a leading "//" (e.g. "/<prefix>////-.jar") is an RFC-3986 network-path
+    // reference that resolves to an empty/foreign authority and throws here; reject it as a bad
+    // request rather than letting it surface downstream.
+    try
+    {
+      return remoteServer.GetUpstreamUri(remainingPath);
+    }
+    catch (UriFormatException)
+    {
+      await SetStatusAsync(context, CachingProxyStatus.BAD_REQUEST, CachedResponse.InvalidPath);
+      return null;
+    }
   }
 
   // 404 and authentication / access errors are surfaced to the client verbatim (we do not mask

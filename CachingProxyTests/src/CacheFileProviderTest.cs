@@ -15,7 +15,7 @@ public class CacheFileProviderTest
   {
     Assert.Equal(
       "d9/6d/d96d0bd13935d4ab082c410dea64c70bf2f926b75f3b487ac18c0e290ee8ac3a.jar",
-      ourServer.GetFutureCacheFileLocation("a.jar"));
+      ourServer.GetUpstreamUri("a.jar").GetFutureCacheFileLocation());
   }
 
   [Fact]
@@ -24,7 +24,7 @@ public class CacheFileProviderTest
     // A trailing slash makes the upstream key "a/a.jar/", which has no file extension.
     Assert.Equal(
       "14/40/1440b34e1707076ba9c32fd06c18405254883be42d14cd240f237eaa3eb5960c",
-      ourServer.GetFutureCacheFileLocation("a.jar/"));
+      ourServer.GetUpstreamUri("a.jar/").GetFutureCacheFileLocation());
   }
 
   [Fact]
@@ -32,8 +32,8 @@ public class CacheFileProviderTest
   {
     // The route catch-all value has no leading slash, but a leading slash must hash identically.
     Assert.Equal(
-      ourServer.GetFutureCacheFileLocation("a.jar"),
-      ourServer.GetFutureCacheFileLocation("/a.jar"));
+      ourServer.GetUpstreamUri("a.jar").GetFutureCacheFileLocation(),
+      ourServer.GetUpstreamUri("/a.jar").GetFutureCacheFileLocation());
   }
 
   [Fact]
@@ -41,16 +41,16 @@ public class CacheFileProviderTest
   {
     // Upstreams are case-sensitive, so paths differing only in case must map to distinct cache files.
     Assert.NotEqual(
-      ourServer.GetFutureCacheFileLocation("Foo.jar"),
-      ourServer.GetFutureCacheFileLocation("foo.jar"));
+      ourServer.GetUpstreamUri("Foo.jar").GetFutureCacheFileLocation(),
+      ourServer.GetUpstreamUri("foo.jar").GetFutureCacheFileLocation());
   }
 
   [Fact]
   public void ManglePath_GzipVariantAppendsSuffix()
   {
     // The gzip variant differs from the plain one only by a suffix appended after the hash.
-    var plain = ourServer.GetFutureCacheFileLocation("a.jar");
-    var gzip = ourServer.GetFutureCacheFileLocation("a.jar", "gzip");
+    var plain = ourServer.GetUpstreamUri("a.jar").GetFutureCacheFileLocation();
+    var gzip = ourServer.GetUpstreamUri("a.jar").GetFutureCacheFileLocation("gzip");
     Assert.Equal(plain + "-gzip-Ege4dHyCEA7IM", gzip);
   }
 }

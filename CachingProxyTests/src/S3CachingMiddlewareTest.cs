@@ -127,6 +127,22 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   }
 
   [Fact]
+  public async Task Path_With_Multiple_Slashes_Is_Bad_Request()
+  {
+    // A degenerate URL such as "/maven-central////-.jar" resolves the "///-.jar" remainder to an
+    // empty authority (invalid for http(s)). The shared request validation must reject it as 400
+    // BAD_REQUEST before any S3 work, so the bucket is never probed or written.
+    var server = CreateServer(signedLinks: true);
+    using var response = await server.CreateRequest("/real////-.jar").SendAsync(HttpMethod.Get.Method);
+
+    Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    AssertStatusHeader(response, CachingProxyStatus.BAD_REQUEST);
+    Assert.Equal("Invalid request path", await response.Content.ReadAsStringAsync());
+    Assert.Equal(0, myS3.GetObjectCalls);
+    Assert.Equal(0, myS3.PutObjectCalls);
+  }
+
+  [Fact]
   public async Task Signed_Redirect_Expiry_Includes_Configured_CacheOffset()
   {
     // The presigned link must outlive the cached redirect by the configured offset:
@@ -573,7 +589,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   private string GetPathKey(string path)
   {
     Assert.StartsWith(myRemoteServer.Prefix, path);
-    return myRemoteServer.ManglePath(path[myRemoteServer.Prefix.Value!.Length..]);
+    return myRemoteServer.GetUpstreamUri(path[myRemoteServer.Prefix.Value!.Length..]).ManglePath();
   }
 
   private static void AssertStatusHeader(HttpResponseMessage response, CachingProxyStatus status) =>
