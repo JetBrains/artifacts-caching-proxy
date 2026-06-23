@@ -61,53 +61,44 @@ public class CachingProxy
     if (upstreamUri == null)
       return;
 
-    IResult? cachedFileResult = null;
-    string? cachedContentEncoding = null;
-    CatchSilently(() =>
+    var contentType = myContentTypeProvider.TryGetContentType(remainingPath ?? "", out var resolvedContentType) ?
+      resolvedContentType : MediaTypeNames.Application.Octet;
+
+    foreach (var contentEncoding in GetCacheLookupContentEncodings(context))
     {
-      var contentType = GetContentType(remainingPath);
-      foreach (var contentEncoding in GetCacheLookupContentEncodings(context))
+      var cachedFile = Path.Combine(myLocalCachePath, upstreamUri.GetFutureCacheFileLocation(contentEncoding));
+      if (File.Exists(cachedFile))
       {
-        var cachedFile = Path.Combine(myLocalCachePath, upstreamUri.GetFutureCacheFileLocation(contentEncoding));
-        if (File.Exists(cachedFile))
-        {
-          cachedContentEncoding = contentEncoding;
-          cachedFileResult = TypedResults.PhysicalFile(cachedFile, contentType, enableRangeProcessing: true);
-          break;
-        }
+        myRemoteProxy.SetStatusHeader(context, CachingProxyStatus.HIT);
+        // Only successful (2xx) responses reach here, so the response is always eternally cacheable.
+        context.Response.Headers.CacheControl = CachedResponse.EternalCachingHeader;
+        if (contentEncoding != null)
+          context.Response.Headers.ContentEncoding = contentEncoding;
+        await TypedResults.PhysicalFile(cachedFile, contentType, enableRangeProcessing: true).ExecuteAsync(context);
+        return;
       }
-    });
-    if (cachedFileResult != null)
-    {
-      myRemoteProxy.SetStatusHeader(context, CachingProxyStatus.HIT);
-      // Only successful (2xx) responses reach here, so the response is always eternally cacheable.
-      context.Response.Headers.CacheControl = CachedResponse.EternalCachingHeader;
-      if (cachedContentEncoding != null)
-        context.Response.Headers.ContentEncoding = cachedContentEncoding;
-      await cachedFileResult.ExecuteAsync(context);
-      return;
     }
 
-    using var response = await myRemoteProxy.ProcessAsync(context, upstreamUri.ManglePath(),
-      remoteServer.CacheDuration, upstreamUri, GetContentType(remainingPath));
-
-    // A non-null response is a GET MISS body for us to stream and persist; otherwise it is handled.
-    if (response == null) return;
-
-    var contentEncoding = response.Content.Headers.ContentEncoding.FirstOrDefault();
-    var contentLength = response.Content.Headers.ContentLength;
-    var contentLastModified = response.Content.Headers.LastModified;
-
-    var cachePath = Path.Combine(myLocalCachePath, upstreamUri.GetFutureCacheFileLocation(contentEncoding));
-    var tempFile = cachePath + ".tmp." + Guid.NewGuid();
+    string? tempFile = null;
     try
     {
-      var parent = Directory.GetParent(cachePath);
+      using var response = await myRemoteProxy.ProcessAsync(context, upstreamUri.ManglePath(),
+        remoteServer.CacheDuration, upstreamUri, contentType);
+
+      // A non-null response is a GET MISS body for us to stream and persist; otherwise it is handled.
+      if (response == null) return;
+
+      var contentEncoding = response.Content.Headers.ContentEncoding.FirstOrDefault();
+      var contentLength = response.Content.Headers.ContentLength;
+      var contentLastModified = response.Content.Headers.LastModified;
+
+      var cachedFile = Path.Combine(myLocalCachePath, upstreamUri.GetFutureCacheFileLocation(contentEncoding));
+      tempFile = cachedFile + ".tmp." + Guid.NewGuid();
+
+      var parent = Directory.GetParent(cachedFile);
       Directory.CreateDirectory(parent!.FullName);
 
-      await using (var stream = new FileStream(
-                     tempFile, FileMode.CreateNew, FileAccess.Write, FileShare.None, BUFFER_SIZE,
-                     FileOptions.Asynchronous))
+      await using (var stream = new FileStream(tempFile, FileMode.CreateNew, FileAccess.Write, FileShare.None, BUFFER_SIZE, FileOptions.Asynchronous))
       {
         await using (var sourceStream = await response.Content.ReadAsStreamAsync())
           await CopyToTwoStreamsAsync(sourceStream, context.Response.Body, stream, context.RequestAborted);
@@ -125,26 +116,12 @@ public class CachingProxy
       if (contentLastModified.HasValue)
         File.SetLastWriteTimeUtc(tempFile, contentLastModified.Value.UtcDateTime);
 
-      try
-      {
-        File.Move(tempFile, cachePath);
-      }
-      catch (IOException)
-      {
-        if (File.Exists(cachePath))
-        {
-          // It's ok, a parallel request cached it before us
-        }
-        else throw;
-      }
+      File.Move(tempFile, cachedFile, true);
     }
     catch (OperationCanceledException)
     {
       // Probable cause: OperationCanceledException while streaming the upstream response body
       // Probable cause: OperationCanceledException from this service's client (context.RequestAborted)
-
-      // ref: https://github.com/aspnet/StaticFiles/commit/bbf1478821c11ecdcad776dad085d6ee09d8f8ee#diff-991aec26255237cd6dbfa787d0995a2aR85
-      // ref: https://github.com/aspnet/StaticFiles/issues/150
 
       // Don't throw this exception, it's most likely caused by the client disconnecting.
       // However, if it was cancelled for any other reason we need to prevent empty responses.
@@ -152,17 +129,13 @@ public class CachingProxy
     }
     finally
     {
+      // Covers every exit (success, content-length mismatch, a mid-stream client abort):
+      // leave no orphaned .tmp file behind.
       CatchSilently(() =>
       {
         if (File.Exists(tempFile))
           File.Delete(tempFile);
       });
-    }
-
-    string GetContentType(string? path)
-    {
-      return myContentTypeProvider.TryGetContentType(path ?? "", out var resolvedContentType) ?
-        resolvedContentType : MediaTypeNames.Application.Octet;
     }
   }
 

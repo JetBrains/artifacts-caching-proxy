@@ -250,19 +250,20 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
     await using var body = await response.Content.ReadAsStreamAsync(cancellationToken);
     var contentLength = response.Content.Headers.ContentLength;
 
-    string? spoolPath = null;
-    FileStream? spooled = null;
+    var uploadStream = Stream.Null;
     try
     {
-      var uploadStream = body;
       if (contentLength is null)
       {
-        spoolPath = Path.Combine(Path.GetTempPath(), "s3-upload-" + Guid.NewGuid());
-        spooled = new FileStream(spoolPath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, 81920, FileOptions.Asynchronous);
-        await body.CopyToAsync(spooled, cancellationToken);
-        spooled.Position = 0;
-        contentLength = spooled.Length;
-        uploadStream = spooled;
+        var tmpPath = Path.Combine(Path.GetTempPath(), "s3-upload-" + Guid.NewGuid());
+        uploadStream = new FileStream(tmpPath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, 81920, FileOptions.Asynchronous | FileOptions.DeleteOnClose);
+        await body.CopyToAsync(uploadStream, cancellationToken);
+        uploadStream.Position = 0;
+        contentLength = uploadStream.Length;
+      }
+      else
+      {
+        uploadStream = body;
       }
 
       await amazonS3.PutObjectAsync(new PutObjectRequest
@@ -284,8 +285,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
     }
     finally
     {
-      if (spooled != null) await spooled.DisposeAsync();
-      if (spoolPath != null) File.Delete(spoolPath);
+      await uploadStream.DisposeAsync();
     }
   }
 }
