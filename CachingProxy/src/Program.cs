@@ -215,21 +215,32 @@ public static class Program
         .AddCheck<CachingProxy.HealthCheck>(nameof(CachingProxy));
     }
 
-    // Per-upstream OAuth client-credentials auth. One token-management client per UpstreamAuth entry,
-    // named by its UrlPrefix so IClientCredentialsTokenManager.GetUpstreamAuthorizationHeaderAsync can
-    // look the token up by the same key. Registered only when something is configured, so unauthenticated
+    // Per-upstream OAuth client-credentials auth. One token-management client per credential-bearing
+    // UpstreamAuth entry, named by its ClientId so IClientCredentialsTokenManager.GetUpstreamAuthorizationHeaderAsync
+    // can look the token up by the same key. Registered only when something is configured, so unauthenticated
     // deployments pull in nothing extra (RemoteProxy resolves the token manager optionally). The token
-    // manager defaults to authenticating the client on the token endpoint with HTTP Basic.
+    // manager defaults to authenticating the client on the token endpoint with HTTP Basic. Credential-less
+    // entries (redirect-only / external auth) register no client — they never fetch a token.
     var upstreamAuth = configuration.Get<CachingProxyConfig>()?.UpstreamAuth ?? [];
     if (upstreamAuth.Length > 0)
     {
       var tokenManagement = services.AddClientCredentialsTokenManagement();
       foreach (var auth in upstreamAuth)
       {
-        tokenManagement.AddClient(auth.ClientId, client =>
+        if (!auth.HasCredentials)
+          continue;
+
+        // ClientId is set, so this is credential mode: the token endpoint and secret are mandatory. Fail
+        // fast on a partial config rather than sending a null token endpoint / unauthenticated token request.
+        if (auth.TokenEndpoint == null || string.IsNullOrEmpty(auth.ClientSecret))
+          throw new ArgumentException(
+            $"UpstreamAuth '{auth.UrlPrefix}' sets ClientId but is missing TokenEndpoint and/or ClientSecret; " +
+            "both are required for client-credentials auth. Omit ClientId for a redirect-only (external auth) entry.");
+
+        tokenManagement.AddClient(auth.ClientId!, client =>
         {
           client.TokenEndpoint = auth.TokenEndpoint;
-          client.ClientId = ClientId.Parse(auth.ClientId);
+          client.ClientId = ClientId.Parse(auth.ClientId!);
           client.ClientSecret = ClientSecret.Parse(auth.ClientSecret);
           if (!string.IsNullOrEmpty(auth.Scope))
             client.Scope = Scope.Parse(auth.Scope);

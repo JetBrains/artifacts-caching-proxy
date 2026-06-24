@@ -13,11 +13,15 @@ public static class UpstreamAuthExtensions
   /// client-credentials access token is obtained (and cached/refreshed) by the token manager; we only
   /// turn it into a Basic header, since these upstreams expect the token as the Basic <em>password</em>
   /// (with the client id as the username) rather than a Bearer token. Returns <c>null</c> when
-  /// <paramref name="auth"/> is <c>null</c> (unauthenticated upstream — no header is added).
+  /// <paramref name="auth"/> is <c>null</c> (unauthenticated upstream) or carries no client id
+  /// (redirect-only / external-auth entry) — in both cases no header is added.
   /// </summary>
-  public static async Task<AuthenticationHeaderValue?> GetUpstreamAuthorizationHeaderAsync(
-    this IClientCredentialsTokenManager tokenManager, UpstreamAuth auth, CancellationToken ct)
+  public static async ValueTask<AuthenticationHeaderValue?> GetUpstreamAuthorizationHeaderAsync(
+    this IClientCredentialsTokenManager tokenManager, UpstreamAuth? auth, CancellationToken ct)
   {
+    if (string.IsNullOrEmpty(auth?.ClientId))
+      return null;
+
     var token = await tokenManager
       .GetAccessTokenAsync(ClientCredentialsClientName.Parse(auth.ClientId), ct: ct)
       .GetToken();

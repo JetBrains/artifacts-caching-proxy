@@ -32,12 +32,13 @@ public class RemoteServers : EndpointDataSource
       var remoteServer = new RemoteServer(trimmedPrefix, remoteUri,
         config.CacheDuration.Union(prefix.CacheDuration), MatchAuth(remoteUri, config.UpstreamAuth));
 
-      // A prefix whose upstream requires auth serves private artifacts, so its inbound route must
-      // require a validated client JWT too (enforced by UseAuthentication/UseAuthorization). Attaching
-      // an AuthorizeAttribute without inbound validation configured would silently leave it unenforced,
-      // so fail fast instead.
+      // A prefix whose upstream carries credentials serves proxy-fetched private artifacts, so its inbound
+      // route must require a validated client JWT too (enforced by UseAuthentication/UseAuthorization).
+      // Attaching an AuthorizeAttribute without inbound validation configured would silently leave it
+      // unenforced, so fail fast instead. A credential-less auth entry is redirect-only (the origin
+      // authorizes — see UpstreamAuth), so it is intentionally left public/un-gated here.
       EndpointMetadataCollection metadata;
-      if (remoteServer.Auth != null)
+      if (remoteServer.Auth is { HasCredentials: true })
       {
         if (config.InboundAuth == null)
           throw new ArgumentException(

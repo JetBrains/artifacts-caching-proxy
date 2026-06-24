@@ -213,6 +213,27 @@ public class InboundAuthTest : IAsyncLifetime
     Assert.Throws<ArgumentException>(() => new RemoteServers(config));
   }
 
+  [Fact]
+  public void Credential_Less_Upstream_Without_InboundAuth_Does_Not_Throw()
+  {
+    // A credential-less UpstreamAuth (redirect-only / external auth, e.g. CloudFront) does NOT make the
+    // prefix require inbound auth, so a config with no InboundAuth must construct fine — contrast with
+    // Matched_Upstream_Without_InboundAuth_Throws, whose entry carries a ClientId.
+    var upstreamUrl = UrlOf(myUpstreamServer);
+    var config = new CachingProxyConfig
+    {
+      Prefixes = [$"/cdn={upstreamUrl}cdn"],
+      UpstreamAuth =
+      [
+        new UpstreamAuth { UrlPrefix = new Uri(upstreamUrl, "cdn/").AbsoluteUri },
+      ],
+      // InboundAuth deliberately left null.
+    };
+
+    var servers = new RemoteServers(config);
+    Assert.Single(servers.Endpoints);
+  }
+
   private string MintToken(RSA? rsa = null, bool withExpiration = true)
   {
     var key = new RsaSecurityKey(rsa ?? myRsa) { KeyId = Kid };

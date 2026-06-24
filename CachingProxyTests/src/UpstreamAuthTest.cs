@@ -134,6 +134,24 @@ public class UpstreamAuthTest : IAsyncLifetime
   }
 
   [Fact]
+  public async Task External_Auth_Without_ClientId_Is_Redirected_Without_Inbound_Auth()
+  {
+    // The /cdn prefix has a matching UpstreamAuth that carries no ClientId (redirect-only / external auth,
+    // e.g. CloudFront). The proxy holds no upstream credentials and must not gate the prefix with inbound
+    // auth: with NO Authorization header it still returns a 307 to the origin, which authorizes per-user.
+    using var client = myProxyHost!.GetTestServer().CreateClient();
+
+    var response = await client.GetAsync("/cdn/asset.bin");
+
+    Assert.Equal(HttpStatusCode.TemporaryRedirect, response.StatusCode); // 307, == RedirectKeepVerb
+    Assert.Equal(new Uri(UrlOf(myUpstreamServer), "cdn/asset.bin"), response.Headers.Location);
+
+    // It was redirected, not proxied through — the upstream never received the request and no token was minted.
+    Assert.False(myUpstreamAuthByPath.ContainsKey("cdn/asset.bin"));
+    Assert.Equal(0, myTokenRequests);
+  }
+
+  [Fact]
   public async Task Unauthenticated_Upstream_Sends_No_Authorization()
   {
     using var client = myProxyHost!.GetTestServer().CreateClient();
@@ -162,6 +180,7 @@ public class UpstreamAuthTest : IAsyncLifetime
       [
         $"/private={upstreamUrl}secure",
         $"/public={upstreamUrl}open",
+        $"/cdn={upstreamUrl}cdn",
       ],
       UpstreamAuth =
       [
@@ -173,6 +192,12 @@ public class UpstreamAuthTest : IAsyncLifetime
           ClientId = ClientId,
           ClientSecret = ClientSecret,
           Scope = "read:artifacts",
+        },
+        new UpstreamAuth
+        {
+          // Credential-less: redirect-only / external auth (e.g. CloudFront). No ClientId, so the proxy
+          // holds no upstream credentials, always redirects, and does not require inbound auth.
+          UrlPrefix = new Uri(upstreamUrl, "cdn/").AbsoluteUri,
         },
       ],
       InboundAuth = new CachingProxyConfig.InboundAuthConfig

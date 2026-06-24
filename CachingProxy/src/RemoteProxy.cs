@@ -136,17 +136,18 @@ public partial class RemoteProxy(
     // origin with 307 (RedirectKeepVerb) instead of being cached - this holds for authenticated upstreams
     // too: a 307 preserves the method and the client reuses its own credentials for the origin, so there
     // is no need to proxy these through (which would wrongly cache mutable content for protected sources).
+    // A credential-less auth entry (external-auth / redirect-only, e.g. CloudFront) is handled the same
+    // way for every path: the proxy holds no upstream credentials, so the client is redirected to
+    // authenticate directly with the origin, which serves per-user content the proxy must never cache.
     var isRedirectToRemoteUrl = myRedirectToRemoteUrlsRegex != null && myRedirectToRemoteUrlsRegex.IsMatch(requestPath);
-    if (isRedirectToRemoteUrl)
+    var isExternalAuth = auth is { HasCredentials: false };
+    if (isRedirectToRemoteUrl || isExternalAuth)
     {
-      cachedResponse = new CachedResponse(HttpStatusCode.RedirectKeepVerb, new HeaderDictionary())
-      {
-        Headers =
+      await SetStatusAsync(context, CachingProxyStatus.ALWAYS_REDIRECT,
+        new CachedResponse(HttpStatusCode.RedirectKeepVerb, new HeaderDictionary())
         {
-          Location = upstreamUri.ToString()
-        }
-      };
-      await SetStatusAsync(context, CachingProxyStatus.ALWAYS_REDIRECT, cachedResponse);
+          Headers = { Location = upstreamUri.ToString() }
+        });
       return null;
     }
 
@@ -158,7 +159,9 @@ public partial class RemoteProxy(
     try
     {
       if (tokenManager != null && auth != null)
+      {
         request.Headers.Authorization = await tokenManager.GetUpstreamAuthorizationHeaderAsync(auth, context.RequestAborted);
+      }
       response = await httpClient.Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, context.RequestAborted);
     }
     catch (OperationCanceledException canceledException)
