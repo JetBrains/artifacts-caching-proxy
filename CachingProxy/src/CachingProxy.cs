@@ -118,13 +118,10 @@ public class CachingProxy
 
       File.Move(tempFile, cachedFile, true);
     }
-    catch (OperationCanceledException canceledException)
+    catch (OperationCanceledException)
     {
       // Probable cause: OperationCanceledException while streaming the upstream response body
       // Probable cause: OperationCanceledException from this service's client (context.RequestAborted)
-
-      if (canceledException.CancellationToken == context.RequestAborted) throw;
-
       // However, if it was cancelled for any other reason, we need to prevent empty responses.
       context.Abort();
     }

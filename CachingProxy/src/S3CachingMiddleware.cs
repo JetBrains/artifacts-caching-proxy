@@ -170,10 +170,8 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
 
       await RedirectToBucket();
     }
-    catch (OperationCanceledException canceledException)
+    catch (OperationCanceledException)
     {
-      if (canceledException.CancellationToken == context.RequestAborted) throw;
-
       context.Abort();
     }
     catch (Exception e)

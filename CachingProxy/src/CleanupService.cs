@@ -46,10 +46,7 @@ public class CleanupService(TimeProvider timeProvider, CachingProxyConfig config
         await CleanupOnceAsync(stoppingToken);
       }
     }
-    catch (OperationCanceledException)
-    {
-      throw;
-    }
+    catch (OperationCanceledException) { }
     catch (Exception e)
     {
       logger.LogError(e, "Unexpected error occurred while cleaning up.");
