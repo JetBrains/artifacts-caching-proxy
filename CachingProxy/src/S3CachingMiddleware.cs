@@ -208,7 +208,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
           Verb = HttpMethods.IsHead(context.Request.Method) ? HttpVerb.HEAD : HttpVerb.GET,
           Expires = timeProvider.GetUtcNow().UtcDateTime +
                     config.S3.CacheOffsetDuration +
-                    remoteServer.CacheDuration.GetDuration((HttpStatusCode)context.Response.StatusCode)
+                    responseCache.GetDurableDuration(remoteServer.CacheDuration, (HttpStatusCode)context.Response.StatusCode)
         });
       }
       else
@@ -227,10 +227,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
 
       var cachingResponse = new CachedResponse(HttpStatusCode.RedirectKeepVerb, new HeaderDictionary())
       {
-        Headers =
-        {
-          Location = location
-        }
+        Headers = { Location = location }
       };
       // Only a GET redirects (a HEAD is served from memory), so the redirect always belongs under the
       // verb-specific key and is never replayed to a HEAD.

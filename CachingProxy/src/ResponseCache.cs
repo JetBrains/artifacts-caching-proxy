@@ -78,11 +78,9 @@ public class ResponseCache(IFusionCache cache, TimeProvider timeProvider, Cachin
     // allowed to be shorter than the L1 TTL: the durable backing store must outlive the in-process copy.
     var l2CachingTime = config.DistributedCacheDuration.GetDuration(entry.StatusCode);
     var distributedCachingTime = l2CachingTime > cachingTime ? l2CachingTime : cachingTime;
-    // The durable lifetime is the L2 TTL when a distributed cache is wired (the entry survives L1
-    // eviction and is re-served from L2 until then); otherwise it is just the L1 TTL. Reporting the
-    // durable expiration keeps the header in the future for as long as the entry is actually cached,
-    // instead of going stale once the in-memory copy is evicted.
-    var durableCachingTime = cache.HasDistributedCache ? distributedCachingTime : cachingTime;
+    // Reporting the durable expiration keeps the header in the future for as long as the entry is
+    // actually cached, instead of going stale once the in-memory copy is evicted.
+    var durableCachingTime = GetDurableDuration(cacheDuration, entry.StatusCode);
     entry.Headers[CachingProxyConstants.CachedStatusHeader] = entry.StatusCode.ToString("D");
     entry.Headers[CachingProxyConstants.CachedUntilHeader] = (timeProvider.GetUtcNow() + durableCachingTime).ToString("R");
 
@@ -92,5 +90,21 @@ public class ResponseCache(IFusionCache cache, TimeProvider timeProvider, Cachin
       DistributedCacheDuration = distributedCachingTime,
     }, token: cancellationToken);
     return entry;
+  }
+
+  /// <summary>
+  /// The duration a cached entry actually remains servable: when a distributed (L2) cache is
+  /// wired the entry survives L1 eviction and is re-served from L2 for the (never-shorter) L2
+  /// TTL; otherwise it lives only for the L1 TTL. This is the lifetime the Cached-Until header
+  /// and any externally-minted handle (e.g. an S3 presigned URL) must be sized against.
+  /// </summary>
+  public TimeSpan GetDurableDuration(CacheDuration cacheDuration, HttpStatusCode statusCode)
+  {
+    var cachingTime = cacheDuration.GetDuration(statusCode);
+    if (!cache.HasDistributedCache)
+      return cachingTime;
+
+    var l2CachingTime = config.DistributedCacheDuration.GetDuration(statusCode);
+    return l2CachingTime > cachingTime ? l2CachingTime : cachingTime;
   }
 }

@@ -14,11 +14,16 @@ using Amazon.S3;
 using Amazon.S3.Model;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.TestHost;
+using Microsoft.Extensions.Caching.Distributed;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Options;
 using Xunit;
+using ZiggyCreatures.Caching.Fusion;
+using ZiggyCreatures.Caching.Fusion.Serialization.CysharpMemoryPack;
 
 namespace JetBrains.CachingProxy.Tests;
 
@@ -42,7 +47,8 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   private readonly List<IHost> myHosts = [];
   private readonly RemoteServers.RemoteServer myRemoteServer = new("/real", upstreamServer.Url, new CacheDuration());
 
-  private TestServer CreateServer(bool signedLinks, TimeSpan? cacheOffsetDuration = null, int inlineThresholdBytes = TestInlineThresholdBytes)
+  private TestServer CreateServer(bool signedLinks, TimeSpan? cacheOffsetDuration = null, int inlineThresholdBytes = TestInlineThresholdBytes,
+    CacheDuration? distributedCacheDuration = null)
   {
     var config = new CachingProxyConfig
     {
@@ -51,6 +57,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
         CacheOffsetDuration = cacheOffsetDuration ?? TimeSpan.FromSeconds(5),
         InlineThresholdBytes = inlineThresholdBytes,
       },
+      DistributedCacheDuration = distributedCacheDuration ?? new CacheDuration(),
       Prefixes = [$"/real={upstreamServer.Url}"],
     };
 
@@ -71,6 +78,21 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
             // Real system clock: the signed-link path lets the real client compute the presigned
             // URL, whose Expires must be in the future (no test here advances time).
               .Replace(ServiceDescriptor.Singleton<IAmazonS3>(myS3));
+
+            // Opt-in L2: wire an in-memory distributed cache so HasDistributedCache is true and the
+            // DistributedCacheDuration TTLs actually apply, without needing a real Redis (Program only
+            // wires L2 when a Redis connection string is configured).
+            if (distributedCacheDuration != null)
+            {
+              CachedResponseFormatter.Register();
+              services.AddSingleton<IDistributedCache>(
+                new MemoryDistributedCache(Options.Create(new MemoryDistributedCacheOptions())));
+              services.AddFusionCache()
+                .WithSerializer(new FusionCacheCysharpMemoryPackSerializer())
+                // The registered L2 here is a MemoryDistributedCache, which the builder treats as
+                // "not a real distributed cache" and skips by default; opt in so HasDistributedCache holds.
+                .WithRegisteredDistributedCache(ignoreMemoryDistributedCache: false);
+            }
           })
           .Configure((context, builder) => builder.ConfigureOurApp(context.Configuration));
       })
@@ -161,6 +183,27 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     // GetUtcNow() was sampled during the request, so Expires lands inside the [before, after] window
     // shifted by offset + okDuration.
     Assert.InRange(myS3.LastPresignExpires.Value, before + offset + okDuration, after + offset + okDuration);
+  }
+
+  [Fact]
+  public async Task Signed_Redirect_Expiry_Uses_Longer_Distributed_Cache_Duration()
+  {
+    // With an L2 (distributed) cache wired, the redirect survives L1 eviction and is re-served from
+    // L2 for the longer DistributedCacheDuration. The presigned link must be sized against that
+    // durable lifetime (not the shorter L1 TTL), or an L2-served redirect would carry an expired URL:
+    //   Expires = now + CacheOffsetDuration + the OK(200) DISTRIBUTED duration.
+    var offset = TimeSpan.FromSeconds(30);
+    var l2OkDuration = TimeSpan.FromMinutes(20); // longer than the 5-min L1 default for OK
+    var server = CreateServer(signedLinks: true, cacheOffsetDuration: offset,
+      distributedCacheDuration: new CacheDuration { [HttpStatusCode.OK] = l2OkDuration });
+
+    var before = DateTime.UtcNow;
+    using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
+    var after = DateTime.UtcNow;
+
+    Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
+    Assert.NotNull(myS3.LastPresignExpires);
+    Assert.InRange(myS3.LastPresignExpires.Value, before + offset + l2OkDuration, after + offset + l2OkDuration);
   }
 
   [Fact]
