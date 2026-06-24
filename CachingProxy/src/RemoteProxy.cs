@@ -166,7 +166,7 @@ public partial class RemoteProxy(
     }
     catch (OperationCanceledException canceledException)
     {
-      if (context.RequestAborted == canceledException.CancellationToken) throw;
+      if (canceledException.CancellationToken == context.RequestAborted) throw;
 
       // Canceled by internal token means timeout
 

@@ -100,7 +100,7 @@ public class CachingProxy
 
       await using (var stream = new FileStream(tempFile, FileMode.CreateNew, FileAccess.Write, FileShare.None, BUFFER_SIZE, FileOptions.Asynchronous))
       {
-        await using (var sourceStream = await response.Content.ReadAsStreamAsync())
+        await using (var sourceStream = await response.Content.ReadAsStreamAsync(context.RequestAborted))
           await CopyToTwoStreamsAsync(sourceStream, context.Response.Body, stream, context.RequestAborted);
       }
 
@@ -118,13 +118,14 @@ public class CachingProxy
 
       File.Move(tempFile, cachedFile, true);
     }
-    catch (OperationCanceledException)
+    catch (OperationCanceledException canceledException)
     {
       // Probable cause: OperationCanceledException while streaming the upstream response body
       // Probable cause: OperationCanceledException from this service's client (context.RequestAborted)
 
-      // Don't throw this exception, it's most likely caused by the client disconnecting.
-      // However, if it was cancelled for any other reason we need to prevent empty responses.
+      if (canceledException.CancellationToken == context.RequestAborted) throw;
+
+      // However, if it was cancelled for any other reason, we need to prevent empty responses.
       context.Abort();
     }
     finally
@@ -145,6 +146,7 @@ public class CachingProxy
     {
       action();
     }
+    catch (OperationCanceledException) {}
     catch (Exception e)
     {
       myLogger.Log(LogLevel.Error, e, "LogSilently: {Message}", e.Message);
