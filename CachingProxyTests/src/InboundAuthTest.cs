@@ -97,6 +97,32 @@ public class InboundAuthTest : IAsyncLifetime
   }
 
   [Fact]
+  public async Task Authorized_Response_Is_Cache_Control_Private()
+  {
+    // An authenticated request is served only to the requesting client, so it must not be
+    // stored by shared/intermediary caches.
+    using var client = myProxyHost!.GetTestServer().CreateClient();
+    client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", MintToken());
+
+    var response = await client.GetAsync("/private/one.jar");
+
+    Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    // HttpResponseHeaders re-serializes the parsed directives, ordering "private" after max-age.
+    Assert.Equal("max-age=31536000, private", response.Headers.CacheControl?.ToString());
+  }
+
+  [Fact]
+  public async Task Anonymous_Response_Stays_Cache_Control_Public()
+  {
+    using var client = myProxyHost!.GetTestServer().CreateClient();
+
+    var response = await client.GetAsync("/public/plain.jar");
+
+    Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    Assert.Equal("public, max-age=31536000", response.Headers.CacheControl?.ToString());
+  }
+
+  [Fact]
   public async Task Protected_Prefix_With_Valid_Token_As_Basic_Password_Is_Served()
   {
     // Basic-only clients (Maven/Gradle/npm) carry the JWT as the Basic password; the username is ignored.

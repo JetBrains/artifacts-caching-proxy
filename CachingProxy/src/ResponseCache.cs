@@ -41,19 +41,30 @@ public sealed record CachedResponse(HttpStatusCode StatusCode, IHeaderDictionary
     {
       context.Response.Headers[key] = value;
     }
-    if (StatusCode is >= HttpStatusCode.OK and < HttpStatusCode.MultipleChoices)
-    {
-      // For successful (2xx) responses, the cached response is always eternally cacheable.
-      context.Response.Headers.CacheControl = EternalCachingHeader;
-    }
-
     context.Response.StatusCode = (int)StatusCode;
+    SetCachingHeaderFor(context);
+
     if (Body != null)
       await context.Response.BodyWriter.WriteAsync(Body, context.RequestAborted);
   }
 
-  public static readonly StringValues EternalCachingHeader =
+  private static readonly StringValues ourEternalCachingHeader =
     new CacheControlHeaderValue { Public = true, MaxAge = TimeSpan.FromDays(365) }.ToString();
+
+  private static readonly StringValues ourPrivateCachingHeader =
+    new CacheControlHeaderValue { Private = true, MaxAge = TimeSpan.FromDays(365) }.ToString();
+
+  // Authorized (authenticated) responses are served only to the requesting client, so they
+  // must not be stored by shared/intermediary caches. Anonymous responses stay public.
+  public static void SetCachingHeaderFor(HttpContext context)
+  {
+    // For successful (2xx) responses, the cached response is always eternally cacheable.
+    if (context.Response.StatusCode is >= StatusCodes.Status200OK and < StatusCodes.Status300MultipleChoices)
+    {
+      context.Response.Headers.CacheControl =
+        context.User.Identity?.IsAuthenticated == true ? ourPrivateCachingHeader : ourEternalCachingHeader;
+    }
+  }
 
   public static readonly CachedResponse MethodNotAllowed = new(HttpStatusCode.MethodNotAllowed, new HeaderDictionary());
   public static readonly CachedResponse InvalidPath = new(HttpStatusCode.BadRequest, new HeaderDictionary(), [.. "Invalid request path"u8]);
