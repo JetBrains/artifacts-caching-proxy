@@ -17,6 +17,15 @@ namespace JetBrains.CachingProxy;
 /// username and the token is the password. The matched prefix serves proxy-fetched private artifacts, so
 /// it also requires a validated inbound client JWT (see <see cref="RemoteServers"/>).</para>
 ///
+/// <para><b>GitHub App mode</b> (<see cref="ClientId"/> set together with <see cref="PrivateKey"/>):
+/// GitHub does not support the OAuth2 client-credentials grant, so a GitHub App authenticates
+/// server-to-server by signing a short-lived RS256 JWT with its private key and exchanging it for an
+/// installation access token (see <see cref="GitHubAppInstallationTokenProvider"/>).
+/// The token is sent upstream as <c>Authorization: <see cref="AuthScheme"/> &lt;token&gt;</c> (Bearer by
+/// default). Here <see cref="ClientId"/> is the JWT issuer (the App's client id); <see cref="TokenEndpoint"/>
+/// and <see cref="ClientSecret"/> are not used. Like client-credentials mode it serves proxy-fetched
+/// private artifacts, so it also requires a validated inbound client JWT.</para>
+///
 /// <para><b>Redirect-only / external-auth mode</b> (<see cref="ClientId"/> empty): the proxy holds no
 /// upstream credentials. The matched prefix is always 307-redirected to the origin (e.g. CloudFront),
 /// which performs its own per-user authorization and serves the content directly — so the proxy neither
@@ -38,7 +47,21 @@ public record UpstreamAuth
   // Optional space-separated OAuth scopes, added to the token request when set.
   public string? Scope { get; init; }
 
-  // True when this entry carries upstream OAuth credentials (credential mode). False means redirect-only
-  // / external-auth mode: the proxy always redirects to the origin and does not require inbound auth.
+  // GitHub App mode (used instead of TokenEndpoint/ClientSecret). Supply the App's RSA private key inline
+  // as PEM text (PrivateKey); ClientId is reused as the JWT issuer. InstallationId is optional — when
+  // omitted it is auto-resolved if the App has exactly one installation. GitHubApiBaseUrl/AuthScheme have
+  // sensible defaults (GitHub.com / Bearer).
+  public string? PrivateKey { get; init; }
+  public long? InstallationId { get; init; }
+  public string GitHubApiBaseUrl { get; init; } = "https://api.github.com";
+  public string AuthScheme { get; init; } = "Bearer";
+
+  // True when this entry uses GitHub App auth (a private key is configured); ClientId then acts as the
+  // JWT issuer rather than an OAuth client id.
+  public bool IsGitHubApp => !string.IsNullOrEmpty(PrivateKey);
+
+  // True when this entry carries upstream credentials (client-credentials or GitHub App mode). False means
+  // redirect-only / external-auth mode: the proxy always redirects to the origin and does not require
+  // inbound auth.
   public bool HasCredentials => !string.IsNullOrEmpty(ClientId);
 }

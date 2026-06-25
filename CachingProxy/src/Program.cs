@@ -3,19 +3,13 @@ using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Reflection;
-using System.Text;
 using System.Threading.Tasks;
 using Amazon.Extensions.NETCore.Setup;
 using Amazon.Runtime;
 using Amazon.S3;
-using Duende.AccessTokenManagement;
-using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.StaticFiles;
-using Microsoft.IdentityModel.Protocols;
-using Microsoft.IdentityModel.Protocols.OpenIdConnect;
-using Microsoft.IdentityModel.Tokens;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Caching.StackExchangeRedis;
 using Microsoft.Extensions.Configuration;
@@ -121,6 +115,12 @@ public static class Program
       .AddHealthChecks()
       .AddCheck<HealthCheck>(nameof(HealthCheck));
 
+    // Default User-Agent for every HttpClient created by IHttpClientFactory (the proxy client, the GitHub
+    // App REST client, and Duende's token client). Per-client configuration runs after this, so callers can
+    // still append to it (e.g. ProxyHttpClient adds the optional UserAgentComment).
+    services.ConfigureHttpClientDefaults(builder =>
+      builder.ConfigureHttpClient(client => client.DefaultRequestHeaders.UserAgent.Add(ourUserAgent)));
+
     var fusionCacheBuilder = services
       .AddFusionCache()
       .AsHybridCache()
@@ -215,81 +215,9 @@ public static class Program
         .AddCheck<CachingProxy.HealthCheck>(nameof(CachingProxy));
     }
 
-    // Per-upstream OAuth client-credentials auth. One token-management client per credential-bearing
-    // UpstreamAuth entry, named by its ClientId so IClientCredentialsTokenManager.GetUpstreamAuthorizationHeaderAsync
-    // can look the token up by the same key. Registered only when something is configured, so unauthenticated
-    // deployments pull in nothing extra (RemoteProxy resolves the token manager optionally). The token
-    // manager defaults to authenticating the client on the token endpoint with HTTP Basic. Credential-less
-    // entries (redirect-only / external auth) register no client — they never fetch a token.
-    var upstreamAuth = configuration.Get<CachingProxyConfig>()?.UpstreamAuth ?? [];
-    if (upstreamAuth.Length > 0)
-    {
-      var tokenManagement = services.AddClientCredentialsTokenManagement();
-      foreach (var auth in upstreamAuth)
-      {
-        if (!auth.HasCredentials)
-          continue;
-
-        // ClientId is set, so this is credential mode: the token endpoint and secret are mandatory. Fail
-        // fast on a partial config rather than sending a null token endpoint / unauthenticated token request.
-        if (auth.TokenEndpoint == null || string.IsNullOrEmpty(auth.ClientSecret))
-          throw new ArgumentException(
-            $"UpstreamAuth '{auth.UrlPrefix}' sets ClientId but is missing TokenEndpoint and/or ClientSecret; " +
-            "both are required for client-credentials auth. Omit ClientId for a redirect-only (external auth) entry.");
-
-        tokenManagement.AddClient(auth.ClientId!, client =>
-        {
-          client.TokenEndpoint = auth.TokenEndpoint;
-          client.ClientId = ClientId.Parse(auth.ClientId!);
-          client.ClientSecret = ClientSecret.Parse(auth.ClientSecret);
-          if (!string.IsNullOrEmpty(auth.Scope))
-            client.Scope = Scope.Parse(auth.Scope);
-        });
-      }
-    }
-
-    // Inbound JWT bearer validation. Registered only when InboundAuth is configured, so deployments
-    // without inbound auth pull in nothing extra. Issuer/audience/lifetime are validated explicitly;
-    // the signing keys come from the configured JWKS endpoint via a ConfigurationManager that caches
-    // and auto-refreshes them (so key rotation needs no redeploy). The matching AuthorizeAttribute is
-    // attached per prefix in RemoteServers when the prefix's upstream requires auth.
-    var inboundAuth = configuration.Get<CachingProxyConfig>()?.InboundAuth;
-    if (inboundAuth != null)
-    {
-      var jwks = new ConfigurationManager<OpenIdConnectConfiguration>(
-        inboundAuth.JwksUrl.AbsoluteUri,
-        new JwksConfigurationRetriever(),
-        new HttpDocumentRetriever { RequireHttps = inboundAuth.JwksUrl.Scheme == Uri.UriSchemeHttps });
-
-      services
-        .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
-        .AddJwtBearer(options =>
-        {
-          options.ConfigurationManager = jwks;
-          options.TokenValidationParameters = new TokenValidationParameters
-          {
-            ValidateIssuer = true,
-            ValidIssuer = inboundAuth.Issuer,
-            ValidateAudience = true,
-            ValidAudience = inboundAuth.Audience,
-            ValidateIssuerSigningKey = true,
-            ValidateLifetime = true,
-            RequireExpirationTime = inboundAuth.RequireExpiration,
-          };
-          // Accept the JWT carried as the HTTP Basic password too, not just "Authorization: Bearer
-          // <jwt>". Clients that only speak Basic (Maven/Gradle/npm) put the token in the password.
-          options.Events = new JwtBearerEvents
-          {
-            OnMessageReceived = context =>
-            {
-              if (string.IsNullOrEmpty(context.Token))
-                context.Token = GetTokenFromBasicPassword(context.Request.Headers.Authorization.ToString());
-              return Task.CompletedTask;
-            },
-          };
-        });
-      services.AddAuthorization();
-    }
+    services
+      .AddUpstreamAuth(configuration)
+      .AddInboundAuth(configuration);
 
     services
       .AddHttpClient<ProxyHttpClient>(static (provider, client) =>
@@ -298,13 +226,13 @@ public static class Program
         client.Timeout = TimeSpan.FromSeconds(config.RequestTimeoutSec);
         client.DefaultRequestVersion = HttpVersion.Version20;
         client.DefaultVersionPolicy = HttpVersionPolicy.RequestVersionOrHigher;
-        var userAgentHeader = client.DefaultRequestHeaders.UserAgent;
-        userAgentHeader.Add(ourUserAgent);
+        // The base product token is added globally (ConfigureHttpClientDefaults); only append the optional
+        // deployment-specific comment here.
         if (config.UserAgentComment is { Length: >0 } userAgentComment)
         {
           try
           {
-            userAgentHeader.Add(new ProductInfoHeaderValue(userAgentComment));
+            client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue(userAgentComment));
           }
           catch (FormatException ex)
           {
@@ -326,41 +254,12 @@ public static class Program
     return services;
   }
 
-  // Extracts the password from an "Authorization: Basic base64(user:password)" header, used to accept
-  // a JWT that a Basic-only client (Maven/Gradle/npm) sent as the password. Returns null when the
-  // header is absent, not Basic, malformed, or carries no password.
-  private static string? GetTokenFromBasicPassword(string? authorizationHeader)
-  {
-    if (!AuthenticationHeaderValue.TryParse(authorizationHeader, out var header) ||
-        !"Basic".Equals(header.Scheme, StringComparison.OrdinalIgnoreCase) ||
-        header.Parameter is not { Length: > 0 } parameter)
-      return null;
-
-    try
-    {
-      var decoded = Encoding.UTF8.GetString(Convert.FromBase64String(parameter));
-      var separator = decoded.IndexOf(':');
-      return separator >= 0 && separator < decoded.Length - 1 ? decoded[(separator + 1)..] : null;
-    }
-    catch (FormatException)
-    {
-      return null;
-    }
-  }
-
   public static void ConfigureOurApp(this IApplicationBuilder app, IConfiguration configuration)
   {
     var cachingProxyConfig = configuration.Get<CachingProxyConfig>()!;
     app.UseRouting();
     app.UseHealthChecks("/health");
-    // After UseRouting (so the matched endpoint's AuthorizeAttribute metadata is available) and before
-    // the proxy middleware below (which does the real work and would otherwise serve unauthenticated
-    // requests). /health is already handled above, so it stays public.
-    if (cachingProxyConfig.InboundAuth != null)
-    {
-      app.UseAuthentication();
-      app.UseAuthorization();
-    }
+    app.UseInboundAuth(cachingProxyConfig);
     if (!string.IsNullOrEmpty(cachingProxyConfig.S3?.BucketName))
     {
       app.UseMiddleware<S3CachingMiddleware>();

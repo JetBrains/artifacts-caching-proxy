@@ -6,7 +6,6 @@ using System.Net.Http;
 using System.Net.Mime;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
-using Duende.AccessTokenManagement;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
 
@@ -26,7 +25,7 @@ public partial class RemoteProxy(
   ResponseCache responseCache,
   CachingProxyMetrics metrics,
   ILogger<RemoteProxy> logger,
-  IClientCredentialsTokenManager? tokenManager = null)
+  IUpstreamAuthorizationProvider? authProvider = null)
 {
   [GeneratedRegex(@"^([\x20a-zA-Z_\-0-9./+@]|%[0-9a-fA-F]{2})+$", RegexOptions.Compiled)]
   private static partial Regex OurGoodPathChars { get; }
@@ -160,9 +159,9 @@ public partial class RemoteProxy(
     HttpResponseMessage response;
     try
     {
-      if (tokenManager != null && auth != null)
+      if (authProvider != null && auth != null)
       {
-        request.Headers.Authorization = await tokenManager.GetUpstreamAuthorizationHeaderAsync(auth, context.RequestAborted);
+        request.Headers.Authorization = await authProvider.GetAuthorizationHeaderAsync(auth, context.RequestAborted);
       }
       response = await httpClient.Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, context.RequestAborted);
     }
