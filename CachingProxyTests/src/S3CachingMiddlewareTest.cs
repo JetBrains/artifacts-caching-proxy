@@ -47,14 +47,14 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   private readonly List<IHost> myHosts = [];
   private readonly RemoteServers.RemoteServer myRemoteServer = new("/real", upstreamServer.Url, new CacheDuration());
 
-  private TestServer CreateServer(bool signedLinks, TimeSpan? cacheOffsetDuration = null, int inlineThresholdBytes = TestInlineThresholdBytes,
+  private TestServer CreateServer(bool signedLinks, TimeSpan? signedLinkTTL = null, int inlineThresholdBytes = TestInlineThresholdBytes,
     CacheDuration? distributedCacheDuration = null)
   {
     var config = new CachingProxyConfig
     {
       S3 = new CachingProxyConfig.S3Config(BucketName, signedLinks)
       {
-        CacheOffsetDuration = cacheOffsetDuration ?? TimeSpan.FromSeconds(5),
+        SignedLinkTTL = signedLinkTTL ?? TimeSpan.FromMinutes(10),
         InlineThresholdBytes = inlineThresholdBytes,
       },
       DistributedCacheDuration = distributedCacheDuration ?? new CacheDuration(),
@@ -165,14 +165,15 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   }
 
   [Fact]
-  public async Task Signed_Redirect_Expiry_Includes_Configured_CacheOffset()
+  public async Task Signed_Redirect_Expiry_Uses_Fixed_Ttl()
   {
-    // The presigned link must outlive the cached redirect by the configured offset:
-    //   Expires = now + CacheOffsetDuration + the OK(200) cache duration.
-    // A distinctive 90s offset makes the assertion fail if the 5s default were used instead.
-    var offset = TimeSpan.FromSeconds(90);
-    var okDuration = TimeSpan.FromMinutes(5); // CacheDuration default for OK
-    var server = CreateServer(signedLinks: true, cacheOffsetDuration: offset);
+    // The link is signed on the fly per request, so its expiry is a fixed TTL from "now" and does NOT
+    // depend on the cached redirect's lifetime (L1 or L2 duration): Expires = now + SignedLinkTTL.
+    // A distinctive 90s TTL makes the assertion fail if the 5-minute default were used instead, and a
+    // long L2 OK duration proves the expiry is not sized against the durable cache lifetime.
+    var ttl = TimeSpan.FromSeconds(90);
+    var server = CreateServer(signedLinks: true, signedLinkTTL: ttl,
+      distributedCacheDuration: new CacheDuration { [HttpStatusCode.OK] = TimeSpan.FromMinutes(20) });
 
     var before = DateTime.UtcNow;
     using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
@@ -181,29 +182,40 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
     Assert.NotNull(myS3.LastPresignExpires);
     // GetUtcNow() was sampled during the request, so Expires lands inside the [before, after] window
-    // shifted by offset + okDuration.
-    Assert.InRange(myS3.LastPresignExpires.Value, before + offset + okDuration, after + offset + okDuration);
+    // shifted by the TTL.
+    Assert.InRange(myS3.LastPresignExpires.Value, before + ttl, after + ttl);
   }
 
   [Fact]
-  public async Task Signed_Redirect_Expiry_Uses_Longer_Distributed_Cache_Duration()
+  public async Task Signed_Redirect_Is_Re_Signed_On_Cache_Hit()
   {
-    // With an L2 (distributed) cache wired, the redirect survives L1 eviction and is re-served from
-    // L2 for the longer DistributedCacheDuration. The presigned link must be sized against that
-    // durable lifetime (not the shorter L1 TTL), or an L2-served redirect would carry an expired URL:
-    //   Expires = now + CacheOffsetDuration + the OK(200) DISTRIBUTED duration.
-    var offset = TimeSpan.FromSeconds(30);
-    var l2OkDuration = TimeSpan.FromMinutes(20); // longer than the 5-min L1 default for OK
-    var server = CreateServer(signedLinks: true, cacheOffsetDuration: offset,
-      distributedCacheDuration: new CacheDuration { [HttpStatusCode.OK] = l2OkDuration });
+    // The cached redirect stores an unsigned, verb-agnostic Location and is signed on the fly. A second
+    // GET is a cache HIT but must still produce a freshly-signed link with a later expiry, so an
+    // L2-served redirect never hands the client a stale (cached-at-store-time) URL.
+    var ttl = TimeSpan.FromSeconds(90);
+    var server = CreateServer(signedLinks: true, signedLinkTTL: ttl);
+    myS3.Objects[GetPathKey("/real/a.jar")] = (ourLargeBody, "application/java-archive", null);
+
+    using (var miss = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method))
+    {
+      Assert.Equal(HttpStatusCode.RedirectKeepVerb, miss.StatusCode);
+      AssertStatusHeader(miss, CachingProxyStatus.MISS);
+      Assert.Contains("X-Amz-", miss.Headers.Location?.ToString());
+    }
+    var missExpiry = myS3.LastPresignExpires;
+    Assert.NotNull(missExpiry);
 
     var before = DateTime.UtcNow;
-    using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
+    using var hit = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
     var after = DateTime.UtcNow;
 
-    Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
+    Assert.Equal(HttpStatusCode.RedirectKeepVerb, hit.StatusCode);
+    AssertStatusHeader(hit, CachingProxyStatus.HIT);
+    // Replayed from cache (no second probe), yet still presigned with a fresh TTL window.
+    Assert.Equal(1, myS3.GetObjectCalls);
+    Assert.Contains("X-Amz-", hit.Headers.Location?.ToString());
     Assert.NotNull(myS3.LastPresignExpires);
-    Assert.InRange(myS3.LastPresignExpires.Value, before + offset + l2OkDuration, after + offset + l2OkDuration);
+    Assert.InRange(myS3.LastPresignExpires.Value, before + ttl, after + ttl);
   }
 
   [Fact]
@@ -589,8 +601,8 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
       var statuses = responses
         .Select(r => r.Headers.GetValues(CachingProxyConstants.StatusHeader).First())
         .ToList();
-      Assert.Equal(1, statuses.Count(s => s == CachingProxyStatus.MISS.ToString()));
-      Assert.Equal(responses.Length - 1, statuses.Count(s => s == CachingProxyStatus.HIT.ToString()));
+      Assert.Equal(1, statuses.Count(s => s == nameof(CachingProxyStatus.MISS)));
+      Assert.Equal(responses.Length - 1, statuses.Count(s => s == nameof(CachingProxyStatus.HIT)));
 
       Assert.Equal(1, myS3.GetObjectCalls); // probed once despite 16 concurrent misses
       Assert.Equal(1, myS3.PutObjectCalls); // uploaded once

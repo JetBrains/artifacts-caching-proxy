@@ -1,7 +1,5 @@
 using System;
 using System.IO;
-using System.Linq;
-using System.Text.RegularExpressions;
 
 namespace JetBrains.CachingProxy;
 
@@ -9,9 +7,10 @@ public class CachingProxyConfig
 {
   public record S3Config(string? BucketName = null, bool SignedLinks = false)
   {
-    // Added to the S3 redirect cache duration so a presigned link stays valid slightly longer than the
-    // cached redirect itself, avoiding a race where the link expires right as the redirect is replayed.
-    public TimeSpan CacheOffsetDuration { get; init; } = TimeSpan.FromSeconds(5);
+    // Lifetime of a presigned redirect link. The link is (re)signed on every request that serves the
+    // redirect (including cache HITs), so it only needs to outlive a single client's redirect-follow,
+    // not the cached redirect entry — a short TTL is both sufficient and safe.
+    public TimeSpan SignedLinkTTL { get; init; } = TimeSpan.FromMinutes(10);
 
     // Objects whose body fits within this many bytes are probed in a single ranged GET and served
     // inline (200 + body, cached in L1/L2); larger objects are redirected to S3. Raising it trades

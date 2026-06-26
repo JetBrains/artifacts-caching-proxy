@@ -114,11 +114,13 @@ public partial class RemoteProxy(
           cachedResponse with { StatusCode = ClientFacingStatus(cachedResponse.StatusCode) });
         return null;
 
-      // The caller decides whether the key includes the HTTP method (the S3 backend does so for
-      // signed links), so a verb-specific presigned redirect only ever replays for the same verb it
-      // was stored under. A cached 2xx is replayed when it carries the full body (the S3 backend
-      // inlines small objects into the cache) or when the request is a HEAD (which needs only the
-      // metadata); a bodyless 2xx is never replayed to a GET, whose body lives on disk/S3 instead.
+      // The caller decides whether the key includes the HTTP method (the S3 backend does so to keep a
+      // large object's HEAD metadata distinct from its GET redirect), so such a redirect only ever
+      // replays for the same verb it was stored under. The redirect Location itself is verb-agnostic
+      // (the S3 backend signs it on the fly per request). A cached 2xx is replayed when it carries the
+      // full body (the S3 backend inlines small objects into the cache) or when the request is a HEAD
+      // (which needs only the metadata); a bodyless 2xx is never replayed to a GET, whose body lives
+      // on disk/S3 instead.
       case >= HttpStatusCode.MultipleChoices:
       case >= HttpStatusCode.OK when isHead || cachedResponse.Body != null:
         await SetStatusAsync(context, CachingProxyStatus.HIT, cachedResponse);

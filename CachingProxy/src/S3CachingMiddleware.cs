@@ -21,6 +21,12 @@ namespace JetBrains.CachingProxy;
 [SuppressMessage("ReSharper", "ClassNeverInstantiated.Global")]
 public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amazonS3, CachingProxyConfig config, RemoteProxy remoteProxy, ResponseCache responseCache, TimeProvider timeProvider, ILogger<S3CachingMiddleware>  logger)
 {
+  // The bucket endpoint URL (assumed to end with '/', as AWS virtual-hosted-style endpoints do, so it
+  // joins to an "aa/bb/<hash>" key with a single separator). Used both to build the redirect Location
+  // and to recognise our own bucket redirects when signing them on the fly.
+  private readonly string myBucketBaseUrl = amazonS3.Config.DetermineServiceOperationEndpoint(
+    new ServiceOperationEndpointParameters(new GetObjectRequest { BucketName = config.S3!.BucketName })).URL;
+
   // The ranged-probe window: a body that fits is served inline, a larger one is redirected. Sized from
   // S3.InlineThresholdBytes (default 32 KiB). config.S3 is non-null here — the middleware is only wired
   // when S3.BucketName is set (see Program.ConfigureOurApp).
@@ -68,10 +74,12 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
 
     // A HEAD is always answered from memory with the object's metadata (never redirected), and a
     // redirect is therefore produced only for a GET. So the verb-specific key holds, per verb, a
-    // HEAD's large-object metadata head or a GET's (signed or unsigned) redirect — replayed only for
-    // the verb that produced it. The shared key holds the verb-agnostic values: inline bodies (plain
-    // bytes) and negative results. So a HEAD that prefetches a small object warms the following GET,
-    // and a missing object is probed/cached once for both verbs.
+    // HEAD's large-object metadata head or a GET's redirect — replayed only for the verb that produced
+    // it. The redirect is stored unsigned/verb-agnostic and signed on the fly per request (see the
+    // finally block), so the key is verb-specific not for signing but to keep a large object's HEAD
+    // metadata (200) distinct from its GET redirect (307). The shared key holds the verb-agnostic
+    // values: inline bodies (plain bytes) and negative results. So a HEAD that prefetches a small
+    // object warms the following GET, and a missing object is probed/cached once for both verbs.
     var verbKey = context.Request.Method + s3Key;
     var isHead = HttpMethods.IsHead(context.Request.Method);
 
@@ -193,41 +201,41 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
           break;
       }
     }
+    finally
+    {
+      // Sign the redirect on the fly. The cached redirect Location is stored unsigned (verb-agnostic),
+      // so a single cached entry is re-signed per request — every client (including cache HITs served
+      // from L2) gets a fresh, full-TTL presigned URL instead of a possibly expired cached one.
+      if (config.S3!.SignedLinks &&
+          context.Response.StatusCode == StatusCodes.Status307TemporaryRedirect &&
+          context.Response.Headers.Location is [{} location] &&
+          location.StartsWith(myBucketBaseUrl, StringComparison.Ordinal) &&
+          location.AsSpan(myBucketBaseUrl.Length).StartsWith(s3Key, StringComparison.Ordinal))
+      {
+        try
+        {
+          context.Response.Headers.Location = await amazonS3.GetPreSignedURLAsync(new GetPreSignedUrlRequest
+          {
+            BucketName = config.S3.BucketName,
+            Key = s3Key,
+            Verb = isHead ? HttpVerb.HEAD : HttpVerb.GET,
+            Expires = timeProvider.GetUtcNow().UtcDateTime + config.S3.SignedLinkTTL
+          });
+        }
+        catch (Exception e)
+        {
+          logger.LogError(e, "Failed to get pre-signed URL for {S3Key}", s3Key);
+        }
+      }
+    }
 
     return;
 
     async ValueTask RedirectToBucket()
     {
-      string location;
-      if (config.S3!.SignedLinks)
-      {
-        location = await amazonS3.GetPreSignedURLAsync(new GetPreSignedUrlRequest
-        {
-          BucketName = config.S3.BucketName,
-          Key = s3Key,
-          Verb = HttpMethods.IsHead(context.Request.Method) ? HttpVerb.HEAD : HttpVerb.GET,
-          Expires = timeProvider.GetUtcNow().UtcDateTime +
-                    config.S3.CacheOffsetDuration +
-                    responseCache.GetDurableDuration(remoteServer.CacheDuration, (HttpStatusCode)context.Response.StatusCode)
-        });
-      }
-      else
-      {
-        var endpoint = amazonS3.Config.DetermineServiceOperationEndpoint(
-          new ServiceOperationEndpointParameters(new GetObjectRequest
-          {
-            BucketName = config.S3.BucketName,
-            Key = s3Key,
-          }));
-        // Join with exactly one '/' and percent-encode each key segment (the path may contain
-        // spaces or other reserved characters), keeping the '/' separators intact.
-        var baseUrl = endpoint.URL.EndsWith('/') ? endpoint.URL : endpoint.URL + "/";
-        location = baseUrl + s3Key;
-      }
-
       var cachingResponse = new CachedResponse(HttpStatusCode.RedirectKeepVerb, new HeaderDictionary())
       {
-        Headers = { Location = location }
+        Headers = { Location = myBucketBaseUrl + s3Key }
       };
       // Only a GET redirects (a HEAD is served from memory), so the redirect always belongs under the
       // verb-specific key and is never replayed to a HEAD.
