@@ -557,6 +557,25 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
       });
   }
 
+  [Theory]
+  // maven-metadata.xml with any extension is redirected (mutable). RedirectToRemoteUrlsRegex matches
+  // an arbitrary suffix (\..+), not just the well-known checksum extensions, so newer checksum
+  // algorithms or other companion files are covered too.
+  [InlineData("maven-metadata.xml.sha256")]
+  [InlineData("maven-metadata.xml.sha384")]
+  [InlineData("maven-metadata.xml.asc")]
+  public async Task Always_Redirect_MavenMetadataXml_AnyExtension(string fileName)
+  {
+    await AssertGetResponse($"/repo1.maven.org/maven2/org/apache/ant/ant-xz/{fileName}",
+      HttpStatusCode.RedirectKeepVerb,
+      (message, _) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.ALWAYS_REDIRECT);
+        Assert.Equal($"https://repo1.maven.org/maven2/org/apache/ant/ant-xz/{fileName}",
+          message.Headers.Location?.ToString());
+      });
+  }
+
   [Fact]
   public async Task No_Route_To_Host()
   {
