@@ -27,7 +27,8 @@ namespace JetBrains.CachingProxy.Tests;
 // upstream requires auth (matching UpstreamAuth) requires a validated client JWT; a prefix with a
 // public upstream stays public, as does /health. The proxy fetches the RSA signing key from a real
 // JWKS server. Asserts: valid token -> proxied, missing/wrong-key token -> 401, public prefix and
-// /health -> served without a token, and that a matched-upstream config with no InboundAuth fails to start.
+// /health -> served without a token, and that a matched-upstream prefix with no InboundAuth returns 401
+// (fails closed via the deny scheme).
 public class InboundAuthTest : IAsyncLifetime
 {
   private const string ClientId = "svc-proxy";
@@ -216,11 +217,16 @@ public class InboundAuthTest : IAsyncLifetime
   }
 
   [Fact]
-  public void Matched_Upstream_Without_InboundAuth_Throws()
+  public async Task Matched_Upstream_Without_InboundAuth_Is_Unauthorized()
   {
+    // A matched-upstream prefix carries [Authorize], but no inbound JWT scheme is configured. Rather than
+    // throwing a 500 (no authentication scheme) or serving it unauthenticated, the request must fail
+    // closed with 401 via the deny scheme registered when InboundAuth is absent.
     var upstreamUrl = UrlOf(myUpstreamServer);
     var config = new CachingProxyConfig
     {
+      LocalCachePath = myTempDirectory,
+      MinimumFreeDiskSpaceMb = 2,
       Prefixes = [$"/private={upstreamUrl}secure"],
       UpstreamAuth =
       [
@@ -235,28 +241,20 @@ public class InboundAuthTest : IAsyncLifetime
       // InboundAuth deliberately left null.
     };
 
-    Assert.Throws<ArgumentException>(() => new RemoteServers(config));
-  }
-
-  [Fact]
-  public void Credential_Less_Upstream_Without_InboundAuth_Does_Not_Throw()
-  {
-    // A credential-less UpstreamAuth (redirect-only / external auth, e.g. CloudFront) does NOT make the
-    // prefix require inbound auth, so a config with no InboundAuth must construct fine — contrast with
-    // Matched_Upstream_Without_InboundAuth_Throws, whose entry carries a ClientId.
-    var upstreamUrl = UrlOf(myUpstreamServer);
-    var config = new CachingProxyConfig
+    using var host = BuildProxyHost(config);
+    await host.StartAsync();
+    try
     {
-      Prefixes = [$"/cdn={upstreamUrl}cdn"],
-      UpstreamAuth =
-      [
-        new UpstreamAuth { UrlPrefix = new Uri(upstreamUrl, "cdn/").AbsoluteUri },
-      ],
-      // InboundAuth deliberately left null.
-    };
+      using var client = host.GetTestServer().CreateClient();
 
-    var servers = new RemoteServers(config);
-    Assert.Single(servers.Endpoints);
+      var response = await client.GetAsync("/private/one.jar");
+
+      Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    }
+    finally
+    {
+      await host.StopAsync();
+    }
   }
 
   private string MintToken(RSA? rsa = null, bool withExpiration = true)

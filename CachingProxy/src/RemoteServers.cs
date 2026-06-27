@@ -32,24 +32,13 @@ public class RemoteServers : EndpointDataSource
       var remoteServer = new RemoteServer(trimmedPrefix, remoteUri,
         config.CacheDuration.Union(prefix.CacheDuration), MatchAuth(remoteUri, config.UpstreamAuth));
 
-      // A prefix whose upstream carries credentials serves proxy-fetched private artifacts, so its inbound
-      // route must require a validated client JWT too (enforced by UseAuthentication/UseAuthorization).
-      // Attaching an AuthorizeAttribute without inbound validation configured would silently leave it
-      // unenforced, so fail fast instead. A credential-less auth entry is redirect-only (the origin
-      // authorizes — see UpstreamAuth), so it is intentionally left public/un-gated here.
-      EndpointMetadataCollection metadata;
-      if (remoteServer.Auth is { HasCredentials: true })
-      {
-        if (config.InboundAuth == null)
-          throw new ArgumentException(
-            $"Prefix '{prefix}' has a matching UpstreamAuth but InboundAuth is not configured; " +
-            "its route would be served without client authentication. Configure InboundAuth.");
-        metadata = new EndpointMetadataCollection(remoteServer, new AuthorizeAttribute());
-      }
-      else
-      {
-        metadata = new EndpointMetadataCollection(remoteServer);
-      }
+      // A prefix with a matched UpstreamAuth serves proxy-fetched private artifacts, so its inbound route
+      // must require a validated client JWT too: attach an AuthorizeAttribute (enforced by
+      // UseAuthentication/UseAuthorization). A prefix with no matched auth has no upstream credentials and
+      // is left public/un-gated.
+      var metadata = remoteServer.Auth is not null ?
+        new EndpointMetadataCollection(remoteServer, new AuthorizeAttribute()) :
+        new EndpointMetadataCollection(remoteServer);
 
       // Overlapping prefixes (e.g. "/aprefix" and "/aprefix/too") both match via their {**path}
       // catch-all, and routing breaks such ties by Endpoint.Order, NOT by specificity. So order by
@@ -58,7 +47,7 @@ public class RemoteServers : EndpointDataSource
       // them are never observed.
       endpoints[i] = new RouteEndpoint(
         requestDelegate: static _ => Task.CompletedTask,
-        routePattern: RoutePatternFactory.Parse(trimmedPrefix + $"/{{**{ourPathParameterName}}}"),
+        routePattern: RoutePatternFactory.Parse(trimmedPrefix + $"/{{**{PathParameterName}}}"),
         order: 0, // Yes, the same order for everything. Real order will be determined by the ASP.NET in runtime according to prefixes topology.
         metadata: metadata,
         displayName: $"Metadata-only {prefix}");
@@ -67,7 +56,7 @@ public class RemoteServers : EndpointDataSource
     Endpoints = endpoints;
   }
 
-  private const string ourPathParameterName = "path";
+  private const string PathParameterName = "path";
 
   // Among the auth entries whose UrlPrefix is a prefix of the upstream URL, the longest (most
   // specific) one wins, so a host-wide block and a path-scoped block can coexist. Returns null when
@@ -80,7 +69,7 @@ public class RemoteServers : EndpointDataSource
 
   public static RemoteServer? GetRemoteServer(HttpContext context, out string? path)
   {
-    path = context.GetRouteValue(ourPathParameterName)?.ToString();
+    path = context.GetRouteValue(PathParameterName)?.ToString();
     return context.GetEndpoint()?.Metadata.GetMetadata<RemoteServer>();
   }
 

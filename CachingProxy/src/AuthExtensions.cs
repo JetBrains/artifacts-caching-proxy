@@ -1,15 +1,20 @@
 using System;
 using System.Net.Http.Headers;
 using System.Text;
+using System.Text.Encodings.Web;
 using System.Threading.Tasks;
 using Duende.AccessTokenManagement;
+using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Http;
 using Microsoft.IdentityModel.Protocols;
 using Microsoft.IdentityModel.Protocols.OpenIdConnect;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace JetBrains.CachingProxy;
 
@@ -24,41 +29,31 @@ public static class AuthExtensions
   /// client-credentials (Duende token management, one client per entry named by its ClientId) and GitHub
   /// App (a signed JWT exchanged for an installation token — GitHub does not support the client-credentials
   /// grant). The dispatch between them lives in <see cref="IUpstreamAuthorizationProvider"/>, which
-  /// RemoteProxy resolves optionally, so unauthenticated deployments pull in nothing extra. Credential-less
-  /// entries (redirect-only / external auth) register no client — they never fetch a token.
+  /// RemoteProxy resolves optionally, so unauthenticated deployments pull in nothing extra.
   /// </summary>
   public static IServiceCollection AddUpstreamAuth(this IServiceCollection services, IConfiguration configuration)
   {
     var upstreamAuth = configuration.Get<CachingProxyConfig>()?.UpstreamAuth ?? [];
-    if (upstreamAuth.Length == 0)
-      return services;
 
-    // Only stand up Duende client-credentials management when at least one entry needs it; a GitHub-App-only
-    // (or redirect-only) deployment skips it entirely.
-    var hasClientCredentialEntry = false;
-    foreach (var auth in upstreamAuth)
-      if (auth is { HasCredentials: true, IsGitHubApp: false }) { hasClientCredentialEntry = true; break; }
-
-    var tokenManagement = hasClientCredentialEntry ? services.AddClientCredentialsTokenManagement() : null;
+    ClientCredentialsTokenManagementBuilder? tokenManagement = null;
     foreach (var auth in upstreamAuth)
     {
-      if (!auth.HasCredentials)
-        continue;
-
       // GitHub App mode (ClientId is the JWT issuer, PrivateKey is the signing key): the installation
       // token is minted on demand by GitHubAppInstallationTokenProvider, so there is no Duende client to
       // register here. TokenEndpoint/ClientSecret are not used.
       if (auth.IsGitHubApp)
         continue;
 
+      tokenManagement ??= services.AddClientCredentialsTokenManagement();
+
       // ClientId is set without a private key, so this is client-credentials mode: the token endpoint and
       // secret are mandatory. Fail fast rather than sending a null token endpoint / unauthenticated request.
       if (auth.TokenEndpoint == null || string.IsNullOrEmpty(auth.ClientSecret))
         throw new ArgumentException(
           $"UpstreamAuth '{auth.UrlPrefix}' sets ClientId but is missing TokenEndpoint and/or ClientSecret; " +
-          "both are required for client-credentials auth. Omit ClientId for a redirect-only (external auth) entry.");
+          "both are required for client-credentials auth.");
 
-      tokenManagement!.AddClient(auth.ClientId!, client =>
+      tokenManagement.AddClient(auth.ClientId!, client =>
       {
         client.TokenEndpoint = auth.TokenEndpoint;
         client.ClientId = ClientId.Parse(auth.ClientId!);
@@ -78,17 +73,28 @@ public static class AuthExtensions
   }
 
   /// <summary>
-  /// Inbound JWT bearer validation. Registered only when InboundAuth is configured, so deployments without
-  /// inbound auth pull in nothing extra. Issuer/audience/lifetime are validated explicitly; the signing
-  /// keys come from the configured JWKS endpoint via a ConfigurationManager that caches and auto-refreshes
-  /// them (so key rotation needs no redeploy). The matching AuthorizeAttribute is attached per prefix in
-  /// RemoteServers when the prefix's upstream requires auth.
+  /// Inbound JWT bearer validation. Authentication/authorization are always registered, since a prefix
+  /// whose upstream requires auth carries an AuthorizeAttribute (attached per prefix in RemoteServers)
+  /// regardless of inbound config. When InboundAuth is configured, the JWT bearer scheme validates
+  /// issuer/audience/lifetime explicitly; the signing keys come from the configured JWKS endpoint via a
+  /// ConfigurationManager that caches and auto-refreshes them (so key rotation needs no redeploy). When it
+  /// is NOT configured, a fail-closed default scheme (<see cref="DenyAuthenticationHandler"/>) answers any
+  /// AuthorizeAttribute challenge with 401 instead of letting the middleware throw a 500.
   /// </summary>
   public static IServiceCollection AddInboundAuth(this IServiceCollection services, IConfiguration configuration)
   {
+    services.AddAuthorization();
+
     var inboundAuth = configuration.Get<CachingProxyConfig>()?.InboundAuth;
     if (inboundAuth == null)
+    {
+      // No inbound validation, but a matched-upstream prefix still carries [Authorize]. Register a
+      // no-identity default scheme so those requests fail closed with 401 (public prefixes stay anonymous).
+      services
+        .AddAuthentication(DenyAuthenticationHandler.SchemeName)
+        .AddScheme<AuthenticationSchemeOptions, DenyAuthenticationHandler>(DenyAuthenticationHandler.SchemeName, null);
       return services;
+    }
 
     var jwks = new ConfigurationManager<OpenIdConnectConfiguration>(
       inboundAuth.JwksUrl.AbsoluteUri,
@@ -122,24 +128,19 @@ public static class AuthExtensions
           },
         };
       });
-    services.AddAuthorization();
 
     return services;
   }
 
   /// <summary>
-  /// Adds the authentication/authorization middleware when inbound auth is configured. Must run after
-  /// UseRouting (so the matched endpoint's AuthorizeAttribute metadata is available) and before the proxy
-  /// middleware (which would otherwise serve unauthenticated requests). /health stays public (handled
-  /// earlier in the pipeline).
+  /// Adds the authentication/authorization middleware. Must run after UseRouting (so the matched
+  /// endpoint's AuthorizeAttribute metadata is available) and before the proxy middleware (which would
+  /// otherwise serve unauthenticated requests). /health stays public (handled earlier in the pipeline).
   /// </summary>
   public static IApplicationBuilder UseInboundAuth(this IApplicationBuilder app, CachingProxyConfig config)
   {
-    if (config.InboundAuth != null)
-    {
-      app.UseAuthentication();
-      app.UseAuthorization();
-    }
+    app.UseAuthentication();
+    app.UseAuthorization();
     return app;
   }
 
@@ -163,5 +164,24 @@ public static class AuthExtensions
     {
       return null;
     }
+  }
+}
+
+// Default authentication scheme used when no inbound JWT validation is configured. Never establishes an
+// identity (so un-gated/public prefixes stay anonymous) and answers a challenge with a bare 401, so a
+// prefix that carries [Authorize] (its upstream requires auth) fails closed instead of throwing a 500.
+internal sealed class DenyAuthenticationHandler(
+  IOptionsMonitor<AuthenticationSchemeOptions> options, ILoggerFactory logger, UrlEncoder encoder)
+  : AuthenticationHandler<AuthenticationSchemeOptions>(options, logger, encoder)
+{
+  public const string SchemeName = "Deny";
+
+  protected override Task<AuthenticateResult> HandleAuthenticateAsync() =>
+    Task.FromResult(AuthenticateResult.NoResult());
+
+  protected override Task HandleChallengeAsync(AuthenticationProperties properties)
+  {
+    Response.StatusCode = StatusCodes.Status401Unauthorized;
+    return Task.CompletedTask;
   }
 }

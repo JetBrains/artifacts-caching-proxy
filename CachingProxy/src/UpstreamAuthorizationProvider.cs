@@ -9,7 +9,7 @@ namespace JetBrains.CachingProxy;
 /// <summary>
 /// Builds the <c>Authorization</c> header sent to an authenticated upstream, dispatching on the matched
 /// <see cref="UpstreamAuth"/> entry's mode. Returns <c>null</c> when there is nothing to add (unauthenticated
-/// upstream, or a redirect-only / external-auth entry with no client id).
+/// upstream, or an entry with no client id).
 /// </summary>
 public interface IUpstreamAuthorizationProvider
 {
@@ -30,7 +30,7 @@ public sealed class UpstreamAuthorizationProvider(
     if (auth.IsGitHubApp)
     {
       var installationToken = await gitHubAppTokenProvider.GetInstallationTokenAsync(auth, ct);
-      return new AuthenticationHeaderValue(auth.AuthScheme, installationToken);
+      return new AuthenticationHeaderValue("Bearer", installationToken);
     }
 
     // Client-credentials mode: the OAuth access token is obtained (and cached/refreshed) by the token
