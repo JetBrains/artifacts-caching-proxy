@@ -219,7 +219,11 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
             BucketName = config.S3.BucketName,
             Key = s3Key,
             Verb = isHead ? HttpVerb.HEAD : HttpVerb.GET,
-            Expires = timeProvider.GetUtcNow().UtcDateTime + config.S3.SignedLinkTTL
+            Expires = timeProvider.GetUtcNow().UtcDateTime + config.S3.SignedLinkTTL,
+            ResponseHeaderOverrides = new ResponseHeaderOverrides
+            {
+              CacheControl = CachedResponse.GetCachingHeader(context)
+            }
           });
         }
         catch (Exception e)

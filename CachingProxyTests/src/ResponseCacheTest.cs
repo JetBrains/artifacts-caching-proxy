@@ -1,6 +1,8 @@
 using System;
 using System.Net;
+using System.Security.Claims;
 using System.Threading.Tasks;
+using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Options;
@@ -346,5 +348,27 @@ public class ResponseCacheTest
 
     var expected = (_timeProvider.GetUtcNow() + TimeSpan.FromMinutes(10)).ToString("R");
     Assert.Equal(expected, entry.Headers[CachingProxyConstants.CachedUntilHeader].ToString());
+  }
+
+  [Fact]
+  public void GetCachingHeader_Anonymous_IsPublic()
+  {
+    // No identity established: the response is shared, so it stays publicly cacheable.
+    var context = new DefaultHttpContext();
+
+    Assert.Equal("public, max-age=31536000", CachedResponse.GetCachingHeader(context).ToString());
+  }
+
+  [Fact]
+  public void GetCachingHeader_Authenticated_IsPrivate()
+  {
+    // A non-null AuthenticationType makes Identity.IsAuthenticated true: an authenticated response is
+    // served only to the requesting client, so it must not be stored by shared/intermediary caches.
+    var context = new DefaultHttpContext
+    {
+      User = new ClaimsPrincipal(new ClaimsIdentity(authenticationType: "TestAuth"))
+    };
+
+    Assert.Equal("max-age=31536000, private", CachedResponse.GetCachingHeader(context).ToString());
   }
 }

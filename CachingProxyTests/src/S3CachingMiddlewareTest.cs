@@ -219,6 +219,22 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   }
 
   [Fact]
+  public async Task Signed_Redirect_Overrides_Cache_Control_For_Anonymous_Request()
+  {
+    // S3 honours the response-cache-control override only on a signed request, so the presigned link
+    // carries it. An anonymous request gets the public, eternally-cacheable value, so the object the
+    // client downloads straight from S3 is cached publicly too (not just the proxy's redirect).
+    var server = CreateServer(signedLinks: true);
+    myS3.Objects[GetPathKey("/real/a.jar")] = (ourLargeBody, "application/java-archive", null);
+
+    using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
+
+    Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
+    Assert.Contains("X-Amz-", response.Headers.Location?.ToString()); // presigned
+    Assert.Equal("public, max-age=31536000", myS3.LastPresignCacheControl);
+  }
+
+  [Fact]
   public async Task Get_Without_Content_Length_Is_Spooled_And_Uploaded()
   {
     // Upstream responds chunked (no Content-Length). The body must still land in the bucket intact,
@@ -678,6 +694,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     public int PutObjectCalls;
     public HttpVerb? LastPresignVerb;
     public DateTime? LastPresignExpires;
+    public string? LastPresignCacheControl;
 
     // Test gate for forcing concurrent probes to overlap: when GateKey is set, a probe for that key
     // signals GateReached and then blocks on GateRelease before continuing. Lets a test pile up a
@@ -690,6 +707,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     {
       LastPresignVerb = request.Verb;
       LastPresignExpires = request.Expires;
+      LastPresignCacheControl = request.ResponseHeaderOverrides?.CacheControl;
       return base.GetPreSignedURL(request);
     }
 
@@ -697,6 +715,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     {
       LastPresignVerb = request.Verb;
       LastPresignExpires = request.Expires;
+      LastPresignCacheControl = request.ResponseHeaderOverrides?.CacheControl;
       return base.GetPreSignedURLAsync(request);
     }
 

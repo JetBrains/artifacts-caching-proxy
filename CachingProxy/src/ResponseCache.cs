@@ -54,15 +54,19 @@ public sealed record CachedResponse(HttpStatusCode StatusCode, IHeaderDictionary
   private static readonly StringValues ourPrivateCachingHeader =
     new CacheControlHeaderValue { Private = true, MaxAge = TimeSpan.FromDays(365) }.ToString();
 
-  // Authorized (authenticated) responses are served only to the requesting client, so they
-  // must not be stored by shared/intermediary caches. Anonymous responses stay public.
+  public static StringValues GetCachingHeader(HttpContext context)
+  {
+    // Authorized (authenticated) responses are served only to the requesting client, so they
+    // must not be stored by shared/intermediary caches. Anonymous responses stay public.
+    return context.User.Identity?.IsAuthenticated == true ? ourPrivateCachingHeader : ourEternalCachingHeader;
+  }
+
   public static void SetCachingHeaderFor(HttpContext context)
   {
     // For successful (2xx) responses, the cached response is always eternally cacheable.
     if (context.Response.StatusCode is >= StatusCodes.Status200OK and < StatusCodes.Status300MultipleChoices)
     {
-      context.Response.Headers.CacheControl =
-        context.User.Identity?.IsAuthenticated == true ? ourPrivateCachingHeader : ourEternalCachingHeader;
+      context.Response.Headers.CacheControl = GetCachingHeader(context);
     }
   }
 
