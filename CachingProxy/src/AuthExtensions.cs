@@ -33,10 +33,8 @@ public static class AuthExtensions
   /// </summary>
   public static IServiceCollection AddUpstreamAuth(this IServiceCollection services, IConfiguration configuration)
   {
-    var upstreamAuth = configuration.Get<CachingProxyConfig>()?.UpstreamAuth ?? [];
-
     ClientCredentialsTokenManagementBuilder? tokenManagement = null;
-    foreach (var auth in upstreamAuth)
+    foreach (var (name, auth) in configuration.Get<CachingProxyConfig>()?.UpstreamAuth ?? [])
     {
       // GitHub App mode (ClientId is the JWT issuer, PrivateKey is the signing key): the installation
       // token is minted on demand by GitHubAppInstallationTokenProvider, so there is no Duende client to
@@ -50,7 +48,7 @@ public static class AuthExtensions
       // secret are mandatory. Fail fast rather than sending a null token endpoint / unauthenticated request.
       if (auth.TokenEndpoint == null || string.IsNullOrEmpty(auth.ClientSecret))
         throw new ArgumentException(
-          $"UpstreamAuth '{auth.UrlPrefix}' sets ClientId but is missing TokenEndpoint and/or ClientSecret; " +
+          $"UpstreamAuth '{name}' sets ClientId but is missing TokenEndpoint and/or ClientSecret; " +
           "both are required for client-credentials auth.");
 
       tokenManagement.AddClient(auth.ClientId!, client =>

@@ -138,16 +138,16 @@ public class GitHubAppUpstreamAuthTest : IAsyncLifetime
       MinimumFreeDiskSpaceMb = 2,
       Prefixes = [$"/github={upstreamUrl}repo"],
       UpstreamAuth =
-      [
-        new UpstreamAuth
+      {
+        ["test"] = new UpstreamAuth
         {
-          UrlPrefix = new Uri(upstreamUrl, "repo/").AbsoluteUri,
+          UrlPrefixes = [new Uri(upstreamUrl, "repo/").AbsoluteUri],
           ClientId = AppClientId,
           PrivateKey = myAppRsa.ExportRSAPrivateKeyPem(),
           GitHubApiBaseUrl = UrlOf(myGitHubApi).AbsoluteUri.TrimEnd('/'),
           // InstallationId intentionally omitted to exercise auto-resolution.
         },
-      ],
+      },
       InboundAuth = new CachingProxyConfig.InboundAuthConfig
       {
         Issuer = Issuer,

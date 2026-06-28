@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 
 namespace JetBrains.CachingProxy;
@@ -47,7 +48,7 @@ public class CachingProxyConfig
   // OAuth client-credentials auth for private upstreams, matched to each prefix by longest URL
   // prefix (see RemoteServers). Empty by default: upstreams without a matching entry are requested
   // unauthenticated, exactly as before.
-  public UpstreamAuth[] UpstreamAuth { get; init; } = [];
+  public Dictionary<string, UpstreamAuth> UpstreamAuth { get; init; } = new();
 
   // Inbound JWT bearer validation, applied to every prefix whose upstream requires auth (i.e. has a
   // matching UpstreamAuth entry — see RemoteServers). Null by default: no inbound auth, every prefix

@@ -4,7 +4,7 @@ namespace JetBrains.CachingProxy;
 
 /// <summary>
 /// Per-upstream authentication for one or more sources, configured separately from
-/// <see cref="CachingProxyPrefix"/> and matched to an upstream by the longest <see cref="UrlPrefix"/>
+/// <see cref="CachingProxyPrefix"/> and matched to an upstream by the longest <see cref="UrlPrefixes"/>
 /// of its resolved URL (see <see cref="RemoteServers"/>). This lets many prefixes pointing at the same
 /// host share a single block.
 ///
@@ -28,8 +28,8 @@ namespace JetBrains.CachingProxy;
 /// </summary>
 public record UpstreamAuth
 {
-  // Upstream URL prefix this auth applies to (e.g. "https://repo.example.com/"); the longest match wins.
-  public required string UrlPrefix { get; init; }
+  // Upstream URL prefixes this auth applies to (e.g. "https://repo.example.com/"); the longest match wins.
+  public required string[] UrlPrefixes { get; init; }
 
   public Uri? TokenEndpoint { get; init; }
   public string? ClientId { get; init; }

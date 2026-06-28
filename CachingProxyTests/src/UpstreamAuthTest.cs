@@ -4,7 +4,6 @@ using System.IdentityModel.Tokens.Jwt;
 using System.IO;
 using System.Linq;
 using System.Net;
-using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
@@ -164,17 +163,17 @@ public class UpstreamAuthTest : IAsyncLifetime
         $"/public={upstreamUrl}open",
       ],
       UpstreamAuth =
-      [
-        new UpstreamAuth
+      {
+        ["test"] = new UpstreamAuth
         {
           // Scoped to the /secure subtree so the /public prefix (same host) is unauthenticated.
-          UrlPrefix = new Uri(upstreamUrl, "secure/").AbsoluteUri,
+          UrlPrefixes = [new Uri(upstreamUrl, "secure/").AbsoluteUri],
           TokenEndpoint = new Uri(UrlOf(myAuthServer), "token"),
           ClientId = ClientId,
           ClientSecret = ClientSecret,
           Scope = "read:artifacts",
         },
-      ],
+      },
       InboundAuth = new CachingProxyConfig.InboundAuthConfig
       {
         Issuer = Issuer,

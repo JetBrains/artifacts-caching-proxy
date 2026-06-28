@@ -229,15 +229,15 @@ public class InboundAuthTest : IAsyncLifetime
       MinimumFreeDiskSpaceMb = 2,
       Prefixes = [$"/private={upstreamUrl}secure"],
       UpstreamAuth =
-      [
-        new UpstreamAuth
+      {
+        ["test"] = new UpstreamAuth
         {
-          UrlPrefix = new Uri(upstreamUrl, "secure/").AbsoluteUri,
+          UrlPrefixes = [new Uri(upstreamUrl, "secure/").AbsoluteUri],
           TokenEndpoint = new Uri(UrlOf(myAuthServer), "token"),
           ClientId = ClientId,
           ClientSecret = ClientSecret,
         },
-      ],
+      },
       // InboundAuth deliberately left null.
     };
 
@@ -316,16 +316,16 @@ public class InboundAuthTest : IAsyncLifetime
         $"/public={upstreamUrl}open",
       ],
       UpstreamAuth =
-      [
-        new UpstreamAuth
+      {
+        ["test"] = new UpstreamAuth
         {
           // Scoped to the /secure subtree so the /public prefix (same host) is unauthenticated.
-          UrlPrefix = new Uri(upstreamUrl, "secure/").AbsoluteUri,
+          UrlPrefixes = [new Uri(upstreamUrl, "secure/").AbsoluteUri],
           TokenEndpoint = new Uri(UrlOf(myAuthServer), "token"),
           ClientId = ClientId,
           ClientSecret = ClientSecret,
         },
-      ],
+      },
       InboundAuth = new CachingProxyConfig.InboundAuthConfig
       {
         Issuer = Issuer,

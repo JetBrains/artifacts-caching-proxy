@@ -30,7 +30,7 @@ public class RemoteServers : EndpointDataSource
       var remoteUri = Uri.TryCreate(target, UriKind.Absolute, out var targetUri) ? targetUri :
         new Uri(Uri.UriSchemeHttps + Uri.SchemeDelimiter + target, UriKind.Absolute);
       var remoteServer = new RemoteServer(trimmedPrefix, remoteUri,
-        config.CacheDuration.Union(prefix.CacheDuration), MatchAuth(remoteUri, config.UpstreamAuth));
+        config.CacheDuration.Union(prefix.CacheDuration), MatchAuth(remoteUri, config.UpstreamAuth.Values));
 
       // A prefix with a matched UpstreamAuth serves proxy-fetched private artifacts, so its inbound route
       // must require a validated client JWT too: attach an AuthorizeAttribute (enforced by
@@ -58,14 +58,19 @@ public class RemoteServers : EndpointDataSource
 
   private const string PathParameterName = "path";
 
-  // Among the auth entries whose UrlPrefix is a prefix of the upstream URL, the longest (most
+  // Among the auth entries whose UrlPrefixes contain a prefix of the upstream URL, the longest (most
   // specific) one wins, so a host-wide block and a path-scoped block can coexist. Returns null when
   // nothing matches, leaving the upstream unauthenticated.
-  private static UpstreamAuth? MatchAuth(Uri remoteUri, UpstreamAuth[] auths) =>
-    auths
-      .Where(a => remoteUri.AbsoluteUri.StartsWith(a.UrlPrefix, StringComparison.OrdinalIgnoreCase))
-      .OrderByDescending(a => a.UrlPrefix.Length)
+  private static UpstreamAuth? MatchAuth(Uri remoteUri, IReadOnlyCollection<UpstreamAuth> auths)
+  {
+    var remoteUriAbsoluteUri = remoteUri.AbsoluteUri;
+    return auths.
+      SelectMany(auth => auth.UrlPrefixes.Select(prefix => KeyValuePair.Create(prefix, auth)))
+      .Where(kv => remoteUriAbsoluteUri.StartsWith(kv.Key, StringComparison.OrdinalIgnoreCase))
+      .OrderByDescending(kv => kv.Key.Length)
+      .Select(kv => kv.Value)
       .FirstOrDefault();
+  }
 
   public static RemoteServer? GetRemoteServer(HttpContext context, out string? path)
   {
