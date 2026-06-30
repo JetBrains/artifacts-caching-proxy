@@ -10,11 +10,11 @@ public static class CacheFileProvider
 {
   private static readonly string ourGzippedContentSuffix = "-gzip-Ege4dHyCEA7IM";
 
-  extension(Uri upstreamUri)
+  extension(Uri uri)
   {
     public string GetFutureCacheFileLocation(string? contentEncoding = null) =>
-      upstreamUri.ManglePath()
-      + Path.GetExtension(upstreamUri.AbsolutePath)
+      uri.ManglePath()
+      + Path.GetExtension(uri.AbsolutePath)
       + contentEncoding switch
       {
         "gzip" => ourGzippedContentSuffix,
@@ -24,7 +24,7 @@ public static class CacheFileProvider
 
     public string ManglePath()
     {
-      var path = upstreamUri.GetComponents(UriComponents.Host | UriComponents.Port | UriComponents.Path, UriFormat.UriEscaped);
+      var path = uri.GetHostPortPath();
       var maxBytes = Encoding.UTF8.GetMaxByteCount(path.Length);
 
       byte[]? rented = null;
@@ -53,5 +53,13 @@ public static class CacheFileProvider
           ArrayPool<byte>.Shared.Return(rented);
       }
     }
+
+    /// <summary>
+    /// The scheme-agnostic <c>host[:port]/path</c> form of the URI (escaped). Used both to key cache
+    /// files and to match upstreams against <see cref="UpstreamAuth.UrlPrefixes"/>, so every site must
+    /// derive it identically — hence this single source.
+    /// </summary>
+    public string GetHostPortPath() =>
+      uri.GetComponents(UriComponents.Host | UriComponents.Port | UriComponents.Path, UriFormat.UriEscaped);
   }
 }

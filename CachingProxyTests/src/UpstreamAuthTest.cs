@@ -167,7 +167,7 @@ public class UpstreamAuthTest : IAsyncLifetime
         ["test"] = new UpstreamAuth
         {
           // Scoped to the /secure subtree so the /public prefix (same host) is unauthenticated.
-          UrlPrefixes = [new Uri(upstreamUrl, "secure/").AbsoluteUri],
+          UrlPrefixes = [new Uri(upstreamUrl, "secure/").GetHostPortPath()],
           TokenEndpoint = new Uri(UrlOf(myAuthServer), "token"),
           ClientId = ClientId,
           ClientSecret = ClientSecret,

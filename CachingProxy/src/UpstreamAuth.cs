@@ -28,7 +28,8 @@ namespace JetBrains.CachingProxy;
 /// </summary>
 public record UpstreamAuth
 {
-  // Upstream URL prefixes this auth applies to (e.g. "https://repo.example.com/"); the longest match wins.
+  // Upstream URL prefixes this auth applies to, matched scheme-agnostically against the upstream's
+  // host[:port]/path (e.g. "repo.example.com/" or "repo.example.com/secure/"); the longest match wins.
   public required string[] UrlPrefixes { get; init; }
 
   public Uri? TokenEndpoint { get; init; }

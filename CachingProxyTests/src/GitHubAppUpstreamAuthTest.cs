@@ -141,7 +141,7 @@ public class GitHubAppUpstreamAuthTest : IAsyncLifetime
       {
         ["test"] = new UpstreamAuth
         {
-          UrlPrefixes = [new Uri(upstreamUrl, "repo/").AbsoluteUri],
+          UrlPrefixes = [new Uri(upstreamUrl, "repo/").GetHostPortPath()],
           ClientId = AppClientId,
           PrivateKey = myAppRsa.ExportRSAPrivateKeyPem(),
           GitHubApiBaseUrl = UrlOf(myGitHubApi).AbsoluteUri.TrimEnd('/'),

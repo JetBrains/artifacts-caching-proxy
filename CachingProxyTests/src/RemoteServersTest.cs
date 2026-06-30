@@ -50,8 +50,8 @@ public class RemoteServersTest
   [Fact]
   public void Upstream_Auth_Matches_By_Longest_Url_Prefix()
   {
-    var hostWide = new UpstreamAuth { UrlPrefixes = ["https://repo.example.com/"], TokenEndpoint = new Uri("https://repo.example.com/"), ClientId = "host" };
-    var pathScoped = new UpstreamAuth { UrlPrefixes = ["https://repo.example.com/secure/"], TokenEndpoint = new Uri("https://repo.example.com/"), ClientId = "scoped" };
+    var hostWide = new UpstreamAuth { UrlPrefixes = ["repo.example.com/"], TokenEndpoint = new Uri("https://repo.example.com/"), ClientId = "host" };
+    var pathScoped = new UpstreamAuth { UrlPrefixes = ["repo.example.com/secure/"], TokenEndpoint = new Uri("https://repo.example.com/"), ClientId = "scoped" };
 
     var config = new CachingProxyConfig
     {

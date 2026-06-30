@@ -63,10 +63,10 @@ public class RemoteServers : EndpointDataSource
   // nothing matches, leaving the upstream unauthenticated.
   private static UpstreamAuth? MatchAuth(Uri remoteUri, IReadOnlyCollection<UpstreamAuth> auths)
   {
-    var remoteUriAbsoluteUri = remoteUri.AbsoluteUri;
+    var remotePrefix = remoteUri.GetHostPortPath();
     return auths.
       SelectMany(auth => auth.UrlPrefixes.Select(prefix => KeyValuePair.Create(prefix, auth)))
-      .Where(kv => remoteUriAbsoluteUri.StartsWith(kv.Key, StringComparison.OrdinalIgnoreCase))
+      .Where(kv => remotePrefix.StartsWith(kv.Key, StringComparison.OrdinalIgnoreCase))
       .OrderByDescending(kv => kv.Key.Length)
       .Select(kv => kv.Value)
       .FirstOrDefault();
