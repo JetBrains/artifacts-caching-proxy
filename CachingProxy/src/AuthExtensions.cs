@@ -36,6 +36,9 @@ public static class AuthExtensions
     ClientCredentialsTokenManagementBuilder? tokenManagement = null;
     foreach (var (name, auth) in configuration.Get<CachingProxyConfig>()?.UpstreamAuth ?? [])
     {
+      if (string.IsNullOrEmpty(auth.ClientId))
+        continue;
+
       // GitHub App mode (ClientId is the JWT issuer, PrivateKey is the signing key): the installation
       // token is minted on demand by GitHubAppInstallationTokenProvider, so there is no Duende client to
       // register here. TokenEndpoint/ClientSecret are not used.
