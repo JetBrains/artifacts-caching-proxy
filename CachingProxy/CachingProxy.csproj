@@ -6,7 +6,7 @@
     <Nullable>enable</Nullable>
     <Company>JetBrains</Company>
     <Product>ArtifactsCachingProxy</Product>
-    <Version>3.0.0</Version>
+    <Version>3.0.1</Version>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
   </PropertyGroup>
 
@@ -17,8 +17,10 @@
     <PackageReference Include="AWSSDK.SSO" />
     <PackageReference Include="AWSSDK.SSOOIDC" />
     <PackageReference Include="Cronos" />
+    <PackageReference Include="DotNetEnv" />
     <PackageReference Include="Duende.AccessTokenManagement" />
     <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" />
+    <PackageReference Include="Microsoft.AspNetCore.DataProtection.StackExchangeRedis" />
     <PackageReference Include="Microsoft.Extensions.Caching.StackExchangeRedis" />
     <PackageReference Include="Microsoft.Extensions.Http.Polly" />
     <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" />

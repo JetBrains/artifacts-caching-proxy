@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 using Amazon.Extensions.NETCore.Setup;
 using Amazon.Runtime;
 using Amazon.S3;
+using DotNetEnv.Configuration;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.StaticFiles;
@@ -49,6 +50,7 @@ public static class Program
     {
       builder.Logging.AddSimpleConsole();
       builder.Configuration
+        .AddDotNetEnv()
         .AddJsonFile("appsettings.Development.user.json", optional: true, reloadOnChange: true);
     }
     else

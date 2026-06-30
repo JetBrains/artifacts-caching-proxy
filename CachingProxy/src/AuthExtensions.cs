@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Encodings.Web;
@@ -7,14 +8,19 @@ using Duende.AccessTokenManagement;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.DataProtection;
+using Microsoft.AspNetCore.DataProtection.KeyManagement;
+using Microsoft.AspNetCore.DataProtection.StackExchangeRedis;
 using Microsoft.AspNetCore.Http;
 using Microsoft.IdentityModel.Protocols;
 using Microsoft.IdentityModel.Protocols.OpenIdConnect;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using StackExchange.Redis;
 
 namespace JetBrains.CachingProxy;
 
@@ -84,9 +90,33 @@ public static class AuthExtensions
   /// </summary>
   public static IServiceCollection AddInboundAuth(this IServiceCollection services, IConfiguration configuration)
   {
+    // Without explicit configuration the key ring is generated ephemerally on first use,
+    // which logs a warning (captured by Sentry with a full thread stack). Pin a stable application name and
+    // persist the key ring so keys survive restarts and are shared across replicas: to Redis when L2 is
+    // configured (reusing the shared, lazily-resolved IConnectionMultiplexer), otherwise to the local disk.
+    var dataProtection = services.AddDataProtection();
+    services.AddOptions<DataProtectionOptions>()
+      .Configure<IHostEnvironment>((options, env) => options.ApplicationDiscriminator = env.ApplicationName);
+    var cachingProxyConfig = configuration.Get<CachingProxyConfig>();
+    if (!string.IsNullOrEmpty(cachingProxyConfig?.Redis?.ConnectionString))
+    {
+      // Configure the repository via options so the IConnectionMultiplexer is resolved from DI on first
+      // use rather than connected eagerly at startup.
+      services.AddOptions<KeyManagementOptions>()
+        .Configure<IServiceProvider>((options, sp) =>
+          options.XmlRepository = new RedisXmlRepository(
+            () => sp.GetRequiredService<IConnectionMultiplexer>().GetDatabase(), "DataProtection-Keys"));
+    }
+    else
+    {
+      var keysDirectory = Path.Combine(
+        cachingProxyConfig?.LocalCachePath ?? Path.GetTempPath(), ".dataprotection-keys");
+      dataProtection.PersistKeysToFileSystem(new DirectoryInfo(keysDirectory));
+    }
+
     services.AddAuthorization();
 
-    var inboundAuth = configuration.Get<CachingProxyConfig>()?.InboundAuth;
+    var inboundAuth = cachingProxyConfig?.InboundAuth;
     if (inboundAuth == null)
     {
       // No inbound validation, but a matched-upstream prefix still carries [Authorize]. Register a
