@@ -139,6 +139,10 @@ public static class Program
       // CachedResponse holds an IHeaderDictionary that MemoryPack can't serialize on its own, so a
       // custom formatter (registered globally) maps it to/from a serializable surrogate.
       CachedResponseFormatter.Register();
+      // Duende's client-credentials token cache also flows through this FusionCache (as HybridCache),
+      // so its (non-MemoryPackable) ClientCredentialsToken needs a formatter too, else L2 serialization
+      // fails and Duende falls back to no token caching.
+      ClientCredentialsTokenFormatter.Register();
 
       // Single shared connection used by both the L2 cache and the health check below. Resolves
       // lazily (on first cache/health-check use), so startup is not blocked on connecting to Redis.
