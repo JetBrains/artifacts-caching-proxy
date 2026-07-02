@@ -1,5 +1,6 @@
 using System;
 using System.Linq;
+using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
 namespace JetBrains.CachingProxy.Tests;
@@ -8,7 +9,7 @@ public class RemoteServersTest
 {
   private static RemoteServers.RemoteServer[] Build(params string[] prefixes) =>
   [
-    .. new RemoteServers(new CachingProxyConfig { Prefixes = [.. prefixes.Select(p => (CachingProxyPrefix)p)] })
+    .. new RemoteServers(new CachingProxyConfig { Prefixes = [.. prefixes.Select(p => (CachingProxyPrefix)p)] }, new NullLogger<RemoteServers>())
       .Endpoints
       .Select(e => e.Metadata.GetMetadata<RemoteServers.RemoteServer>()!)
   ];
@@ -68,7 +69,7 @@ public class RemoteServersTest
       }
     };
 
-    var servers = new RemoteServers(config).Endpoints
+    var servers = new RemoteServers(config, new NullLogger<RemoteServers>()).Endpoints
       .Select(e => e.Metadata.GetMetadata<RemoteServers.RemoteServer>()!)
       .ToArray();
 

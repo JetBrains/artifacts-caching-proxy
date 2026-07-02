@@ -7,15 +7,17 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.AspNetCore.Routing.Patterns;
 using Microsoft.Extensions.FileProviders;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Primitives;
 
 namespace JetBrains.CachingProxy;
 
 public class RemoteServers : EndpointDataSource
 {
-  public RemoteServers(CachingProxyConfig config)
+  public RemoteServers(CachingProxyConfig config, ILogger<RemoteServers> logger)
   {
     var endpoints = new Endpoint[config.Prefixes.Length];
+    logger.LogInformation("Creating {Count} endpoints", config.Prefixes.Length);
     for (var i = 0; i < config.Prefixes.Length; i++)
     {
       var prefix = config.Prefixes[i];
@@ -32,6 +34,7 @@ public class RemoteServers : EndpointDataSource
       var remoteServer = new RemoteServer(trimmedPrefix, remoteUri,
         config.CacheDuration.Union(prefix.CacheDuration), MatchAuth(remoteUri, config.UpstreamAuth.Values));
 
+      logger.LogInformation("RemoteServer: {Prefix} -> {RemoteUri}, Auth: {Auth}", remoteServer.Prefix, remoteServer.RemoteUri, remoteServer.Auth);
       // A prefix with a matched UpstreamAuth serves proxy-fetched private artifacts, so its inbound route
       // must require a validated client JWT too: attach an AuthorizeAttribute (enforced by
       // UseAuthentication/UseAuthorization). A prefix with no matched auth has no upstream credentials and

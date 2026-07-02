@@ -10,6 +10,7 @@ using Amazon.S3;
 using DotNetEnv.Configuration;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Routing;
 using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Caching.StackExchangeRedis;
@@ -113,6 +114,7 @@ public static class Program
       .AddSingleton<CachingProxyMetrics>()
       .AddSingleton<ResponseCache>()
       .AddSingleton<RemoteProxy>()
+      .AddSingleton<RemoteServers>()
       .ConfigureOptions<HealthCheck>()
       .AddHealthChecks()
       .AddCheck<HealthCheck>(nameof(HealthCheck));
@@ -274,10 +276,9 @@ public static class Program
     {
       app.UseMiddleware<CachingProxy>();
     }
-    app.UseEndpoints(builder =>
+    app.UseEndpoints(endpoints =>
     {
-      builder.DataSources.Add(new RemoteServers(cachingProxyConfig));
+      endpoints.DataSources.Add(endpoints.ServiceProvider.GetRequiredService<RemoteServers>());
     });
-
   }
 }

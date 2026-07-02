@@ -1,4 +1,5 @@
 using System;
+using System.Text;
 
 namespace JetBrains.CachingProxy;
 
@@ -49,4 +50,12 @@ public record UpstreamAuth
   // True when this entry uses GitHub App auth (a private key is configured); ClientId then acts as the
   // JWT issuer rather than an OAuth client id.
   public bool IsGitHubApp => !string.IsNullOrEmpty(PrivateKey);
+
+  public override string ToString() => new StringBuilder()
+    .Append(ClientId != null ? $"{nameof(ClientId)}: {ClientId} " : "")
+    .Append(UrlPrefixes.Length > 0 ? $", {nameof(UrlPrefixes)}: {string.Join(" ", UrlPrefixes)}" : "")
+    .Append(TokenEndpoint != null ? $", {nameof(TokenEndpoint)}: {TokenEndpoint}" : "")
+    .Append(Scope != null ? $", {nameof(Scope)}:{Scope}" : "")
+    .Append(InstallationId != null ? $", {nameof(InstallationId)}:{InstallationId}" : "")
+    .ToString();
 }
