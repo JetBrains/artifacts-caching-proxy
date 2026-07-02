@@ -105,6 +105,8 @@ public partial class RemoteProxy(
   {
     var isHead = HttpMethods.IsHead(context.Request.Method);
 
+    using var scope = logger.BeginScope(upstreamUri.GetHostPortPath());
+
     var cachedResponse = await responseCache.GetCachedStatusCode(cacheKey, context.RequestAborted);
     switch (cachedResponse?.StatusCode)
     {

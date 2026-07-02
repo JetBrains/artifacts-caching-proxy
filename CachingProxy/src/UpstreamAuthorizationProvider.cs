@@ -3,6 +3,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Duende.AccessTokenManagement;
 using Duende.IdentityModel.Client;
+using Microsoft.Extensions.Logging;
 
 namespace JetBrains.CachingProxy;
 
@@ -18,6 +19,7 @@ public interface IUpstreamAuthorizationProvider
 
 public sealed class UpstreamAuthorizationProvider(
   GitHubAppInstallationTokenProvider gitHubAppTokenProvider,
+  ILogger<UpstreamAuthorizationProvider> logger,
   IClientCredentialsTokenManager? tokenManager = null) : IUpstreamAuthorizationProvider
 {
   public async ValueTask<AuthenticationHeaderValue?> GetAuthorizationHeaderAsync(UpstreamAuth? auth, CancellationToken ct)
@@ -42,6 +44,8 @@ public sealed class UpstreamAuthorizationProvider(
     var token = await tokenManager
       .GetAccessTokenAsync(ClientCredentialsClientName.Parse(auth.ClientId), ct: ct)
       .GetToken();
+
+    logger.LogInformation($"Access token: {token.AccessToken}");
 
     return new BasicAuthenticationHeaderValue(auth.ClientId, token.AccessToken);
   }
