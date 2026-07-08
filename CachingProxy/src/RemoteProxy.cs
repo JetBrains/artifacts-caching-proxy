@@ -192,11 +192,17 @@ public partial class RemoteProxy(
       if (!response.IsSuccessStatusCode)
       {
         var entry = await responseCache.PutStatusCode(cacheKey, response.StatusCode, cacheDuration, context.RequestAborted);
-        if (ClientFacingStatus(response.StatusCode) is var statusCode and HttpStatusCode.NotFound && response.StatusCode != statusCode)
+        if (ClientFacingStatus(response.StatusCode) is var statusCode && statusCode != response.StatusCode)
         {
-          logger.LogWarning(Event.NegativeMiss(response.StatusCode),
-            "Non-success requesting {UpstreamUri}: {StatusCode}", upstreamUri, response.StatusCode);
           entry = entry with { StatusCode = statusCode };
+        }
+        switch (statusCode)
+        {
+          case HttpStatusCode.NotFound when statusCode != response.StatusCode:
+          case not HttpStatusCode.NotFound when auth != null:
+            logger.LogWarning(Event.NegativeMiss(response.StatusCode),
+              "Non-success requesting {UpstreamUri}: {StatusCode}", upstreamUri, response.StatusCode);
+            break;
         }
 
         await SetStatusAsync(context, CachingProxyStatus.NEGATIVE_MISS, entry);
