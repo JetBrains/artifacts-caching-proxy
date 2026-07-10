@@ -85,6 +85,21 @@ public class InboundAuthTest : IAsyncLifetime
   }
 
   [Fact]
+  public async Task Protected_Prefix_Without_Token_Challenges_Bearer_And_Basic()
+  {
+    // Basic-only clients (Maven/Gradle/npm) need a Basic challenge to prompt for / send the JWT as the
+    // password; the JwtBearer default Bearer challenge is advertised alongside it, not replaced.
+    using var client = myProxyHost!.GetTestServer().CreateClient();
+
+    var response = await client.GetAsync("/private/one.jar");
+
+    Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    Assert.Contains(response.Headers.WwwAuthenticate, h => h.Scheme == "Bearer");
+    var basic = Assert.Single(response.Headers.WwwAuthenticate, h => h.Scheme == "Basic");
+    Assert.Equal("realm=\"Artifacts Caching Proxy\"", basic.Parameter);
+  }
+
+  [Fact]
   public async Task Protected_Prefix_With_Valid_Token_Is_Served()
   {
     using var client = myProxyHost!.GetTestServer().CreateClient();
@@ -250,6 +265,48 @@ public class InboundAuthTest : IAsyncLifetime
       var response = await client.GetAsync("/private/one.jar");
 
       Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    }
+    finally
+    {
+      await host.StopAsync();
+    }
+  }
+
+  [Fact]
+  public async Task Matched_Upstream_Without_InboundAuth_Challenges_Basic()
+  {
+    // The deny scheme (no InboundAuth configured) has no Bearer scheme, so it advertises Basic only.
+    var upstreamUrl = UrlOf(myUpstreamServer);
+    var config = new CachingProxyConfig
+    {
+      LocalCachePath = myTempDirectory,
+      MinimumFreeDiskSpaceMb = 2,
+      Prefixes = [$"/private={upstreamUrl}secure"],
+      UpstreamAuth =
+      {
+        ["test"] = new UpstreamAuth
+        {
+          UrlPrefixes = [new Uri(upstreamUrl, "secure/").GetHostPortPath()],
+          TokenEndpoint = new Uri(UrlOf(myAuthServer), "token"),
+          ClientId = ClientId,
+          ClientSecret = ClientSecret,
+        },
+      },
+      // InboundAuth deliberately left null -> deny scheme.
+    };
+
+    using var host = BuildProxyHost(config);
+    await host.StartAsync();
+    try
+    {
+      using var client = host.GetTestServer().CreateClient();
+
+      var response = await client.GetAsync("/private/one.jar");
+
+      Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+      var basic = Assert.Single(response.Headers.WwwAuthenticate, h => h.Scheme == "Basic");
+      Assert.Equal("realm=\"Artifacts Caching Proxy\"", basic.Parameter);
+      Assert.DoesNotContain(response.Headers.WwwAuthenticate, h => h.Scheme == "Bearer");
     }
     finally
     {

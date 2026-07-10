@@ -15,6 +15,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.IdentityModel.Protocols;
 using Microsoft.IdentityModel.Protocols.OpenIdConnect;
 using Microsoft.IdentityModel.Tokens;
+using Microsoft.Net.Http.Headers;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -30,6 +31,10 @@ namespace JetBrains.CachingProxy;
 /// </summary>
 public static class AuthExtensions
 {
+  // Advertised on 401s so Basic-only clients (Maven/Gradle/npm) prompt for / send the JWT as the
+  // Basic password. Appended alongside the JwtBearer "Bearer" challenge, and standalone in the deny path.
+  internal const string BasicChallenge = "Basic realm=\"Artifacts Caching Proxy\"";
+
   /// <summary>
   /// Per-upstream auth. Two credential modes coexist (see <see cref="UpstreamAuth"/>): OAuth
   /// client-credentials (Duende token management, one client per entry named by its ClientId) and GitHub
@@ -157,6 +162,15 @@ public static class AuthExtensions
               context.Token = GetTokenFromBasicPassword(context.Request.Headers.Authorization.ToString());
             return Task.CompletedTask;
           },
+          // Advertise Basic in addition to the default Bearer challenge. We deliberately do NOT call
+          // context.HandleResponse(), so the base JwtBearerHandler still appends its "Bearer" value after
+          // this returns; the two WWW-Authenticate values coexist. Basic lets Basic-only clients
+          // (Maven/Gradle/npm) prompt for / send the JWT as the Basic password.
+          OnChallenge = context =>
+          {
+            context.Response.Headers.Append(HeaderNames.WWWAuthenticate, BasicChallenge);
+            return Task.CompletedTask;
+          },
         };
       });
 
@@ -213,6 +227,7 @@ internal sealed class DenyAuthenticationHandler(
   protected override Task HandleChallengeAsync(AuthenticationProperties properties)
   {
     Response.StatusCode = StatusCodes.Status401Unauthorized;
+    Response.Headers.Append(HeaderNames.WWWAuthenticate, AuthExtensions.BasicChallenge);
     return Task.CompletedTask;
   }
 }
