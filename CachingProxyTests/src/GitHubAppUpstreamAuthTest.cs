@@ -156,7 +156,7 @@ public class GitHubAppUpstreamAuthTest : IAsyncLifetime
       InboundAuth = new CachingProxyConfig.InboundAuthConfig
       {
         Issuer = Issuer,
-        Audience = Audience,
+        Audiences = [Audience],
         JwksUrl = new Uri(UrlOf(myGitHubApi), "jwks.json"),
       },
     };

@@ -147,7 +147,7 @@ public static class AuthExtensions
           ValidateIssuer = true,
           ValidIssuer = inboundAuth.Issuer,
           ValidateAudience = true,
-          ValidAudience = inboundAuth.Audience,
+          ValidAudiences = inboundAuth.Audiences,
           ValidateIssuerSigningKey = true,
           ValidateLifetime = true,
           RequireExpirationTime = inboundAuth.RequireExpiration,

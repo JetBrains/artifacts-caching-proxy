@@ -177,7 +177,7 @@ public class UpstreamAuthTest : IAsyncLifetime
       InboundAuth = new CachingProxyConfig.InboundAuthConfig
       {
         Issuer = Issuer,
-        Audience = Audience,
+        Audiences = [Audience],
         JwksUrl = new Uri(UrlOf(myAuthServer), "jwks.json"),
       },
     };

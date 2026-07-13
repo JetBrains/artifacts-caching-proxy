@@ -33,7 +33,7 @@ public class CachingProxyConfig
   public record InboundAuthConfig
   {
     public required string Issuer { get; init; }
-    public required string Audience { get; init; }
+    public required string[] Audiences { get; init; }
     public required Uri JwksUrl { get; init; }
 
     // Whether tokens must carry an 'exp' claim. Default true (any token without an expiration is
