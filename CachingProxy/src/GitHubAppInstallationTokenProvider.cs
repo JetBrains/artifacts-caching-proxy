@@ -59,9 +59,9 @@ public sealed class GitHubAppInstallationTokenProvider(
     http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
     http.BaseAddress = new Uri(auth.GitHubApiBaseUrl);
 
-    var installationId = auth.InstallationId ?? await ResolveInstallationIdAsync(http, jwt, auth, ct);
+    var accessTokensUrl = await ResolveInstallationIdAsync(http, jwt, auth, ct);
 
-    using var request = new HttpRequestMessage(HttpMethod.Post, $"/app/installations/{installationId}/access_tokens");
+    using var request = new HttpRequestMessage(HttpMethod.Post, accessTokensUrl);
     request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", jwt);
 
     using var response = await http.SendAsync(request, ct);
@@ -69,20 +69,18 @@ public sealed class GitHubAppInstallationTokenProvider(
     {
       var body = await response.Content.ReadAsStringAsync(ct);
       throw new InvalidOperationException(
-        $"GitHub App '{auth.ClientId}' could not obtain an installation token for installation {installationId}: " +
-        $"{(int)response.StatusCode} {response.ReasonPhrase}. {body}");
+        $"GitHub App '{auth.ClientId}' could not obtain an installation token: {(int)response.StatusCode} {response.ReasonPhrase}. {body}");
     }
 
     var result = await response.Content.ReadFromJsonAsync<InstallationTokenResponse>(ct);
     if (result?.Token is not { Length: > 0 })
       throw new InvalidOperationException($"GitHub App '{auth.ClientId}' returned an empty installation token.");
 
-    logger.LogDebug("Obtained GitHub App installation token for installation {InstallationId}, expires at {ExpiresAt}",
-      installationId, result.ExpiresAt);
+    logger.LogDebug("Obtained GitHub App {ClientId} installation token, expires at {ExpiresAt}", auth.ClientId, result.ExpiresAt);
     return (result.Token, result.ExpiresAt);
   }
 
-  private async Task<long> ResolveInstallationIdAsync(HttpClient http, string jwt, UpstreamAuth auth, CancellationToken ct)
+  private async Task<Uri> ResolveInstallationIdAsync(HttpClient http, string jwt, UpstreamAuth auth, CancellationToken ct)
   {
     using var request = new HttpRequestMessage(HttpMethod.Get, $"/app/installations");
     request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", jwt);
@@ -103,7 +101,7 @@ public sealed class GitHubAppInstallationTokenProvider(
       throw new InvalidOperationException(
         $"GitHub App '{auth.ClientId}' has {installations.Count} installations; set InstallationId explicitly in UpstreamAuth.");
 
-    return installations[0].Id;
+    return installations[0].AccessTokensUrl;
   }
 
   private string CreateAppJwt(UpstreamAuth auth)
@@ -136,5 +134,5 @@ public sealed class GitHubAppInstallationTokenProvider(
   }
 
   [SuppressMessage("ReSharper", "ClassNeverInstantiated.Local")]
-  private sealed record Installation([property: JsonPropertyName("id")] long Id);
+  private sealed record Installation([property: JsonPropertyName("id")] long Id, [property: JsonPropertyName("access_tokens_url")] Uri AccessTokensUrl);
 }

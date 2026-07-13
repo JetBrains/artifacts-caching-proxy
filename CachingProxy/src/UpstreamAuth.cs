@@ -44,7 +44,6 @@ public record UpstreamAuth
   // as PEM text (PrivateKey); ClientId is reused as the JWT issuer. InstallationId is optional — when
   // omitted it is auto-resolved if the App has exactly one installation. GitHubApiBaseUrl defaults to GitHub.com.
   public string? PrivateKey { get; init; }
-  public long? InstallationId { get; init; }
   public string GitHubApiBaseUrl { get; init; } = "https://api.github.com";
 
   // True when this entry uses GitHub App auth (a private key is configured); ClientId then acts as the
@@ -56,6 +55,5 @@ public record UpstreamAuth
     .Append(UrlPrefixes.Length > 0 ? $", {nameof(UrlPrefixes)}: {string.Join(" ", UrlPrefixes)}" : "")
     .Append(TokenEndpoint != null ? $", {nameof(TokenEndpoint)}: {TokenEndpoint}" : "")
     .Append(Scope != null ? $", {nameof(Scope)}:{Scope}" : "")
-    .Append(InstallationId != null ? $", {nameof(InstallationId)}:{InstallationId}" : "")
     .ToString();
 }

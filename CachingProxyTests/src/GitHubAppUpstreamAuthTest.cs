@@ -66,11 +66,16 @@ public class GitHubAppUpstreamAuthTest : IAsyncLifetime
         return res.WriteAsync(JwksJson(myInboundRsa));
       });
 
-      router.MapGet("app/installations", (_, res, _) =>
+      router.MapGet("app/installations", (req, res, _) =>
       {
         Interlocked.Increment(ref myListInstallationsRequests);
         res.ContentType = "application/json";
-        return res.WriteAsync(JsonSerializer.Serialize(new[] { new { id = InstallationId } }));
+        // Mirror the real GitHub API: each installation carries its own access_tokens_url, which the
+        // proxy now follows directly. Derive it from this request so it points back at this same fake
+        // server's access-tokens route (keeping the {id} capture intact).
+        var accessTokensUrl = $"{req.Scheme}://{req.Host}/app/installations/{InstallationId}/access_tokens";
+        return res.WriteAsync(JsonSerializer.Serialize(
+          new[] { new { id = InstallationId, access_tokens_url = accessTokensUrl } }));
       });
 
       router.MapPost("app/installations/{id}/access_tokens", (req, res, data) =>
