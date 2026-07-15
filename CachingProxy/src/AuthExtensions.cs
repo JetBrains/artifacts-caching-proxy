@@ -35,6 +35,10 @@ public static class AuthExtensions
   // Basic password. Appended alongside the JwtBearer "Bearer" challenge, and standalone in the deny path.
   internal const string BasicChallenge = "Basic realm=\"Artifacts Caching Proxy\"";
 
+  // Default scheme used when redirect-signature validation is enabled: a policy scheme that forwards
+  // each request to JwtBearer or the redirect-signature handler (see AddInboundAuth).
+  private const string CombinedInboundScheme = "CombinedInbound";
+
   /// <summary>
   /// Per-upstream auth. Two credential modes coexist (see <see cref="UpstreamAuth"/>): OAuth
   /// client-credentials (Duende token management, one client per entry named by its ClientId) and GitHub
@@ -137,8 +141,31 @@ public static class AuthExtensions
       new JwksConfigurationRetriever(),
       new HttpDocumentRetriever { RequireHttps = inboundAuth.JwksUrl.Scheme == Uri.UriSchemeHttps });
 
-    services
-      .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    var redirectSignature = inboundAuth.RedirectSignature;
+
+    // When redirect-signature validation is enabled, a private request may authenticate with EITHER a
+    // client JWT OR a redirector HMAC signature (the two never coexist: the JWT is dropped on the
+    // cross-host redirect that carries the signature). Make the default scheme a policy scheme that
+    // forwards each request to whichever handler its credentials fit — cr_sig present => the signature
+    // handler, otherwise JwtBearer — so a single [Authorize] on the prefix accepts both. With no
+    // signature configured, JwtBearer stays the sole default scheme, exactly as before.
+    var authenticationBuilder = services.AddAuthentication(
+      redirectSignature != null ? CombinedInboundScheme : JwtBearerDefaults.AuthenticationScheme);
+
+    if (redirectSignature != null)
+    {
+      authenticationBuilder
+        .AddPolicyScheme(CombinedInboundScheme, displayName: null, options =>
+          options.ForwardDefaultSelector = context =>
+            context.Request.Query.ContainsKey(RedirectSignatureAuthenticationHandler.SignatureQueryParam)
+              ? RedirectSignatureAuthenticationHandler.SchemeName
+              : JwtBearerDefaults.AuthenticationScheme)
+        .AddScheme<RedirectSignatureOptions, RedirectSignatureAuthenticationHandler>(
+          RedirectSignatureAuthenticationHandler.SchemeName,
+          options => options.Config = redirectSignature);
+    }
+
+    authenticationBuilder
       .AddJwtBearer(options =>
       {
         options.ConfigurationManager = jwks;

@@ -41,6 +41,28 @@ public class CachingProxyConfig
     // token that does carry exp/nbf is still validated against them. Trade-off: a leaked non-expiring
     // token stays valid until the signing key rotates or it is revoked at the issuer (not checked here).
     public bool RequireExpiration { get; init; } = true;
+
+    // HMAC signature validation for redirects issued by the cache-redirector. When the redirector
+    // hands a client a signed 307 to this proxy, the client follows it to a different host, so the
+    // client JWT (Authorization header) is dropped by HTTP clients on the cross-host hop. The
+    // redirector instead proves the request was authorized by appending cr_exp/cr_sig query
+    // parameters signed with a key shared out-of-band (see the cache-redirector repo's auth.lua).
+    // Null by default: no signature is accepted and only the JWT authorizes a private prefix.
+    public RedirectSignatureConfig? RedirectSignature { get; init; }
+  }
+
+  // Shared-secret HMAC verification of cache-redirector signed links. The signature covers the
+  // request line (path + query, minus the cr_exp/cr_sig parameters themselves) plus the expiry, so a
+  // signed URL authorizes exactly one path until it expires and cannot be replayed against another.
+  public record RedirectSignatureConfig
+  {
+    // The HMAC-SHA256 key, shared out-of-band with the redirector (its CR_SIGNING_KEY). Same value,
+    // duplicated across the two AWS accounts (see the redirector repo's README).
+    public required string Key { get; init; }
+
+    // Tolerance for clock drift between the redirector (which stamps cr_exp) and this proxy when
+    // checking expiry. The signature lifetime itself is chosen by the redirector.
+    public TimeSpan ClockSkew { get; init; } = TimeSpan.FromSeconds(30);
   }
 
   public CachingProxyPrefix[] Prefixes { get; init; } = [];
