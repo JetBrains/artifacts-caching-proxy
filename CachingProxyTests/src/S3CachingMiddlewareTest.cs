@@ -70,11 +70,11 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
           .UseTestServer()
           .ConfigureAppConfiguration(cfg =>
             cfg.AddJsonStream(new MemoryStream(JsonSerializer.SerializeToUtf8Bytes(config))))
-          .ConfigureServices((context, services) =>
+          .ConfigureOurServices()
+          .ConfigureServices(services =>
           {
             services
               .AddSingleton(config)
-              .ConfigureOurServices(context.Configuration)
             // Real system clock: the signed-link path lets the real client compute the presigned
             // URL, whose Expires must be in the future (no test here advances time).
               .Replace(ServiceDescriptor.Singleton<IAmazonS3>(myS3));

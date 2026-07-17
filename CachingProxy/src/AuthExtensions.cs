@@ -31,10 +31,6 @@ namespace JetBrains.CachingProxy;
 /// </summary>
 public static class AuthExtensions
 {
-  // Advertised on 401s so Basic-only clients (Maven/Gradle/npm) prompt for / send the JWT as the
-  // Basic password. Appended alongside the JwtBearer "Bearer" challenge, and standalone in the deny path.
-  internal const string BasicChallenge = "Basic realm=\"Artifacts Caching Proxy\"";
-
   // Default scheme used when redirect-signature validation is enabled: a policy scheme that forwards
   // each request to JwtBearer or the redirect-signature handler (see AddInboundAuth).
   private const string CombinedInboundScheme = "CombinedInbound";
@@ -97,7 +93,7 @@ public static class AuthExtensions
   /// is NOT configured, a fail-closed default scheme (<see cref="DenyAuthenticationHandler"/>) answers any
   /// AuthorizeAttribute challenge with 401 instead of letting the middleware throw a 500.
   /// </summary>
-  public static IServiceCollection AddInboundAuth(this IServiceCollection services, IConfiguration configuration)
+  public static IServiceCollection AddInboundAuth(this IServiceCollection services, IConfiguration configuration, IHostEnvironment hostEnvironment)
   {
     // Without explicit configuration the key ring is generated ephemerally on first use,
     // which logs a warning (captured by Sentry with a full thread stack). Pin a stable application name and
@@ -152,6 +148,10 @@ public static class AuthExtensions
     var authenticationBuilder = services.AddAuthentication(
       redirectSignature != null ? CombinedInboundScheme : JwtBearerDefaults.AuthenticationScheme);
 
+    // Advertised on 401s so Basic-only clients (Maven/Gradle/npm) prompt for / send the JWT as the
+    // Basic password. Appended alongside the JwtBearer "Bearer" challenge, and standalone in the deny path.
+    var basicChallenge = $"Basic realm=\"{hostEnvironment.ApplicationName}\"";
+
     if (redirectSignature != null)
     {
       authenticationBuilder
@@ -162,7 +162,11 @@ public static class AuthExtensions
               : JwtBearerDefaults.AuthenticationScheme)
         .AddScheme<RedirectSignatureOptions, RedirectSignatureAuthenticationHandler>(
           RedirectSignatureAuthenticationHandler.SchemeName,
-          options => options.Config = redirectSignature);
+          options =>
+          {
+            options.Config = redirectSignature;
+            options.Challenge = basicChallenge;
+          });
     }
 
     authenticationBuilder
@@ -195,7 +199,7 @@ public static class AuthExtensions
           // (Maven/Gradle/npm) prompt for / send the JWT as the Basic password.
           OnChallenge = context =>
           {
-            context.Response.Headers.Append(HeaderNames.WWWAuthenticate, BasicChallenge);
+            context.Response.Headers.Append(HeaderNames.WWWAuthenticate, basicChallenge);
             return Task.CompletedTask;
           },
         };
@@ -209,12 +213,9 @@ public static class AuthExtensions
   /// endpoint's AuthorizeAttribute metadata is available) and before the proxy middleware (which would
   /// otherwise serve unauthenticated requests). /health stays public (handled earlier in the pipeline).
   /// </summary>
-  public static IApplicationBuilder UseInboundAuth(this IApplicationBuilder app, CachingProxyConfig config)
-  {
-    app.UseAuthentication();
-    app.UseAuthorization();
-    return app;
-  }
+  public static IApplicationBuilder UseInboundAuth(this IApplicationBuilder app) => app
+    .UseAuthentication()
+    .UseAuthorization();
 
   // Extracts the password from an "Authorization: Basic base64(user:password)" header, used to accept
   // a JWT that a Basic-only client (Maven/Gradle/npm) sent as the password. Returns null when the
@@ -254,7 +255,6 @@ internal sealed class DenyAuthenticationHandler(
   protected override Task HandleChallengeAsync(AuthenticationProperties properties)
   {
     Response.StatusCode = StatusCodes.Status401Unauthorized;
-    Response.Headers.Append(HeaderNames.WWWAuthenticate, AuthExtensions.BasicChallenge);
     return Task.CompletedTask;
   }
 }

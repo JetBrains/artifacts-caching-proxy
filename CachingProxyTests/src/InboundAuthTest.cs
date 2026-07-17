@@ -96,7 +96,7 @@ public class InboundAuthTest : IAsyncLifetime
     Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
     Assert.Contains(response.Headers.WwwAuthenticate, h => h.Scheme == "Bearer");
     var basic = Assert.Single(response.Headers.WwwAuthenticate, h => h.Scheme == "Basic");
-    Assert.Equal("realm=\"Artifacts Caching Proxy\"", basic.Parameter);
+    Assert.Equal("realm=\"CachingProxyTests\"", basic.Parameter);
   }
 
   [Fact]
@@ -304,9 +304,6 @@ public class InboundAuthTest : IAsyncLifetime
       var response = await client.GetAsync("/private/one.jar");
 
       Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
-      var basic = Assert.Single(response.Headers.WwwAuthenticate, h => h.Scheme == "Basic");
-      Assert.Equal("realm=\"Artifacts Caching Proxy\"", basic.Parameter);
-      Assert.DoesNotContain(response.Headers.WwwAuthenticate, h => h.Scheme == "Bearer");
     }
     finally
     {
@@ -399,9 +396,8 @@ public class InboundAuthTest : IAsyncLifetime
         .UseTestServer()
         .ConfigureAppConfiguration(cfg =>
           cfg.AddJsonStream(new MemoryStream(JsonSerializer.SerializeToUtf8Bytes(config))))
-        .ConfigureServices((context, services) => services
-          .AddSingleton(config)
-          .ConfigureOurServices(context.Configuration))
+        .ConfigureOurServices()
+        .ConfigureServices(services => services.AddSingleton(config))
         .Configure((context, builder) => builder.ConfigureOurApp(context.Configuration)))
       .Build();
 

@@ -19,6 +19,7 @@ public class RedirectSignatureOptions : AuthenticationSchemeOptions
   // Set from InboundAuthConfig.RedirectSignature (see AuthExtensions.AddInboundAuth). Non-null
   // whenever this scheme is registered.
   public CachingProxyConfig.RedirectSignatureConfig Config { get; set; } = null!;
+  public string? Challenge { get; set; }
 }
 
 /// <summary>
@@ -124,7 +125,8 @@ public sealed class RedirectSignatureAuthenticationHandler(
   protected override Task HandleChallengeAsync(AuthenticationProperties properties)
   {
     Response.StatusCode = StatusCodes.Status401Unauthorized;
-    Response.Headers.Append(HeaderNames.WWWAuthenticate, AuthExtensions.BasicChallenge);
+    if (Options.Challenge is {} challenge)
+      Response.Headers.Append(HeaderNames.WWWAuthenticate, challenge);
     return Task.CompletedTask;
   }
 }

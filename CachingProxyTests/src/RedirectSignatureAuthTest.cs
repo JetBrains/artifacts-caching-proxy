@@ -274,9 +274,8 @@ public class RedirectSignatureAuthTest : IAsyncLifetime
         .UseTestServer()
         .ConfigureAppConfiguration(cfg =>
           cfg.AddJsonStream(new MemoryStream(JsonSerializer.SerializeToUtf8Bytes(config))))
-        .ConfigureServices((context, services) => services
-          .AddSingleton(config)
-          .ConfigureOurServices(context.Configuration))
+        .ConfigureOurServices()
+        .ConfigureServices(services => services.AddSingleton(config))
         .Configure((context, builder) => builder.ConfigureOurApp(context.Configuration)))
       .Build();
 

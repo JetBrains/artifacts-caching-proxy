@@ -81,13 +81,10 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
           .UseTestServer()
           .ConfigureAppConfiguration(cfg =>
             cfg.AddJsonStream(new MemoryStream(JsonSerializer.SerializeToUtf8Bytes(myConfig))))
-          .ConfigureServices((context, services) =>
-          {
-            services
-              .AddSingleton(myConfig)
-              .ConfigureOurServices(context.Configuration)
-              .Replace(ServiceDescriptor.Singleton<TimeProvider>(myTimeProvider));
-          })
+          .ConfigureOurServices()
+          .ConfigureServices(services => services
+            .AddSingleton(myConfig)
+            .Replace(ServiceDescriptor.Singleton<TimeProvider>(myTimeProvider)))
           .Configure((context, builder) => builder.ConfigureOurApp(context.Configuration));
       })
       .Build();

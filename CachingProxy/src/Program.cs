@@ -65,8 +65,7 @@ public static class Program
       .Configure<CachingProxyConfig>(builder.Configuration)
       .AddSingleton(static sp => sp.GetRequiredService<IOptions<CachingProxyConfig>>().Value);
 
-    builder.Services
-      .ConfigureOurServices(builder.Configuration);
+    builder.WebHost.ConfigureOurServices();
 
     builder.Services
       .AddOpenTelemetry()
@@ -107,7 +106,7 @@ public static class Program
     return app.RunAsync();
   }
 
-  public static IServiceCollection ConfigureOurServices(this IServiceCollection services, IConfiguration configuration)
+  public static IWebHostBuilder ConfigureOurServices(this IWebHostBuilder webHostBuilder) => webHostBuilder.ConfigureServices((context, services) =>
   {
     services
       .AddSingleton(TimeProvider.System)
@@ -135,7 +134,7 @@ public static class Program
     // Opt-in L2 (distributed) cache: wired only when a Redis connection string is configured, so
     // disk/dev runs stay L1-only with no Redis dependency. Mirrors the S3 conditional below. The
     // per-status DistributedCacheDuration applied in ResponseCache.PutStatusCode takes effect once this runs.
-    var redis = configuration.Get<CachingProxyConfig>()?.Redis;
+    var redis = context.Configuration.Get<CachingProxyConfig>()?.Redis;
     if (!string.IsNullOrEmpty(redis?.ConnectionString))
     {
       // CachedResponse holds an IHeaderDictionary that MemoryPack can't serialize on its own, so a
@@ -174,7 +173,7 @@ public static class Program
       .AddOptions<MemoryCacheOptions>()
       .Configure<TimeProvider>((options, tp) => options.Clock = new TimeProviderClock(tp));
 
-    if (!string.IsNullOrEmpty(configuration.Get<CachingProxyConfig>()?.S3?.BucketName))
+    if (!string.IsNullOrEmpty(context.Configuration.Get<CachingProxyConfig>()?.S3?.BucketName))
     {
       services
         .AddSingleton<AWSOptions>(static provider =>
@@ -224,8 +223,8 @@ public static class Program
     }
 
     services
-      .AddUpstreamAuth(configuration)
-      .AddInboundAuth(configuration);
+      .AddUpstreamAuth(context.Configuration)
+      .AddInboundAuth(context.Configuration, context.HostingEnvironment);
 
     services
       .AddHttpClient<ProxyHttpClient>(static (provider, client) =>
@@ -236,7 +235,7 @@ public static class Program
         client.DefaultVersionPolicy = HttpVersionPolicy.RequestVersionOrHigher;
         // The base product token is added globally (ConfigureHttpClientDefaults); only append the optional
         // deployment-specific comment here.
-        if (config.UserAgentComment is { Length: >0 } userAgentComment)
+        if (config.UserAgentComment is { Length: > 0 } userAgentComment)
         {
           try
           {
@@ -258,17 +257,14 @@ public static class Program
       })
       .AddTransientHttpErrorPolicy(static policyBuilder => policyBuilder.WaitAndRetryAsync(
         4, retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt - 1))));
-
-    return services;
-  }
+  });
 
   public static void ConfigureOurApp(this IApplicationBuilder app, IConfiguration configuration)
   {
-    var cachingProxyConfig = configuration.Get<CachingProxyConfig>()!;
     app.UseRouting();
     app.UseHealthChecks("/health");
-    app.UseInboundAuth(cachingProxyConfig);
-    if (!string.IsNullOrEmpty(cachingProxyConfig.S3?.BucketName))
+    app.UseInboundAuth();
+    if (!string.IsNullOrEmpty(configuration.Get<CachingProxyConfig>()!.S3?.BucketName))
     {
       app.UseMiddleware<S3CachingMiddleware>();
     }
