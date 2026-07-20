@@ -51,6 +51,12 @@ public class UpstreamTestServer : IAsyncLifetime
   public int MavenMetadataRequestCount;
   public int SnapshotRequestCount;
 
+  // Counts hits on the npm packument / tarball routes. The packument route is conditional-aware and,
+  // on a conditional request, honours the shared Revalidate behavior so the npm tests can script a
+  // 304 (kept) or a 5xx (serve stale) after the freshness window.
+  public int PackumentRequestCount;
+  public int TarballRequestCount;
+
   public UpstreamTestServer()
   {
     var builder = WebApplication.CreateBuilder();
@@ -139,6 +145,32 @@ public class UpstreamTestServer : IAsyncLifetime
       {
         res.ContentType = MediaTypeNames.Text.Xml;
         return res.WriteAsync("<archetype-catalog/>");
+      })
+      .MapGet("express", (req, res, data) =>
+      {
+        Interlocked.Increment(ref PackumentRequestCount);
+        // Conditional revalidation after the freshness window: honour the scripted behavior so the
+        // tests can drive REVALIDATED (304) or STALE (5xx). A first (unconditional) request returns
+        // the full packument.
+        if (req.Headers.ContainsKey("If-Modified-Since") || req.Headers.ContainsKey("If-None-Match"))
+        {
+          switch (Revalidate)
+          {
+            case RevalidateBehavior.NotModified:
+              res.StatusCode = StatusCodes.Status304NotModified;
+              return Task.CompletedTask;
+            case RevalidateBehavior.ServerError:
+              res.StatusCode = StatusCodes.Status500InternalServerError;
+              return res.WriteAsync("boom");
+          }
+        }
+        res.ContentType = MediaTypeNames.Application.Json;
+        return res.WriteAsync("{\"name\":\"express\",\"dist-tags\":{\"latest\":\"1.0.0\"}}");
+      })
+      .MapGet("express/-/express-1.0.0.tgz", (req, res, data) =>
+      {
+        Interlocked.Increment(ref TarballRequestCount);
+        return res.WriteAsync("npm-tarball-content");
       })
       .MapGet("a.jar", (req, res, data) => res.WriteAsync("a.jar"))
       .MapGet("chunked.bin", async (req, res, data) =>

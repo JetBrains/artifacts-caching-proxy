@@ -62,4 +62,35 @@ public class CachingProfileTest
   {
     Assert.Null(new CachingProfile().Match("/anything"));
   }
+
+  [Fact]
+  public void Npm_Profile_Rules_Resolve_By_Endpoint_Kind()
+  {
+    // Mirrors the shipped npm profile ordering: security redirect, tarball eternal, catch-all freshness.
+    var profile = new CachingProfile
+    {
+      Rules =
+      [
+        new CachingRule { Pattern = "-/npm/v1/security/", Redirect = true },
+        new CachingRule { Pattern = @"\.tgz$" },
+        new CachingRule { Pattern = ".", RefreshAfter = TimeSpan.FromHours(1) },
+      ]
+    };
+
+    // Tarball matches the eternal .tgz rule before the catch-all (immutable => no freshness window).
+    var tarball = profile.Match("/registry.npmjs.org/express/-/express-1.0.0.tgz");
+    Assert.NotNull(tarball);
+    Assert.False(tarball!.Redirect);
+    Assert.Null(tarball.RefreshAfter);
+
+    // A bare packument path falls through to the catch-all => 1-hour freshness.
+    var packument = profile.Match("/registry.npmjs.org/express");
+    Assert.NotNull(packument);
+    Assert.Equal(TimeSpan.FromHours(1), packument!.RefreshAfter);
+
+    // The security-audit endpoint redirects (dynamic).
+    var security = profile.Match("/registry.npmjs.org/-/npm/v1/security/audits/quick");
+    Assert.NotNull(security);
+    Assert.True(security!.Redirect);
+  }
 }

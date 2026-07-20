@@ -59,9 +59,21 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
             new CachingRule { Pattern = "-SNAPSHOT", RefreshAfter = TimeSpan.FromDays(1) },
           ]
         },
-        // Exercises the Redirect rule action (the mechanism a future npm profile will use): any path
-        // is always 307-redirected to the upstream.
+        // Exercises the Redirect rule action: any path is always 307-redirected to the upstream.
         ["redirect-all"] = new() { Rules = [new CachingRule { Pattern = ".", Redirect = true }] },
+        // The npm profile (full-only packument caching): security/search redirect (dynamic), tarballs
+        // are cached forever (immutable), and everything else — packuments, version docs, dist-tags —
+        // is cached with a short freshness window and revalidated.
+        ["npm"] = new()
+        {
+          Rules =
+          [
+            new CachingRule { Pattern = "-/npm/v1/security/", Redirect = true },
+            new CachingRule { Pattern = "-/v1/search", Redirect = true },
+            new CachingRule { Pattern = @"\.tgz$" },
+            new CachingRule { Pattern = ".", RefreshAfter = TimeSpan.FromHours(1) },
+          ]
+        },
       },
       Prefixes =
       [
@@ -77,6 +89,7 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
         $"/overlap/nested={upstreamServer.Url}",
         new CachingProxyPrefix($"/real={upstreamServer.Url}", Profile: "maven"),
         new CachingProxyPrefix($"/real-redirect={upstreamServer.Url}", Profile: "redirect-all"),
+        new CachingProxyPrefix($"/real-npm={upstreamServer.Url}", Profile: "npm"),
         new CachingProxyPrefix($"/real-custom-ttl={upstreamServer.Url}", new CacheDuration
         {
           [HttpStatusCode.OK] = TimeSpan.FromMinutes(30),
@@ -514,12 +527,92 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
   public async Task Redirect_Rule_Always_Redirects()
   {
     // A profile Redirect rule bounces the path to the upstream with a 307 (never caching it) — the
-    // mechanism a future npm profile will use for its non-cacheable security-audit endpoint.
+    // mechanism the npm profile uses for its non-cacheable security-audit endpoint.
     await AssertGetResponse("/real-redirect/a.jar", HttpStatusCode.RedirectKeepVerb,
       (message, bytes) =>
       {
         AssertStatusHeader(message, CachingProxyStatus.ALWAYS_REDIRECT);
         Assert.Equal($"{myUpstreamServer.Url}a.jar", message.Headers.Location?.ToString());
+      });
+  }
+
+  [Fact]
+  public async Task Npm_Packument_Is_Cached_And_Revalidated()
+  {
+    myUpstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.Ok;
+
+    // A packument is a bare package path (no file extension). The npm profile caches it (never
+    // redirects) and advertises the 1-hour freshness window as the client max-age.
+    await AssertGetResponse("/real-npm/express", HttpStatusCode.OK,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.MISS);
+        Assert.Equal("public, max-age=3600", message.Headers.CacheControl?.ToString());
+        Assert.Contains("\"name\":\"express\"", Encoding.UTF8.GetString(bytes));
+      });
+
+    await AssertGetResponse("/real-npm/express", HttpStatusCode.OK,
+      (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.HIT));
+
+    // Past the window it is revalidated; the upstream answers 304, so it is kept and served.
+    myTimeProvider.Advance(TimeSpan.FromMinutes(61));
+    myUpstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.NotModified;
+    await AssertGetResponse("/real-npm/express", HttpStatusCode.OK,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.REVALIDATED);
+        Assert.Contains("\"name\":\"express\"", Encoding.UTF8.GetString(bytes));
+      });
+  }
+
+  [Fact]
+  public async Task Npm_Packument_Served_Stale_When_Upstream_Down()
+  {
+    // The offline guarantee: once cached, a packument is still served (not redirected, not failed)
+    // when the upstream is unreachable during revalidation.
+    myUpstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.Ok;
+    await AssertGetResponse("/real-npm/express", HttpStatusCode.OK,
+      (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.MISS));
+
+    myTimeProvider.Advance(TimeSpan.FromMinutes(61));
+    myUpstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.ServerError;
+    await AssertGetResponse("/real-npm/express", HttpStatusCode.OK,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.STALE);
+        Assert.Contains("\"name\":\"express\"", Encoding.UTF8.GetString(bytes));
+      });
+  }
+
+  [Fact]
+  public async Task Npm_Tarball_Is_Cached_Eternally()
+  {
+    // A version tarball is immutable: the .tgz rule (before the catch-all) caches it forever.
+    await AssertGetResponse("/real-npm/express/-/express-1.0.0.tgz", HttpStatusCode.OK,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.MISS);
+        Assert.Equal("public, max-age=31536000", message.Headers.CacheControl?.ToString());
+        Assert.Equal("npm-tarball-content", Encoding.UTF8.GetString(bytes));
+      });
+
+    await AssertGetResponse("/real-npm/express/-/express-1.0.0.tgz", HttpStatusCode.OK,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.HIT);
+        Assert.Equal("public, max-age=31536000", message.Headers.CacheControl?.ToString());
+      });
+  }
+
+  [Fact]
+  public async Task Npm_Security_Audit_Is_Redirected()
+  {
+    // The security-audit endpoint is dynamic (not meaningful offline data), so it is redirected.
+    await AssertGetResponse("/real-npm/-/npm/v1/security/audits/quick", HttpStatusCode.RedirectKeepVerb,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.ALWAYS_REDIRECT);
+        Assert.Equal($"{myUpstreamServer.Url}-/npm/v1/security/audits/quick", message.Headers.Location?.ToString());
       });
   }
 
