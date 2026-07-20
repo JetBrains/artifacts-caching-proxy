@@ -48,8 +48,18 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   private readonly RemoteServers.RemoteServer myRemoteServer = new("/real", upstreamServer.Url, new CacheDuration());
 
   private TestServer CreateServer(bool signedLinks, TimeSpan? signedLinkTTL = null, int inlineThresholdBytes = TestInlineThresholdBytes,
-    CacheDuration? distributedCacheDuration = null)
+    CacheDuration? distributedCacheDuration = null, TimeSpan? refreshAfter = null)
   {
+    // When a freshness window is requested, drive it through a profile with a catch-all rule (so every
+    // /real path is revalidated after the window) — mirroring how the disk tests exercise revalidation.
+    var profiles = new Dictionary<string, CachingProfile>();
+    CachingProxyPrefix prefix = $"/real={upstreamServer.Url}";
+    if (refreshAfter is { } ra)
+    {
+      profiles["fresh"] = new CachingProfile { Rules = [new CachingRule { Pattern = ".", RefreshAfter = ra }] };
+      prefix = new CachingProxyPrefix($"/real={upstreamServer.Url}", Profile: "fresh");
+    }
+
     var config = new CachingProxyConfig
     {
       S3 = new CachingProxyConfig.S3Config(BucketName, signedLinks)
@@ -58,7 +68,8 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
         InlineThresholdBytes = inlineThresholdBytes,
       },
       DistributedCacheDuration = distributedCacheDuration ?? new CacheDuration(),
-      Prefixes = [$"/real={upstreamServer.Url}"],
+      CachingProfiles = profiles,
+      Prefixes = [prefix],
     };
 
     var host = new HostBuilder()
@@ -657,6 +668,88 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     Assert.Equal(HttpStatusCode.RedirectKeepVerb, blockedResponse.StatusCode);
   }
 
+  [Fact]
+  public async Task Stale_Object_Upstream_Changed_Is_Re_Stored()
+  {
+    // Past its freshness window, a stale object is revalidated; upstream returns new content (200), so
+    // the bucket object is replaced and the client served the refreshed copy (REVALIDATED).
+    var server = CreateServer(signedLinks: false, refreshAfter: TimeSpan.FromMinutes(1));
+    var key = GetPathKey("/real/revalidate.txt");
+    myS3.Objects[key] = ([.. "old"u8], "text/plain", "\"old\"");
+    myS3.CreatedAt[key] = DateTimeOffset.UtcNow - TimeSpan.FromHours(1); // stale
+    upstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.Ok;
+    upstreamServer.RevalidateContent = "new-content";
+
+    using var response = await server.CreateRequest("/real/revalidate.txt").SendAsync(HttpMethod.Get.Method);
+
+    Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
+    AssertStatusHeader(response, CachingProxyStatus.REVALIDATED);
+    Assert.Equal(1, myS3.PutObjectCalls);
+    Assert.Equal("new-content", Encoding.UTF8.GetString(myS3.Objects[key].Body));
+  }
+
+  [Fact]
+  public async Task Stale_Object_Upstream_NotModified_Is_Kept_And_Touched()
+  {
+    // Upstream reports 304: the stale object is still valid, so it is kept and served (REVALIDATED),
+    // and its stored date is bumped via a metadata-only self-copy (no re-upload).
+    var server = CreateServer(signedLinks: false, refreshAfter: TimeSpan.FromMinutes(1));
+    var key = GetPathKey("/real/revalidate.txt");
+    myS3.Objects[key] = ([.. "v1"u8], "text/plain", "\"v1\"");
+    var staleAt = DateTimeOffset.UtcNow - TimeSpan.FromHours(1);
+    myS3.CreatedAt[key] = staleAt;
+    upstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.NotModified;
+
+    using var response = await server.CreateRequest("/real/revalidate.txt").SendAsync(HttpMethod.Get.Method);
+
+    Assert.Equal(HttpStatusCode.OK, response.StatusCode); // small object served inline
+    AssertStatusHeader(response, CachingProxyStatus.REVALIDATED);
+    Assert.Equal("v1", await response.Content.ReadAsStringAsync());
+    Assert.Equal(1, myS3.CopyObjectCalls);              // touched
+    Assert.Equal(0, myS3.PutObjectCalls);               // not re-uploaded
+    Assert.True(myS3.CreatedAt[key] > staleAt);          // freshness clock reset
+  }
+
+  [Fact]
+  public async Task Stale_Object_Upstream_Error_Serves_Stale_Copy()
+  {
+    // Upstream is unreachable/5xx during revalidation: the stale object must still be served (STALE)
+    // and left untouched in the bucket.
+    var server = CreateServer(signedLinks: false, refreshAfter: TimeSpan.FromMinutes(1));
+    var key = GetPathKey("/real/revalidate.txt");
+    myS3.Objects[key] = ([.. "v1"u8], "text/plain", "\"v1\"");
+    myS3.CreatedAt[key] = DateTimeOffset.UtcNow - TimeSpan.FromHours(1);
+    upstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.ServerError;
+
+    using var response = await server.CreateRequest("/real/revalidate.txt").SendAsync(HttpMethod.Get.Method);
+
+    Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    AssertStatusHeader(response, CachingProxyStatus.STALE);
+    Assert.Equal("v1", await response.Content.ReadAsStringAsync());
+    Assert.Equal(0, myS3.PutObjectCalls);
+    Assert.Equal(0, myS3.DeleteObjectCalls);
+    Assert.True(myS3.Objects.ContainsKey(key)); // kept
+  }
+
+  [Fact]
+  public async Task Stale_Object_Upstream_NotFound_Is_Deleted()
+  {
+    // Upstream returns 404 during revalidation: the stale object is removed from the bucket and the
+    // client gets a (negatively cached) 404.
+    var server = CreateServer(signedLinks: false, refreshAfter: TimeSpan.FromMinutes(1));
+    var key = GetPathKey("/real/revalidate.txt");
+    myS3.Objects[key] = ([.. "v1"u8], "text/plain", "\"v1\"");
+    myS3.CreatedAt[key] = DateTimeOffset.UtcNow - TimeSpan.FromHours(1);
+    upstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.NotFound;
+
+    using var response = await server.CreateRequest("/real/revalidate.txt").SendAsync(HttpMethod.Get.Method);
+
+    Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    AssertStatusHeader(response, CachingProxyStatus.NEGATIVE_MISS);
+    Assert.Equal(1, myS3.DeleteObjectCalls);
+    Assert.False(myS3.Objects.ContainsKey(key)); // removed
+  }
+
   private string GetPathKey(string path)
   {
     Assert.StartsWith(myRemoteServer.Prefix, path);
@@ -689,9 +782,15 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     public readonly Dictionary<string, (byte[] Body, string? ContentType, string? ETag)> Objects = new();
     // The "uri" user-metadata stored alongside each PutObject, keyed by object key.
     public readonly Dictionary<string, string?> PutObjectUris = new();
+    // The object's "created-at" user-metadata (our freshness clock), keyed by object key. Absent
+    // unless written by a PutObject/CopyObject or seeded by a test; revalidation tests backdate it
+    // to make the object appear stale.
+    public readonly Dictionary<string, DateTimeOffset> CreatedAt = new();
     // S3 existence probes via the ranged GetObject prefetch.
     public int GetObjectCalls;
     public int PutObjectCalls;
+    public int CopyObjectCalls;
+    public int DeleteObjectCalls;
     public HttpVerb? LastPresignVerb;
     public DateTime? LastPresignExpires;
     public string? LastPresignCacheControl;
@@ -748,8 +847,11 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
         ContentLength = length,
         ContentRange = $"bytes {start}-{lastIndex}/{total}",
         ETag = obj.ETag,
+        LastModified = DateTime.UtcNow,
       };
       response.Headers.ContentType = obj.ContentType;
+      if (CreatedAt.TryGetValue(request.Key, out var createdAt))
+        response.Metadata["created-at"] = createdAt.ToString("O");
       return response;
     }
 
@@ -760,7 +862,26 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
       await request.InputStream.CopyToAsync(ms, cancellationToken);
       Objects[request.Key] = (ms.ToArray(), request.Headers.ContentType, null);
       PutObjectUris[request.Key] = request.Metadata["uri"];
+      if (request.Metadata["created-at"] is { } createdAt)
+        CreatedAt[request.Key] = DateTimeOffset.Parse(createdAt);
       return new PutObjectResponse { HttpStatusCode = HttpStatusCode.OK };
+    }
+
+    // Metadata-only self-copy used to bump an object's "created-at" (its freshness clock) on a 304.
+    public override Task<CopyObjectResponse> CopyObjectAsync(CopyObjectRequest request, CancellationToken cancellationToken = default)
+    {
+      Interlocked.Increment(ref CopyObjectCalls);
+      if (request.Metadata["created-at"] is { } createdAt)
+        CreatedAt[request.DestinationKey] = DateTimeOffset.Parse(createdAt);
+      return Task.FromResult(new CopyObjectResponse { HttpStatusCode = HttpStatusCode.OK });
+    }
+
+    public override Task<DeleteObjectResponse> DeleteObjectAsync(DeleteObjectRequest request, CancellationToken cancellationToken = default)
+    {
+      Interlocked.Increment(ref DeleteObjectCalls);
+      Objects.Remove(request.Key);
+      CreatedAt.Remove(request.Key);
+      return Task.FromResult(new DeleteObjectResponse { HttpStatusCode = HttpStatusCode.OK });
     }
 
     public override Task<GetBucketAclResponse> GetBucketAclAsync(GetBucketAclRequest request, CancellationToken cancellationToken = default) =>

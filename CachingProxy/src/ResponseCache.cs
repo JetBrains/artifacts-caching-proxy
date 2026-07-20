@@ -58,7 +58,15 @@ public sealed record CachedResponse(HttpStatusCode StatusCode, IHeaderDictionary
   {
     // Authorized (authenticated) responses are served only to the requesting client, so they
     // must not be stored by shared/intermediary caches. Anonymous responses stay public.
-    return context.User.Identity?.IsAuthenticated == true ? ourPrivateCachingHeader : ourEternalCachingHeader;
+    var isAuthenticated = context.User.Identity?.IsAuthenticated == true;
+
+    // When the request's caching-profile rule gave a freshness window, advertise it as the downstream
+    // max-age so shared and browser caches revalidate in step with the proxy instead of holding the
+    // artifact for a year. Otherwise (immutable coordinates) keep the eternal 365-day header.
+    if (context.Items[CachingProxyConstants.RefreshAfterItemKey] is TimeSpan refreshAfter)
+      return new CacheControlHeaderValue { Public = !isAuthenticated, Private = isAuthenticated, MaxAge = refreshAfter }.ToString();
+
+    return isAuthenticated ? ourPrivateCachingHeader : ourEternalCachingHeader;
   }
 
   public static void SetCachingHeaderFor(HttpContext context)

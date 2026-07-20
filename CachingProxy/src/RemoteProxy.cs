@@ -3,8 +3,10 @@ using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Net.Mime;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
@@ -32,9 +34,6 @@ public partial class RemoteProxy(
 
   private readonly Regex? myBlacklistRegex = !string.IsNullOrWhiteSpace(config.BlacklistUrlRegex) ?
     new Regex(config.BlacklistUrlRegex, RegexOptions.Compiled) : null;
-
-  private readonly Regex? myRedirectToRemoteUrlsRegex = !string.IsNullOrWhiteSpace(config.RedirectToRemoteUrlsRegex) ?
-    new Regex(config.RedirectToRemoteUrlsRegex, RegexOptions.Compiled) : null;
 
   /// <summary>
   /// Validates the request method (only GET/HEAD are allowed), the path (no traversal, only safe
@@ -101,7 +100,7 @@ public partial class RemoteProxy(
   /// Content-Encoding off the response) and must dispose it; in every other case the request is
   /// fully handled, the response (if any) is disposed internally, and <c>null</c> is returned.
   /// </summary>
-  public async Task<HttpResponseMessage?> ProcessAsync(HttpContext context, string cacheKey, CacheDuration cacheDuration, Uri upstreamUri, string? contentType = null, UpstreamAuth? auth = null)
+  public async Task<HttpResponseMessage?> ProcessAsync(HttpContext context, string cacheKey, CacheDuration cacheDuration, Uri upstreamUri, string? contentType = null, UpstreamAuth? auth = null, CachingRule? rule = null)
   {
     var isHead = HttpMethods.IsHead(context.Request.Method);
 
@@ -133,12 +132,12 @@ public partial class RemoteProxy(
       return null;
     }
 
-    // Mutable / non-cacheable paths (SNAPSHOTs, maven-metadata.xml, npm security) are redirected to the
-    // origin with 307 (RedirectKeepVerb) instead of being cached - this holds for authenticated upstreams
-    // too: a 307 preserves the method and the client reuses its own credentials for the origin, so there
-    // is no need to proxy these through (which would wrongly cache mutable content for protected sources).
-    var isRedirectToRemoteUrl = myRedirectToRemoteUrlsRegex != null && myRedirectToRemoteUrlsRegex.IsMatch(requestPath);
-    if (isRedirectToRemoteUrl)
+    // A caching profile rule may mark a path as always-redirected: it is bounced to the origin with
+    // 307 (RedirectKeepVerb) instead of being cached. This holds for authenticated upstreams too: a
+    // 307 preserves the method and the client reuses its own credentials for the origin, so there is
+    // no need to proxy these through (which would wrongly cache dynamic/non-cacheable content for
+    // protected sources). With no matching rule the path is cached, never redirected.
+    if (rule is { Redirect: true })
     {
       await SetStatusAsync(context, CachingProxyStatus.ALWAYS_REDIRECT,
         new CachedResponse(HttpStatusCode.RedirectKeepVerb, new HeaderDictionary())
@@ -209,15 +208,15 @@ public partial class RemoteProxy(
         return null;
       }
 
-      var headersContentEncoding = response.Content.Headers.ContentEncoding;
-      if (headersContentEncoding.Count > 1)
-        return await InternalServerError(context, Event.MultipleContentTypes,
-          $"{upstreamUri} returned multiple Content-Encoding which is not allowed: {string.Join(", ", headersContentEncoding)}");
-
-      var contentEncoding = headersContentEncoding.Count == 0 ? null : headersContentEncoding.Single();
-      if (contentEncoding != null && contentEncoding != "gzip")
-        return await InternalServerError(context, Event.NotSupportedContentType,
-          $"{upstreamUri} returned Content-Encoding '{contentEncoding}' which is not supported");
+      switch (ValidateContentEncoding(response, out var contentEncoding))
+      {
+        case ContentEncodingValidation.Multiple:
+          return await InternalServerError(context, Event.MultipleContentTypes,
+            $"{upstreamUri} returned multiple Content-Encoding which is not allowed: {string.Join(", ", response.Content.Headers.ContentEncoding)}");
+        case ContentEncodingValidation.Unsupported:
+          return await InternalServerError(context, Event.NotSupportedContentType,
+            $"{upstreamUri} returned Content-Encoding '{contentEncoding}' which is not supported");
+      }
 
       var responseEntry = new CachedResponse(response)
       {
@@ -245,6 +244,101 @@ public partial class RemoteProxy(
   }
 
 
+  /// <summary>
+  /// Revalidates a stale stored copy against the upstream with a conditional GET. Unlike
+  /// <see cref="ProcessAsync"/>, this never writes a negative cache entry and never touches the
+  /// response on <paramref name="context"/>; the caller decides what to serve from the outcome:
+  /// <list type="bullet">
+  /// <item><c>304 Not Modified</c> → <see cref="RevalidationOutcome.NotModified"/> (keep the stored copy).</item>
+  /// <item><c>404</c> → <see cref="RevalidationOutcome.Gone"/> (delete the stored copy).</item>
+  /// <item>a <c>2xx</c> with a storable Content-Encoding → <see cref="RevalidationOutcome.Replaced"/>;
+  /// the open response is returned for the caller to stream/store and <b>must be disposed</b>.</item>
+  /// <item>anything else (other status, timeout, network error, unsupported encoding) →
+  /// <see cref="RevalidationOutcome.UpstreamError"/> (serve the stale copy as-is).</item>
+  /// </list>
+  /// </summary>
+  public async Task<RevalidationResult> RevalidateAsync(HttpContext context, Uri upstreamUri,
+    string? etag, DateTimeOffset? lastModified, UpstreamAuth? auth, CancellationToken cancellationToken)
+  {
+    logger.LogDebug("Revalidating {UpstreamUri}", upstreamUri);
+
+    var request = new HttpRequestMessage(HttpMethod.Get, upstreamUri);
+    if (!string.IsNullOrEmpty(etag) && EntityTagHeaderValue.TryParse(etag, out var parsedEtag))
+      request.Headers.IfNoneMatch.Add(parsedEtag);
+    if (lastModified.HasValue)
+      request.Headers.IfModifiedSince = lastModified.Value;
+
+    HttpResponseMessage response;
+    try
+    {
+      if (authProvider != null && auth != null)
+        request.Headers.Authorization = await authProvider.GetAuthorizationHeaderAsync(auth, cancellationToken);
+      response = await httpClient.Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+    }
+    catch (OperationCanceledException canceledException)
+    {
+      if (canceledException.CancellationToken == context.RequestAborted) throw;
+      // Canceled by the internal token means a timeout: keep and serve the stale copy.
+      logger.LogWarning(Event.Timeout, "Timeout revalidating {UpstreamUri}; serving stale", upstreamUri);
+      return new RevalidationResult(RevalidationOutcome.UpstreamError);
+    }
+    catch (Exception e)
+    {
+      logger.LogWarning(e, "Exception revalidating {UpstreamUri}: {Message}; serving stale", upstreamUri, e.Message);
+      return new RevalidationResult(RevalidationOutcome.UpstreamError);
+    }
+
+    var transferOwnership = false;
+    try
+    {
+      switch (response.StatusCode)
+      {
+        case HttpStatusCode.NotModified:
+          return new RevalidationResult(RevalidationOutcome.NotModified);
+        case HttpStatusCode.NotFound:
+          return new RevalidationResult(RevalidationOutcome.Gone);
+      }
+
+      if (!response.IsSuccessStatusCode)
+      {
+        logger.LogWarning(Event.NegativeMiss(response.StatusCode),
+          "Non-success revalidating {UpstreamUri}: {StatusCode}; serving stale", upstreamUri, response.StatusCode);
+        return new RevalidationResult(RevalidationOutcome.UpstreamError);
+      }
+
+      if (ValidateContentEncoding(response, out var contentEncoding) != ContentEncodingValidation.Ok)
+      {
+        logger.LogWarning(Event.NotSupportedContentType,
+          "Unsupported Content-Encoding '{ContentEncoding}' revalidating {UpstreamUri}; serving stale", contentEncoding, upstreamUri);
+        return new RevalidationResult(RevalidationOutcome.UpstreamError);
+      }
+
+      transferOwnership = true;
+      return new RevalidationResult(RevalidationOutcome.Replaced, response);
+    }
+    finally
+    {
+      if (!transferOwnership) response.Dispose();
+    }
+  }
+
+  private enum ContentEncodingValidation { Ok, Multiple, Unsupported }
+
+  // Only an absent or a single "gzip" Content-Encoding is storable (the disk and S3 backends keep
+  // just plain and gzip variants). Reports the normalized encoding (null = none) via the out param.
+  private static ContentEncodingValidation ValidateContentEncoding(HttpResponseMessage response, out string? contentEncoding)
+  {
+    var headers = response.Content.Headers.ContentEncoding;
+    if (headers.Count > 1)
+    {
+      contentEncoding = null;
+      return ContentEncodingValidation.Multiple;
+    }
+
+    contentEncoding = headers.Count == 0 ? null : headers.Single();
+    return contentEncoding is null or "gzip" ? ContentEncodingValidation.Ok : ContentEncodingValidation.Unsupported;
+  }
+
   public async ValueTask SetStatusAsync(HttpContext context, CachingProxyStatus status, CachedResponse response)
   {
     SetStatusHeader(context, status);
@@ -267,3 +361,21 @@ public partial class RemoteProxy(
     return null;
   }
 }
+
+public enum RevalidationOutcome
+{
+  /// <summary>Upstream returned a new representation (2xx); the stored copy must be replaced.</summary>
+  Replaced,
+  /// <summary>Upstream returned 304; the stored copy is still valid and should be kept.</summary>
+  NotModified,
+  /// <summary>Upstream returned 404; the stored copy should be deleted.</summary>
+  Gone,
+  /// <summary>Upstream could not be reached or returned another error; serve the stale copy.</summary>
+  UpstreamError,
+}
+
+/// <summary>
+/// Result of <see cref="RemoteProxy.RevalidateAsync"/>. <see cref="Response"/> is non-null and open
+/// only for <see cref="RevalidationOutcome.Replaced"/>, and the caller must dispose it.
+/// </summary>
+public sealed record RevalidationResult(RevalidationOutcome Outcome, HttpResponseMessage? Response = null);

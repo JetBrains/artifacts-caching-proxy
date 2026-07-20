@@ -34,6 +34,8 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
   private readonly UpstreamTestServer myUpstreamServer;
   private readonly CachingProxyConfig myConfig;
   private readonly FakeTimeProvider myTimeProvider;
+  // Extra hosts spun up by individual tests (e.g. with a custom freshness profile), stopped on dispose.
+  private readonly List<IHost> myExtraHosts = [];
 
   public CachingProxyTest(ITestOutputHelper output, UpstreamTestServer upstreamServer)
   {
@@ -44,6 +46,23 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
     myConfig = new CachingProxyConfig
     {
       LocalCachePath = myTempDirectory,
+      CachingProfiles = new Dictionary<string, CachingProfile>
+      {
+        // The Maven profile: mutable metadata is revalidated hourly, SNAPSHOTs daily, and everything
+        // else (immutable coordinates) matches no rule => cached forever.
+        ["maven"] = new()
+        {
+          Rules =
+          [
+            new CachingRule { Pattern = @"maven-metadata\.xml(\..+)?$", RefreshAfter = TimeSpan.FromHours(1) },
+            new CachingRule { Pattern = @"archetype-catalog\.xml(\..+)?$", RefreshAfter = TimeSpan.FromHours(1) },
+            new CachingRule { Pattern = "-SNAPSHOT", RefreshAfter = TimeSpan.FromDays(1) },
+          ]
+        },
+        // Exercises the Redirect rule action (the mechanism a future npm profile will use): any path
+        // is always 307-redirected to the upstream.
+        ["redirect-all"] = new() { Rules = [new CachingRule { Pattern = ".", Redirect = true }] },
+      },
       Prefixes =
       [
         "/repo1.maven.org/maven2",
@@ -56,7 +75,8 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
         // that a wrong (shorter) match yields a 404 instead of the expected body.
         $"/overlap={upstreamServer.Url}wrong/",
         $"/overlap/nested={upstreamServer.Url}",
-        $"/real={upstreamServer.Url}",
+        new CachingProxyPrefix($"/real={upstreamServer.Url}", Profile: "maven"),
+        new CachingProxyPrefix($"/real-redirect={upstreamServer.Url}", Profile: "redirect-all"),
         new CachingProxyPrefix($"/real-custom-ttl={upstreamServer.Url}", new CacheDuration
         {
           [HttpStatusCode.OK] = TimeSpan.FromMinutes(30),
@@ -436,28 +456,70 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
   }
 
   [Fact]
-  public async Task Always_Redirect_Snapshots()
+  public async Task Maven_Snapshot_Is_Cached_With_Daily_Freshness()
   {
-    await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/1.0-SNAPSHOT/ant-xz-1.0-SNAPSHOT.jar",
-      HttpStatusCode.RedirectKeepVerb,
+    // A SNAPSHOT coordinate is mutable: the maven profile caches it (no longer an ALWAYS_REDIRECT) and
+    // advertises its 1-day freshness window as the client max-age.
+    await AssertGetResponse("/real/group/artifact/1.0-SNAPSHOT/artifact-1.0-SNAPSHOT.jar", HttpStatusCode.OK,
       (message, bytes) =>
       {
-        AssertStatusHeader(message, CachingProxyStatus.ALWAYS_REDIRECT);
-        Assert.Equal("https://repo1.maven.org/maven2/org/apache/ant/ant-xz/1.0-SNAPSHOT/ant-xz-1.0-SNAPSHOT.jar",
-          message.Headers.Location?.ToString());
+        AssertStatusHeader(message, CachingProxyStatus.MISS);
+        Assert.Equal("public, max-age=86400", message.Headers.CacheControl?.ToString());
+        Assert.Equal("snapshot-jar-content", Encoding.UTF8.GetString(bytes));
+      });
+
+    await AssertGetResponse("/real/group/artifact/1.0-SNAPSHOT/artifact-1.0-SNAPSHOT.jar", HttpStatusCode.OK,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.HIT);
+        Assert.Equal("public, max-age=86400", message.Headers.CacheControl?.ToString());
       });
   }
 
   [Fact]
-  public async Task Always_Redirect_Npm_Security_Check()
+  public async Task Maven_Archetype_Catalog_Is_Cached_With_Hourly_Freshness()
   {
-    await AssertGetResponse("/registry.npmjs.org/-/npm/v1/security/audits/quick",
-      HttpStatusCode.RedirectKeepVerb,
+    // archetype-catalog.xml lives at the repository root and is mutable (updated as archetypes are
+    // deployed): the maven profile caches it with the 1-hour freshness window rather than forever.
+    await AssertGetResponse("/real/archetype-catalog.xml", HttpStatusCode.OK,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.MISS);
+        Assert.Equal("public, max-age=3600", message.Headers.CacheControl?.ToString());
+        Assert.Equal("<archetype-catalog/>", Encoding.UTF8.GetString(bytes));
+      });
+
+    await AssertGetResponse("/real/archetype-catalog.xml", HttpStatusCode.OK,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.HIT);
+        Assert.Equal("public, max-age=3600", message.Headers.CacheControl?.ToString());
+      });
+  }
+
+  [Fact]
+  public async Task Maven_Immutable_Keeps_Eternal_Caching()
+  {
+    // An immutable coordinate on the maven-profiled prefix matches no rule => cached forever, with the
+    // eternal 365-day max-age (not the shorter freshness windows the profile gives mutable endpoints).
+    await AssertGetResponse("/real/a.jar", HttpStatusCode.OK,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.MISS);
+        Assert.Equal("public, max-age=31536000", message.Headers.CacheControl?.ToString());
+      });
+  }
+
+  [Fact]
+  public async Task Redirect_Rule_Always_Redirects()
+  {
+    // A profile Redirect rule bounces the path to the upstream with a 307 (never caching it) — the
+    // mechanism a future npm profile will use for its non-cacheable security-audit endpoint.
+    await AssertGetResponse("/real-redirect/a.jar", HttpStatusCode.RedirectKeepVerb,
       (message, bytes) =>
       {
         AssertStatusHeader(message, CachingProxyStatus.ALWAYS_REDIRECT);
-        Assert.Equal("https://registry.npmjs.org/-/npm/v1/security/audits/quick",
-          message.Headers.Location?.ToString());
+        Assert.Equal($"{myUpstreamServer.Url}a.jar", message.Headers.Location?.ToString());
       });
   }
 
@@ -529,48 +591,52 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
   }
 
   [Fact]
-  public async Task Always_Redirect_MavenMetadataXml()
+  public async Task Maven_Metadata_Is_Cached_With_Hourly_Freshness()
   {
-    await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/maven-metadata.xml",
-      HttpStatusCode.RedirectKeepVerb,
-      (message, _) =>
+    // maven-metadata.xml is mutable: the maven profile caches it (no longer an ALWAYS_REDIRECT) and
+    // advertises its 1-hour freshness window as the client max-age.
+    await AssertGetResponse("/real/group/artifact/maven-metadata.xml", HttpStatusCode.OK,
+      (message, bytes) =>
       {
-        AssertStatusHeader(message, CachingProxyStatus.ALWAYS_REDIRECT);
-        Assert.Equal("https://repo1.maven.org/maven2/org/apache/ant/ant-xz/maven-metadata.xml",
-          message.Headers.Location?.ToString());
+        AssertStatusHeader(message, CachingProxyStatus.MISS);
+        Assert.Equal("public, max-age=3600", message.Headers.CacheControl?.ToString());
+        Assert.Equal("<metadata><versioning/></metadata>", Encoding.UTF8.GetString(bytes));
+      });
+
+    await AssertGetResponse("/real/group/artifact/maven-metadata.xml", HttpStatusCode.OK,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.HIT);
+        Assert.Equal("public, max-age=3600", message.Headers.CacheControl?.ToString());
       });
   }
 
   [Fact]
-  public async Task Always_Redirect_MavenMetadataXmlChecksum()
+  public async Task Maven_Per_Endpoint_Freshness_Windows_Differ()
   {
-    await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/maven-metadata.xml.sha1",
-      HttpStatusCode.RedirectKeepVerb,
-      (message, _) =>
-      {
-        AssertStatusHeader(message, CachingProxyStatus.ALWAYS_REDIRECT);
-        Assert.Equal("https://repo1.maven.org/maven2/org/apache/ant/ant-xz/maven-metadata.xml.sha1",
-          message.Headers.Location?.ToString());
-      });
-  }
+    // Prime both endpoints (MISS), then advance the clock past the metadata window (1h) but not the
+    // snapshot window (1 day): the metadata revalidates while the snapshot is still a plain HIT — proof
+    // the freshness window is resolved per endpoint, not globally.
+    await AssertGetResponse("/real/group/artifact/maven-metadata.xml", HttpStatusCode.OK,
+      (m, _) => AssertStatusHeader(m, CachingProxyStatus.MISS));
+    await AssertGetResponse("/real/group/artifact/1.0-SNAPSHOT/artifact-1.0-SNAPSHOT.jar", HttpStatusCode.OK,
+      (m, _) => AssertStatusHeader(m, CachingProxyStatus.MISS));
 
-  [Theory]
-  // maven-metadata.xml with any extension is redirected (mutable). RedirectToRemoteUrlsRegex matches
-  // an arbitrary suffix (\..+), not just the well-known checksum extensions, so newer checksum
-  // algorithms or other companion files are covered too.
-  [InlineData("maven-metadata.xml.sha256")]
-  [InlineData("maven-metadata.xml.sha384")]
-  [InlineData("maven-metadata.xml.asc")]
-  public async Task Always_Redirect_MavenMetadataXml_AnyExtension(string fileName)
-  {
-    await AssertGetResponse($"/repo1.maven.org/maven2/org/apache/ant/ant-xz/{fileName}",
-      HttpStatusCode.RedirectKeepVerb,
-      (message, _) =>
+    myTimeProvider.Advance(TimeSpan.FromHours(2));
+
+    // Metadata is stale (> 1h): revalidated against the upstream, which answers 304 => kept and served.
+    await AssertGetResponse("/real/group/artifact/maven-metadata.xml", HttpStatusCode.OK,
+      (m, bytes) =>
       {
-        AssertStatusHeader(message, CachingProxyStatus.ALWAYS_REDIRECT);
-        Assert.Equal($"https://repo1.maven.org/maven2/org/apache/ant/ant-xz/{fileName}",
-          message.Headers.Location?.ToString());
+        AssertStatusHeader(m, CachingProxyStatus.REVALIDATED);
+        Assert.Equal("<metadata><versioning/></metadata>", Encoding.UTF8.GetString(bytes));
       });
+
+    // The snapshot window (1 day) has not elapsed: still a plain HIT, with no upstream revalidation.
+    var snapshotHitsBefore = myUpstreamServer.SnapshotRequestCount;
+    await AssertGetResponse("/real/group/artifact/1.0-SNAPSHOT/artifact-1.0-SNAPSHOT.jar", HttpStatusCode.OK,
+      (m, _) => AssertStatusHeader(m, CachingProxyStatus.HIT));
+    Assert.Equal(snapshotHitsBefore, myUpstreamServer.SnapshotRequestCount);
   }
 
   [Fact]
@@ -847,6 +913,173 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
     }
   }
 
+  // Builds a second proxy host over the same cache directory and fake clock, with a profile whose
+  // catch-all rule gives every path the requested freshness window — so the freshness/revalidation
+  // behavior can be exercised on /real/revalidate.txt without touching the other tests.
+  private TestServer CreateRefreshAfterServer(TimeSpan refreshAfter)
+  {
+    var config = new CachingProxyConfig
+    {
+      LocalCachePath = myTempDirectory,
+      CachingProfiles = new Dictionary<string, CachingProfile>
+      {
+        ["fresh"] = new() { Rules = [new CachingRule { Pattern = ".", RefreshAfter = refreshAfter }] }
+      },
+      Prefixes = [new CachingProxyPrefix($"/real={myUpstreamServer.Url}", Profile: "fresh")],
+      MinimumFreeDiskSpaceMb = 2,
+    };
+
+    var host = new HostBuilder()
+      .ConfigureWebHost(webHostBuilder => webHostBuilder
+        .UseTestServer()
+        .ConfigureAppConfiguration(cfg =>
+          cfg.AddJsonStream(new MemoryStream(JsonSerializer.SerializeToUtf8Bytes(config))))
+        .ConfigureOurServices()
+        .ConfigureServices(services => services
+          .AddSingleton(config)
+          .Replace(ServiceDescriptor.Singleton<TimeProvider>(myTimeProvider)))
+        .Configure((context, builder) => builder.ConfigureOurApp(context.Configuration)))
+      .Build();
+
+    myExtraHosts.Add(host);
+    host.Start();
+    return host.GetTestServer();
+  }
+
+  private IEnumerable<string> CacheFiles() =>
+    // Exclude the Data Protection key ring persisted under the cache dir — only count cache artifacts.
+    Directory.EnumerateFiles(myTempDirectory, "*", SearchOption.AllDirectories)
+      .Where(f => !f.Contains(".dataprotection-keys"));
+
+  [Fact]
+  public async Task Cache_Control_Max_Age_Reflects_RefreshAfter()
+  {
+    // With a freshness window configured, the served Cache-Control max-age advertises that window
+    // (not the eternal 365-day default) so downstream caches revalidate in step with the proxy.
+    var server = CreateRefreshAfterServer(TimeSpan.FromMinutes(5));
+    myUpstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.Ok;
+    myUpstreamServer.RevalidateContent = "v1";
+
+    using (var miss = await server.CreateRequest("/real/revalidate.txt").GetAsync())
+    {
+      Assert.Equal(HttpStatusCode.OK, miss.StatusCode);
+      AssertStatusHeader(miss, CachingProxyStatus.MISS);
+      Assert.Equal("public, max-age=300", miss.Headers.CacheControl?.ToString());
+    }
+
+    // A plain HIT served from disk advertises the same window.
+    using var hit = await server.CreateRequest("/real/revalidate.txt").GetAsync();
+    AssertStatusHeader(hit, CachingProxyStatus.HIT);
+    Assert.Equal("public, max-age=300", hit.Headers.CacheControl?.ToString());
+  }
+
+  [Fact]
+  public async Task Stale_Upstream_NotModified_Is_Kept_And_Window_Resets()
+  {
+    var server = CreateRefreshAfterServer(TimeSpan.FromMinutes(1));
+    myUpstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.Ok;
+    myUpstreamServer.RevalidateContent = "v1";
+
+    using (var miss = await server.CreateRequest("/real/revalidate.txt").GetAsync())
+    {
+      Assert.Equal(HttpStatusCode.OK, miss.StatusCode);
+      AssertStatusHeader(miss, CachingProxyStatus.MISS);
+      Assert.Equal("v1", await miss.Content.ReadAsStringAsync());
+    }
+
+    // Past the window, upstream reports 304: keep & serve the stored copy and reset the window.
+    myTimeProvider.Advance(TimeSpan.FromMinutes(2));
+    myUpstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.NotModified;
+    using (var reval = await server.CreateRequest("/real/revalidate.txt").GetAsync())
+    {
+      Assert.Equal(HttpStatusCode.OK, reval.StatusCode);
+      AssertStatusHeader(reval, CachingProxyStatus.REVALIDATED);
+      Assert.Equal("v1", await reval.Content.ReadAsStringAsync());
+    }
+
+    // Window was reset by the touch, so an immediate request is a plain HIT with no upstream call.
+    var upstreamHitsBefore = myUpstreamServer.RevalidateRequestCount;
+    using (var hit = await server.CreateRequest("/real/revalidate.txt").GetAsync())
+    {
+      Assert.Equal(HttpStatusCode.OK, hit.StatusCode);
+      AssertStatusHeader(hit, CachingProxyStatus.HIT);
+      Assert.Equal("v1", await hit.Content.ReadAsStringAsync());
+    }
+    Assert.Equal(upstreamHitsBefore, myUpstreamServer.RevalidateRequestCount);
+  }
+
+  [Fact]
+  public async Task Stale_Upstream_Changed_Is_Replaced()
+  {
+    var server = CreateRefreshAfterServer(TimeSpan.FromMinutes(1));
+    myUpstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.Ok;
+    myUpstreamServer.RevalidateContent = "v1";
+
+    using (var miss = await server.CreateRequest("/real/revalidate.txt").GetAsync())
+      AssertStatusHeader(miss, CachingProxyStatus.MISS);
+
+    // Past the window, upstream returns new content (200): replace the stored copy and serve it.
+    myTimeProvider.Advance(TimeSpan.FromMinutes(2));
+    myUpstreamServer.RevalidateContent = "v2-bigger";
+    using (var reval = await server.CreateRequest("/real/revalidate.txt").GetAsync())
+    {
+      Assert.Equal(HttpStatusCode.OK, reval.StatusCode);
+      AssertStatusHeader(reval, CachingProxyStatus.REVALIDATED);
+      Assert.Equal("v2-bigger", await reval.Content.ReadAsStringAsync());
+    }
+
+    // The replaced copy is fresh: an immediate request is a HIT serving the new content.
+    using var hit = await server.CreateRequest("/real/revalidate.txt").GetAsync();
+    AssertStatusHeader(hit, CachingProxyStatus.HIT);
+    Assert.Equal("v2-bigger", await hit.Content.ReadAsStringAsync());
+  }
+
+  [Fact]
+  public async Task Stale_Upstream_Error_Serves_Stale_Copy()
+  {
+    var server = CreateRefreshAfterServer(TimeSpan.FromMinutes(1));
+    myUpstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.Ok;
+    myUpstreamServer.RevalidateContent = "v1";
+
+    using (var miss = await server.CreateRequest("/real/revalidate.txt").GetAsync())
+      AssertStatusHeader(miss, CachingProxyStatus.MISS);
+
+    // Past the window, upstream fails: keep and still serve the stale copy.
+    myTimeProvider.Advance(TimeSpan.FromMinutes(2));
+    myUpstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.ServerError;
+    using (var stale = await server.CreateRequest("/real/revalidate.txt").GetAsync())
+    {
+      Assert.Equal(HttpStatusCode.OK, stale.StatusCode);
+      AssertStatusHeader(stale, CachingProxyStatus.STALE);
+      Assert.Equal("v1", await stale.Content.ReadAsStringAsync());
+    }
+
+    Assert.NotEmpty(CacheFiles()); // the stale copy was kept on disk
+  }
+
+  [Fact]
+  public async Task Stale_Upstream_NotFound_Deletes_Cache()
+  {
+    var server = CreateRefreshAfterServer(TimeSpan.FromMinutes(1));
+    myUpstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.Ok;
+    myUpstreamServer.RevalidateContent = "v1";
+
+    using (var miss = await server.CreateRequest("/real/revalidate.txt").GetAsync())
+      AssertStatusHeader(miss, CachingProxyStatus.MISS);
+    Assert.NotEmpty(CacheFiles());
+
+    // Past the window, upstream is gone (404): delete the stale copy and return 404.
+    myTimeProvider.Advance(TimeSpan.FromMinutes(2));
+    myUpstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.NotFound;
+    using (var gone = await server.CreateRequest("/real/revalidate.txt").GetAsync())
+    {
+      Assert.Equal(HttpStatusCode.NotFound, gone.StatusCode);
+      AssertStatusHeader(gone, CachingProxyStatus.NEGATIVE_MISS);
+    }
+
+    Assert.Empty(CacheFiles()); // the stale copy was removed
+  }
+
   private async Task AssertGetResponse(string url, HttpStatusCode expectedCode, Action<HttpResponseMessage, byte[]> assertions)
   {
     myOutput.WriteLine("*** GET " + url);
@@ -935,6 +1168,8 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
 
   async Task IAsyncLifetime.DisposeAsync()
   {
+    foreach (var host in myExtraHosts)
+      await host.StopAsync();
     await myHost.StopAsync();
     Directory.Delete(myTempDirectory, true);
   }

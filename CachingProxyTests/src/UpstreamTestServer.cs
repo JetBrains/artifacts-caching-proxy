@@ -5,6 +5,7 @@ using System.IO.Compression;
 using System.Linq;
 using System.Net;
 using System.Net.Mime;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
@@ -35,6 +36,20 @@ public class UpstreamTestServer : IAsyncLifetime
 
   private readonly WebApplication myWebApp;
   public volatile bool Conditional500SendErrorOnce;
+
+  // Drives the "revalidate.txt" route the freshness/revalidation tests use to script how the upstream
+  // answers a conditional revalidation: serve content (200), say unchanged (304), be gone (404) or
+  // fail (500). RevalidateContent is the 200 body; RevalidateRequestCount counts route hits.
+  public enum RevalidateBehavior { Ok, NotModified, NotFound, ServerError }
+  public volatile RevalidateBehavior Revalidate = RevalidateBehavior.Ok;
+  public volatile string RevalidateContent = "v1";
+  public int RevalidateRequestCount;
+
+  // Counts hits on the maven metadata / snapshot routes used by the caching-profile tests. The
+  // maven-metadata route is conditional-aware (a request carrying If-Modified-Since / If-None-Match
+  // gets a 304), so a revalidation after the freshness window is served as REVALIDATED (kept).
+  public int MavenMetadataRequestCount;
+  public int SnapshotRequestCount;
 
   public UpstreamTestServer()
   {
@@ -84,6 +99,46 @@ public class UpstreamTestServer : IAsyncLifetime
       {
         res.ContentLength = 1024;
         return res.WriteAsync("not too much");
+      })
+      .MapGet("revalidate.txt", (req, res, data) =>
+      {
+        Interlocked.Increment(ref RevalidateRequestCount);
+        switch (Revalidate)
+        {
+          case RevalidateBehavior.NotModified:
+            res.StatusCode = StatusCodes.Status304NotModified;
+            return Task.CompletedTask;
+          case RevalidateBehavior.NotFound:
+            res.StatusCode = StatusCodes.Status404NotFound;
+            return res.WriteAsync("gone");
+          case RevalidateBehavior.ServerError:
+            res.StatusCode = StatusCodes.Status500InternalServerError;
+            return res.WriteAsync("boom");
+          default:
+            return res.WriteAsync(RevalidateContent);
+        }
+      })
+      .MapGet("group/artifact/maven-metadata.xml", (req, res, data) =>
+      {
+        Interlocked.Increment(ref MavenMetadataRequestCount);
+        // Conditional revalidation after the freshness window: report "unchanged".
+        if (req.Headers.ContainsKey("If-Modified-Since") || req.Headers.ContainsKey("If-None-Match"))
+        {
+          res.StatusCode = StatusCodes.Status304NotModified;
+          return Task.CompletedTask;
+        }
+        res.ContentType = MediaTypeNames.Text.Xml;
+        return res.WriteAsync("<metadata><versioning/></metadata>");
+      })
+      .MapGet("group/artifact/1.0-SNAPSHOT/artifact-1.0-SNAPSHOT.jar", (req, res, data) =>
+      {
+        Interlocked.Increment(ref SnapshotRequestCount);
+        return res.WriteAsync("snapshot-jar-content");
+      })
+      .MapGet("archetype-catalog.xml", (req, res, data) =>
+      {
+        res.ContentType = MediaTypeNames.Text.Xml;
+        return res.WriteAsync("<archetype-catalog/>");
       })
       .MapGet("a.jar", (req, res, data) => res.WriteAsync("a.jar"))
       .MapGet("chunked.bin", async (req, res, data) =>

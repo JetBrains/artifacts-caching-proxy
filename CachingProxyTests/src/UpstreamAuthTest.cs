@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.IdentityModel.Tokens.Jwt;
 using System.IO;
 using System.Linq;
@@ -117,10 +118,10 @@ public class UpstreamAuthTest : IAsyncLifetime
   [Fact]
   public async Task Authenticated_Redirect_Url_Is_Redirected_Not_Cached()
   {
-    // maven-metadata.xml matches RedirectToRemoteUrlsRegex. It is mutable, so even for an authed prefix
-    // it must be redirected to the origin with 307 rather than proxied/cached: a 307 preserves the method
-    // and the client reuses its own credentials for the origin. The proxy must therefore NOT fetch it
-    // upstream (caching it would pin a stale copy for a protected source).
+    // maven-metadata.xml matches the /private profile's Redirect rule. It is mutable, so even for an
+    // authed prefix it must be redirected to the origin with 307 rather than proxied/cached: a 307
+    // preserves the method and the client reuses its own credentials for the origin. The proxy must
+    // therefore NOT fetch it upstream (caching it would pin a stale copy for a protected source).
     var response = await myProxyHost!.GetTestServer().CreateRequest("/private/maven-metadata.xml")
       .AddHeader("Authorization", "Bearer " + MintToken())
       .GetAsync();
@@ -157,9 +158,16 @@ public class UpstreamAuthTest : IAsyncLifetime
     {
       LocalCachePath = myTempDirectory,
       MinimumFreeDiskSpaceMb = 2,
+      CachingProfiles = new Dictionary<string, CachingProfile>
+      {
+        // Mutable metadata on an authenticated prefix is redirected (not proxied/cached) via a Redirect
+        // rule: a 307 preserves the method and the client reuses its own credentials for the origin, so
+        // the proxy never pins a copy of protected mutable content.
+        ["maven"] = new() { Rules = [new CachingRule { Pattern = @"maven-metadata\.xml(\..+)?$", Redirect = true }] },
+      },
       Prefixes =
       [
-        $"/private={upstreamUrl}secure",
+        new CachingProxyPrefix($"/private={upstreamUrl}secure", Profile: "maven"),
         $"/public={upstreamUrl}open",
       ],
       UpstreamAuth =

@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Diagnostics.CodeAnalysis;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -21,6 +22,10 @@ namespace JetBrains.CachingProxy;
 [SuppressMessage("ReSharper", "ClassNeverInstantiated.Global")]
 public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amazonS3, CachingProxyConfig config, RemoteProxy remoteProxy, ResponseCache responseCache, TimeProvider timeProvider, ILogger<S3CachingMiddleware>  logger)
 {
+  // User-metadata key holding our own store time (the freshness clock). We use this rather than S3's
+  // LastModified, which is not under our control. Stored as a round-trippable DateTimeOffset ("O").
+  private const string CreatedAtMetadataKey = "created-at";
+
   // The bucket endpoint URL (assumed to end with '/', as AWS virtual-hosted-style endpoints do, so it
   // joins to an "aa/bb/<hash>" key with a single separator). Used both to build the redirect Location
   // and to recognise our own bucket redirects when signing them on the fly.
@@ -69,6 +74,13 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
     var upstreamUri = await remoteProxy.ValidateRequestAsync(context, remoteServer, remainingPath);
     if (upstreamUri == null)
       return;
+
+    // The caching-profile rule for this path decides its freshness window (revalidate when older) or
+    // marks it always-redirect. A null rule (no profile / no match) means cache forever. The window is
+    // also advertised to the client as Cache-Control max-age (see ResponseCache.GetCachingHeader).
+    var rule = remoteServer.Profile?.Match(context.Request.Path.Value ?? "");
+    if (rule?.RefreshAfter is { } window)
+      context.Items[CachingProxyConstants.RefreshAfterItemKey] = window;
 
     var s3Key = upstreamUri.ManglePath();
 
@@ -124,6 +136,53 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
             ByteRange = myPrefetchSize
           }, context.RequestAborted);
 
+          // Past its freshness window? Revalidate against the upstream (conditional GET using the
+          // object's own ETag and our stored "created-at") before serving. The stored date is our own
+          // object metadata, not S3's LastModified (which we don't control). probeStatus records the
+          // verdict so the serve-from-probe paths below report REVALIDATED (kept after a 304) or STALE
+          // (upstream unreachable) instead of MISS. A 200 re-stores and serves fresh; a 404 deletes it.
+          var probeStatus = CachingProxyStatus.MISS;
+          if (rule?.RefreshAfter is { } refreshAfter &&
+              DateTimeOffset.TryParse(s3Object.Metadata[CreatedAtMetadataKey], CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var createdAt) &&
+              timeProvider.GetUtcNow() - createdAt > refreshAfter)
+          {
+            var result = await remoteProxy.RevalidateAsync(context, upstreamUri, s3Object.ETag, createdAt, remoteServer.Auth, context.RequestAborted);
+            switch (result.Outcome)
+            {
+              case RevalidationOutcome.Replaced:
+                using (var fresh = result.Response!)
+                {
+                  context.Response.Clear();
+                  await StoreInBucketAsync(s3Key, upstreamUri, fresh, context.RequestAborted);
+                  if (isHead)
+                    await remoteProxy.SetStatusAsync(context, CachingProxyStatus.REVALIDATED,
+                      await responseCache.PutStatusCode(verbKey, new CachedResponse(fresh) { StatusCode = HttpStatusCode.OK },
+                        remoteServer.CacheDuration, context.RequestAborted));
+                  else
+                    await RedirectToBucket(CachingProxyStatus.REVALIDATED);
+                }
+                return;
+
+              case RevalidationOutcome.Gone:
+                await amazonS3.DeleteObjectAsync(new DeleteObjectRequest { BucketName = config.S3!.BucketName, Key = s3Key }, context.RequestAborted);
+                await remoteProxy.SetStatusAsync(context, CachingProxyStatus.NEGATIVE_MISS,
+                  await responseCache.PutStatusCode(s3Key, HttpStatusCode.NotFound, remoteServer.CacheDuration, context.RequestAborted));
+                return;
+
+              case RevalidationOutcome.NotModified:
+                // Still valid: bump the stored date (a metadata-only self-copy) so the window restarts,
+                // then serve the object we already probed.
+                await TouchStoredDateAsync(s3Key, s3Object, context.RequestAborted);
+                probeStatus = CachingProxyStatus.REVALIDATED;
+                break;
+
+              case RevalidationOutcome.UpstreamError:
+                // Could not reach/validate the upstream: serve the stale object as-is.
+                probeStatus = CachingProxyStatus.STALE;
+                break;
+            }
+          }
+
           // Did the probe return the whole object, or only the first slice? Decide purely from
           // Content-Range ("bytes <from>-<to>/<total>"), whose semantics are unambiguous: the bytes
           // returned are (to - from + 1) and the object's full size is the total.
@@ -138,7 +197,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
 
             var cachingResponse = new CachedResponse(s3Object) { StatusCode = HttpStatusCode.OK, Body = body };
 
-            await remoteProxy.SetStatusAsync(context, CachingProxyStatus.MISS,
+            await remoteProxy.SetStatusAsync(context, probeStatus,
               await responseCache.PutStatusCode(s3Key, cachingResponse, remoteServer.CacheDuration, context.RequestAborted));
             return;
           }
@@ -156,18 +215,18 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
                 ContentLength = contentRange.Length
               }
             };
-            await remoteProxy.SetStatusAsync(context, CachingProxyStatus.MISS,
+            await remoteProxy.SetStatusAsync(context, probeStatus,
               await responseCache.PutStatusCode(verbKey, head, remoteServer.CacheDuration, context.RequestAborted));
             return;
           }
 
-          await RedirectToBucket();
+          await RedirectToBucket(probeStatus);
           return;
         }
         catch (AmazonServiceException ex) when (ex.StatusCode is HttpStatusCode.NotFound) { }
       }
 
-      using var response = await remoteProxy.ProcessAsync(context, s3Key, remoteServer.CacheDuration, upstreamUri, auth: remoteServer.Auth);
+      using var response = await remoteProxy.ProcessAsync(context, s3Key, remoteServer.CacheDuration, upstreamUri, auth: remoteServer.Auth, rule: rule);
 
       // A non-null response is a GET MISS body for us to stream and persist; otherwise it is handled.
       if (response == null) return;
@@ -176,7 +235,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
 
       await StoreInBucketAsync(s3Key, upstreamUri, response, context.RequestAborted);
 
-      await RedirectToBucket();
+      await RedirectToBucket(CachingProxyStatus.MISS);
     }
     catch (OperationCanceledException)
     {
@@ -235,7 +294,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
 
     return;
 
-    async ValueTask RedirectToBucket()
+    async ValueTask RedirectToBucket(CachingProxyStatus status)
     {
       var cachingResponse = new CachedResponse(HttpStatusCode.RedirectKeepVerb, new HeaderDictionary())
       {
@@ -243,9 +302,35 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
       };
       // Only a GET redirects (a HEAD is served from memory), so the redirect always belongs under the
       // verb-specific key and is never replayed to a HEAD.
-      await remoteProxy.SetStatusAsync(context, CachingProxyStatus.MISS,
+      await remoteProxy.SetStatusAsync(context, status,
         await responseCache.PutStatusCode(verbKey, cachingResponse, remoteServer.CacheDuration, context.RequestAborted));
     }
+  }
+
+  /// <summary>
+  /// Resets a stored object's "created-at" metadata (the freshness clock) without re-downloading it,
+  /// via a metadata-only self-copy. CopyObject onto the same key is only legal with
+  /// <see cref="S3MetadataDirective.REPLACE"/>, so the existing content type, content encoding and
+  /// user metadata (read off the probe response) are re-applied to preserve them; only "created-at"
+  /// is bumped to now.
+  /// </summary>
+  private async Task TouchStoredDateAsync(string s3Key, GetObjectResponse probe, CancellationToken cancellationToken)
+  {
+    var copy = new CopyObjectRequest
+    {
+      SourceBucket = config.S3!.BucketName,
+      SourceKey = s3Key,
+      DestinationBucket = config.S3!.BucketName,
+      DestinationKey = s3Key,
+      MetadataDirective = S3MetadataDirective.REPLACE,
+      ContentType = probe.Headers.ContentType,
+    };
+    copy.Headers.ContentEncoding = probe.Headers.ContentEncoding;
+    foreach (var key in probe.Metadata.Keys)
+      copy.Metadata[key] = probe.Metadata[key];
+    copy.Metadata[CreatedAtMetadataKey] = timeProvider.GetUtcNow().ToString("O", CultureInfo.InvariantCulture);
+
+    await amazonS3.CopyObjectAsync(copy, cancellationToken);
   }
 
   /// <summary>
@@ -287,7 +372,8 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
         },
         Metadata =
         {
-          ["uri"] = requestUri.ToString()
+          ["uri"] = requestUri.ToString(),
+          [CreatedAtMetadataKey] = timeProvider.GetUtcNow().ToString("O", CultureInfo.InvariantCulture),
         },
         InputStream = uploadStream,
       }, cancellationToken);

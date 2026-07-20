@@ -83,7 +83,12 @@ public class CachingProxyConfig
   public string? BlacklistUrlRegex { get; init; }
   public long MinimumFreeDiskSpaceMb { get; init; } = 2048;
   public long RequestTimeoutSec { get; init; } = 20;
-  public string RedirectToRemoteUrlsRegex { get; init; } = $@"^(.*-/npm/v1/security/.*|.*-SNAPSHOT.*|.*maven-metadata\.xml(\..+)?)$";
+
+  // Named caching profiles, referenced per prefix by CachingProxyPrefix.Profile. A profile decides,
+  // per request path, whether an endpoint is cached (and for how long before revalidation) or
+  // redirected to the upstream — replacing the former single global RedirectToRemoteUrlsRegex. A
+  // prefix with no profile caches every path forever (the immutable default). Empty by default.
+  public Dictionary<string, CachingProfile> CachingProfiles { get; init; } = new();
 
   public string? UserAgentComment { get; init; }
 

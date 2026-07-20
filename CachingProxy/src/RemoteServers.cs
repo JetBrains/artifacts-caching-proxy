@@ -32,9 +32,11 @@ public class RemoteServers : EndpointDataSource
       var remoteUri = Uri.TryCreate(target, UriKind.Absolute, out var targetUri) ? targetUri :
         new Uri(Uri.UriSchemeHttps + Uri.SchemeDelimiter + target, UriKind.Absolute);
       var remoteServer = new RemoteServer(trimmedPrefix, remoteUri,
-        config.CacheDuration.Union(prefix.CacheDuration), MatchAuth(remoteUri, config.UpstreamAuth.Values));
+        config.CacheDuration.Union(prefix.CacheDuration), MatchAuth(remoteUri, config.UpstreamAuth.Values),
+        ResolveProfile(prefix.Profile, config.CachingProfiles));
 
-      logger.LogInformation("RemoteServer: {Prefix} -> {RemoteUri}, Auth: {Auth}", remoteServer.Prefix, remoteServer.RemoteUri, remoteServer.Auth);
+      logger.LogInformation("RemoteServer: {Prefix} -> {RemoteUri}, Auth: {Auth}, Profile: {Profile}",
+        remoteServer.Prefix, remoteServer.RemoteUri, remoteServer.Auth, prefix.Profile);
       // A prefix with a matched UpstreamAuth serves proxy-fetched private artifacts, so its inbound route
       // must require a validated client JWT too: attach an AuthorizeAttribute (enforced by
       // UseAuthentication/UseAuthorization). A prefix with no matched auth has no upstream credentials and
@@ -61,6 +63,17 @@ public class RemoteServers : EndpointDataSource
 
   private const string PathParameterName = "path";
 
+  // Resolve a prefix's profile name to its (compiled) CachingProfile. A missing name means no profile
+  // (everything cached forever); a name that does not exist in the config is a misconfiguration and
+  // fails fast at startup.
+  private static CachingProfile? ResolveProfile(string? name, Dictionary<string, CachingProfile> profiles)
+  {
+    if (string.IsNullOrEmpty(name)) return null;
+    if (!profiles.TryGetValue(name, out var profile))
+      throw new ArgumentException($"Unknown caching profile '{name}'. Defined profiles: {string.Join(", ", profiles.Keys)}");
+    return profile.Compile();
+  }
+
   // Among the auth entries whose UrlPrefixes contain a prefix of the upstream URL, the longest (most
   // specific) one wins, so a host-wide block and a path-scoped block can coexist. Returns null when
   // nothing matches, leaving the upstream unauthenticated.
@@ -81,7 +94,7 @@ public class RemoteServers : EndpointDataSource
     return context.GetEndpoint()?.Metadata.GetMetadata<RemoteServer>();
   }
 
-  public record RemoteServer(PathString Prefix, Uri RemoteUri, CacheDuration CacheDuration, UpstreamAuth? Auth = null)
+  public record RemoteServer(PathString Prefix, Uri RemoteUri, CacheDuration CacheDuration, UpstreamAuth? Auth = null, CachingProfile? Profile = null)
   {
     public Uri GetUpstreamUri(string? remainingPath) =>
       string.IsNullOrEmpty(remainingPath) ? RemoteUri : new Uri(RemoteUri, remainingPath);
