@@ -55,9 +55,13 @@ public sealed class RedirectSignatureAuthenticationHandler(
     if (!long.TryParse(expiry, out var expiryUnixSeconds))
       return Fail("cr_exp is not an integer");
 
-    var now = timeProvider.GetUtcNow();
-    if (DateTimeOffset.FromUnixTimeSeconds(expiryUnixSeconds) + Options.Config.ClockSkew < now)
+    // Compare Unix seconds directly. DateTimeOffset.FromUnixTimeSeconds would throw for attacker-supplied
+    // values outside its range, turning a bad credential into a 500 response.
+    var nowUnixSeconds = timeProvider.GetUtcNow().ToUnixTimeSeconds();
+    if (expiryUnixSeconds < nowUnixSeconds - Options.Config.ClockSkew.TotalSeconds)
       return Fail("signature expired");
+    if (expiryUnixSeconds > nowUnixSeconds + Options.Config.MaxLifetime.TotalSeconds + Options.Config.ClockSkew.TotalSeconds)
+      return Fail("signature expiry exceeds the maximum lifetime");
 
     byte[] providedSignature;
     try

@@ -33,7 +33,7 @@ public class RedirectSignatureAuthTest : IAsyncLifetime
 {
   private const string Issuer = "https://issuer.example.com";
   private const string Audience = "artifacts-caching-proxy";
-  private const string SigningKey = "super-secret-shared-hmac-key";
+  private const string SigningKey = "super-secret-shared-hmac-key-32bytes";
 
   private readonly RSA myRsa = RSA.Create(2048);
   private const string Kid = "test-key-1";
@@ -149,12 +149,32 @@ public class RedirectSignatureAuthTest : IAsyncLifetime
   }
 
   [Fact]
+  public async Task Excessively_Long_Lived_Signature_Is_Unauthorized()
+  {
+    using var client = myProxyHost!.GetTestServer().CreateClient();
+
+    var response = await client.GetAsync(Sign("/private/one.jar", expiry: DateTimeOffset.UtcNow.AddDays(1)));
+
+    Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+  }
+
+  [Fact]
   public async Task Garbage_Signature_Is_Unauthorized()
   {
     using var client = myProxyHost!.GetTestServer().CreateClient();
     var exp = DateTimeOffset.UtcNow.AddMinutes(5).ToUnixTimeSeconds();
 
     var response = await client.GetAsync($"/private/one.jar?cr_exp={exp}&cr_sig=not-a-real-signature");
+
+    Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+  }
+
+  [Fact]
+  public async Task Out_Of_Range_Expiry_Is_Unauthorized_Not_Server_Error()
+  {
+    using var client = myProxyHost!.GetTestServer().CreateClient();
+
+    var response = await client.GetAsync($"/private/one.jar?cr_exp={long.MaxValue}&cr_sig=AA");
 
     Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
   }
