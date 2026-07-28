@@ -87,6 +87,13 @@ public static class Program
           "Microsoft.AspNetCore.Authentication",
           "Microsoft.AspNetCore.Identity",
           "Microsoft.AspNetCore.MemoryPool")
+        // Outbound instrumentation: http.client.* (request duration incl. error.type,
+        // open_connections, connection duration) and dns.lookup.duration. Upstream connect
+        // failures are otherwise invisible -- they are folded into NEGATIVE_MISS alongside
+        // genuine 404s, so they cannot be told apart in caching_requests_total.
+        .AddMeter(
+          "System.Net.Http",
+          "System.Net.NameResolution")
         .AddMeter(CachingProxyMetrics.MeterName)
         .AddPrometheusExporter()
         .AddOtlpExporter()
@@ -247,13 +254,30 @@ public static class Program
           }
         }
       })
-      .UseSocketsHttpHandler(static (handler, _) =>
+      .UseSocketsHttpHandler(static (handler, provider) =>
       {
+        var config = provider.GetRequiredService<CachingProxyConfig>();
+
         // force reconnection (and DNS re-resolve) every ten minutes
         handler.PooledConnectionLifetime = TimeSpan.FromMinutes(10);
         handler.AllowAutoRedirect = true;
         handler.AutomaticDecompression = DecompressionMethods.None;
         handler.UseCookies = false;
+
+        handler.ConnectTimeout = TimeSpan.FromSeconds(config.ConnectTimeoutSec);
+        handler.MaxConnectionsPerServer = config.MaxConnectionsPerServer;
+
+        // NOTE on "Cannot assign requested address" (EADDRNOTAVAIL) when connecting upstream:
+        // .NET's resolver does not pass AI_ADDRCONFIG, so AAAA records are returned even where no
+        // routable IPv6 source address exists (archive.apache.org and downloads.apache.org publish
+        // both A and AAAA). On an IPv4-only host the dual-mode socket then attempts the IPv6
+        // address and fails instantly, and because the multi-address connect loop reports the
+        // *last* error, that bogus attempt can also mask why an IPv4 attempt failed.
+        //
+        // This is deliberately NOT handled here: the proxy stays dual-stack capable, and it is the
+        // individual deployment's job to declare that its network is IPv4-only by setting
+        // DOTNET_SYSTEM_NET_DISABLEIPV6=1 (which makes Socket.OSSupportsIPv6 false, so the handler
+        // creates an AF_INET socket and skips AAAA results).
       })
       .AddTransientHttpErrorPolicy(static policyBuilder => policyBuilder.WaitAndRetryAsync(
         4, retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt - 1))));

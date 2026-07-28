@@ -84,6 +84,25 @@ public class CachingProxyConfig
   public long MinimumFreeDiskSpaceMb { get; init; } = 2048;
   public long RequestTimeoutSec { get; init; } = 20;
 
+  // Upper bound on the TCP connect phase alone, separate from the whole-request RequestTimeoutSec.
+  // Without it a connect that never completes (an upstream silently dropping SYNs while
+  // rate-limiting, say) consumes the entire request budget and is reported as a timeout rather than
+  // a connect failure.
+  public long ConnectTimeoutSec { get; init; } = 10;
+
+  // Cap on simultaneous upstream connections per origin (.NET's default is unlimited). Intended as
+  // a runaway backstop rather than a throttle: a single slow origin would otherwise open unbounded
+  // connections, and because an origin often resolves to one address they all compete for a source
+  // port against the same (dst, dport) tuple until the ephemeral range is exhausted and connect()
+  // fails with EADDRNOTAVAIL. Keep it well above peak concurrent in-flight requests per instance —
+  // too low a value makes requests queue, hit RequestTimeoutSec, and get negative-cached as 404s.
+  //
+  // The default is sized from production: peak concurrent in-flight requests per instance across
+  // *all* origins is ~212 (30d max of http.server.active_requests), so 1024 leaves ~5x headroom and
+  // should never queue, while still being only ~4% of the ~28k ephemeral ports available for a
+  // single (dst, dport) tuple.
+  public int MaxConnectionsPerServer { get; init; } = 1024;
+
   // Named caching profiles, referenced per prefix by CachingProxyPrefix.Profile. A profile decides,
   // per request path, whether an endpoint is cached (and for how long before revalidation) or
   // redirected to the upstream — replacing the former single global RedirectToRemoteUrlsRegex. A
