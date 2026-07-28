@@ -60,6 +60,11 @@ public class CachingProxyConfig
     // duplicated across the two AWS accounts (see the redirector repo's README).
     public required string Key { get; init; }
 
+    // Reject correctly signed URLs that claim an unexpectedly distant expiry. This limits replay if a
+    // redirect URL leaks and prevents a buggy redirector from accidentally minting effectively permanent
+    // credentials. ClockSkew is applied in addition to this lifetime at validation time.
+    public TimeSpan MaxLifetime { get; init; } = TimeSpan.FromMinutes(10);
+
     // Tolerance for clock drift between the redirector (which stamps cr_exp) and this proxy when
     // checking expiry. The signature lifetime itself is chosen by the redirector.
     public TimeSpan ClockSkew { get; init; } = TimeSpan.FromSeconds(30);

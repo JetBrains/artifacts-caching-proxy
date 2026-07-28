@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Linq;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Encodings.Web;
@@ -54,7 +55,12 @@ public static class AuthExtensions
       // token is minted on demand by GitHubAppInstallationTokenProvider, so there is no Duende client to
       // register here. TokenEndpoint/ClientSecret are not used.
       if (auth.IsGitHubApp)
+      {
+        if (!Uri.TryCreate(auth.GitHubApiBaseUrl, UriKind.Absolute, out var githubApi) || !githubApi.IsSecureOrLoopback())
+          throw new ArgumentException(
+            $"UpstreamAuth '{name}' uses an insecure GitHubApiBaseUrl. HTTPS is required except on loopback.");
         continue;
+      }
 
       tokenManagement ??= services.AddClientCredentialsTokenManagement();
 
@@ -64,6 +70,9 @@ public static class AuthExtensions
         throw new ArgumentException(
           $"UpstreamAuth '{name}' sets ClientId but is missing TokenEndpoint and/or ClientSecret; " +
           "both are required for client-credentials auth.");
+      if (!auth.TokenEndpoint.IsSecureOrLoopback())
+        throw new ArgumentException(
+          $"UpstreamAuth '{name}' uses an insecure TokenEndpoint. HTTPS is required except on loopback.");
 
       tokenManagement.AddClient(auth.ClientId!, client =>
       {
@@ -130,6 +139,22 @@ public static class AuthExtensions
         .AddAuthentication(DenyAuthenticationHandler.SchemeName)
         .AddScheme<AuthenticationSchemeOptions, DenyAuthenticationHandler>(DenyAuthenticationHandler.SchemeName, null);
       return services;
+    }
+
+    if (string.IsNullOrWhiteSpace(inboundAuth.Issuer))
+      throw new ArgumentException("InboundAuth.Issuer must not be empty.");
+    if (inboundAuth.Audiences.Length == 0 || inboundAuth.Audiences.Any(string.IsNullOrWhiteSpace))
+      throw new ArgumentException("InboundAuth.Audiences must contain at least one non-empty audience.");
+    if (!inboundAuth.JwksUrl.IsSecureOrLoopback())
+      throw new ArgumentException("InboundAuth.JwksUrl must use HTTPS except on loopback.");
+    if (inboundAuth.RedirectSignature is { } signatureConfig)
+    {
+      if (Encoding.UTF8.GetByteCount(signatureConfig.Key) < 32)
+        throw new ArgumentException("InboundAuth.RedirectSignature.Key must contain at least 32 UTF-8 bytes.");
+      if (signatureConfig.MaxLifetime <= TimeSpan.Zero)
+        throw new ArgumentException("InboundAuth.RedirectSignature.MaxLifetime must be positive.");
+      if (signatureConfig.ClockSkew < TimeSpan.Zero)
+        throw new ArgumentException("InboundAuth.RedirectSignature.ClockSkew must not be negative.");
     }
 
     var jwks = new ConfigurationManager<OpenIdConnectConfiguration>(
@@ -238,6 +263,13 @@ public static class AuthExtensions
       return null;
     }
   }
+}
+
+internal static class AuthenticationUriExtensions
+{
+  public static bool IsSecureOrLoopback(this Uri uri) =>
+    uri.Scheme == Uri.UriSchemeHttps ||
+    (uri.Scheme == Uri.UriSchemeHttp && uri.IsLoopback);
 }
 
 // Default authentication scheme used when no inbound JWT validation is configured. Never establishes an

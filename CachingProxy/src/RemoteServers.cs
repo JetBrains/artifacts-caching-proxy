@@ -31,8 +31,12 @@ public class RemoteServers : EndpointDataSource
       target = target.TrimEnd('/') + '/';
       var remoteUri = Uri.TryCreate(target, UriKind.Absolute, out var targetUri) ? targetUri :
         new Uri(Uri.UriSchemeHttps + Uri.SchemeDelimiter + target, UriKind.Absolute);
+      var matchedAuth = MatchAuth(remoteUri, config.UpstreamAuth.Values);
+      if (matchedAuth != null && !remoteUri.IsSecureOrLoopback())
+        throw new ArgumentException(
+          $"Authenticated upstream '{remoteUri}' must use HTTPS except on loopback.");
       var remoteServer = new RemoteServer(trimmedPrefix, remoteUri,
-        config.CacheDuration.Union(prefix.CacheDuration), MatchAuth(remoteUri, config.UpstreamAuth.Values),
+        config.CacheDuration.Union(prefix.CacheDuration), matchedAuth,
         ResolveProfile(prefix.Profile, config.CachingProfiles));
 
       logger.LogInformation("RemoteServer: {Prefix} -> {RemoteUri}, Auth: {Auth}, Profile: {Profile}",
