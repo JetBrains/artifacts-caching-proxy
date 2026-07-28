@@ -143,13 +143,13 @@ public static class AuthExtensions
 
     if (string.IsNullOrWhiteSpace(inboundAuth.Issuer))
       throw new ArgumentException("InboundAuth.Issuer must not be empty.");
-    if (inboundAuth.Audiences.Length == 0 || inboundAuth.Audiences.Any(string.IsNullOrWhiteSpace))
+    if (inboundAuth.Audiences == null || inboundAuth.Audiences.Length == 0 || inboundAuth.Audiences.Any(string.IsNullOrWhiteSpace))
       throw new ArgumentException("InboundAuth.Audiences must contain at least one non-empty audience.");
-    if (!inboundAuth.JwksUrl.IsSecureOrLoopback())
+    if (inboundAuth.JwksUrl == null || !inboundAuth.JwksUrl.IsSecureOrLoopback())
       throw new ArgumentException("InboundAuth.JwksUrl must use HTTPS except on loopback.");
     if (inboundAuth.RedirectSignature is { } signatureConfig)
     {
-      if (Encoding.UTF8.GetByteCount(signatureConfig.Key) < 32)
+      if (string.IsNullOrEmpty(signatureConfig.Key) || Encoding.UTF8.GetByteCount(signatureConfig.Key) < 32)
         throw new ArgumentException("InboundAuth.RedirectSignature.Key must contain at least 32 UTF-8 bytes.");
       if (signatureConfig.MaxLifetime <= TimeSpan.Zero)
         throw new ArgumentException("InboundAuth.RedirectSignature.MaxLifetime must be positive.");
