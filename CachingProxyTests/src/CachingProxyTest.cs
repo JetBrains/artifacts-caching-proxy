@@ -1128,6 +1128,67 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
   }
 
   [Fact]
+  public async Task Fresh_Window_Is_Anchored_To_Our_Stored_Date_Not_Upstream_Last_Modified()
+  {
+    // The freshness window must be measured from when *we* stored the copy, never from a timestamp the
+    // upstream controls. Real upstreams report a Last-Modified in the past (it is preserved as the
+    // cache file's own write time so the served header survives), so anchoring the window to a file
+    // timestamp the upstream can drag backwards would make every stored copy born stale and revalidate
+    // on every single request — silently turning RefreshAfter into "no caching at all".
+    var server = CreateRefreshAfterServer(TimeSpan.FromMinutes(10));
+    myUpstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.Ok;
+    myUpstreamServer.RevalidateContent = "v1";
+    myUpstreamServer.RevalidateLastModified = "Tue, 10 Jul 2018 04:58:42 GMT";
+
+    using (var miss = await server.CreateRequest("/real/revalidate.txt").GetAsync())
+    {
+      AssertStatusHeader(miss, CachingProxyStatus.MISS);
+      Assert.Equal("Tue, 10 Jul 2018 04:58:42 GMT", miss.Content.Headers.GetValues("Last-Modified").Single());
+    }
+
+    // Well inside the window: a plain HIT that never reaches the upstream.
+    var upstreamHitsBefore = myUpstreamServer.RevalidateRequestCount;
+    using (var hit = await server.CreateRequest("/real/revalidate.txt").GetAsync())
+    {
+      AssertStatusHeader(hit, CachingProxyStatus.HIT);
+      Assert.Equal("v1", await hit.Content.ReadAsStringAsync());
+    }
+    Assert.Equal(upstreamHitsBefore, myUpstreamServer.RevalidateRequestCount);
+  }
+
+  [Fact]
+  public async Task Revalidated_Copy_Keeps_Serving_Upstream_Last_Modified()
+  {
+    // Resetting the window must not disturb the artifact's own timestamps. The served Last-Modified —
+    // and the ETag PhysicalFile derives from it — has to survive a 304 keep, otherwise every window
+    // reset would invalidate downstream caches and make them re-download an unchanged body.
+    var server = CreateRefreshAfterServer(TimeSpan.FromMinutes(1));
+    myUpstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.Ok;
+    myUpstreamServer.RevalidateContent = "v1";
+    myUpstreamServer.RevalidateLastModified = "Tue, 10 Jul 2018 04:58:42 GMT";
+
+    using (var miss = await server.CreateRequest("/real/revalidate.txt").GetAsync())
+      AssertStatusHeader(miss, CachingProxyStatus.MISS);
+
+    myTimeProvider.Advance(TimeSpan.FromMinutes(2));
+    myUpstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.NotModified;
+
+    string? revalidatedETag;
+    using (var reval = await server.CreateRequest("/real/revalidate.txt").GetAsync())
+    {
+      AssertStatusHeader(reval, CachingProxyStatus.REVALIDATED);
+      Assert.Equal("Tue, 10 Jul 2018 04:58:42 GMT", reval.Content.Headers.GetValues("Last-Modified").Single());
+      revalidatedETag = reval.Headers.ETag?.ToString();
+    }
+
+    // And the following HIT is byte-for-byte the same entity as far as a downstream cache can tell.
+    using var hit = await server.CreateRequest("/real/revalidate.txt").GetAsync();
+    AssertStatusHeader(hit, CachingProxyStatus.HIT);
+    Assert.Equal("Tue, 10 Jul 2018 04:58:42 GMT", hit.Content.Headers.GetValues("Last-Modified").Single());
+    Assert.Equal(revalidatedETag, hit.Headers.ETag?.ToString());
+  }
+
+  [Fact]
   public async Task Stale_Upstream_Error_Serves_Stale_Copy()
   {
     var server = CreateRefreshAfterServer(TimeSpan.FromMinutes(1));

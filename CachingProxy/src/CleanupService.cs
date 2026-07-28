@@ -81,20 +81,21 @@ public class CleanupService(TimeProvider timeProvider, CachingProxyConfig config
         logger.LogDebug(ex, "Failed to get FileInfo for {Path}", filePath);
         continue;
       }
+      // A freshness stamp is exempt from the access-time cutoff: it is only ever stat'ed, never
+      // opened, so its access time does not track use and the cutoff would evict it from under a
+      // busy artifact — costing a needless revalidation. It lives and dies with its artifact
+      // instead, so the only stamp worth deleting here is one whose artifact is already gone.
+      if (CacheFileProvider.IsStoredDateStamp(filePath))
+      {
+        if (!File.Exists(CacheFileProvider.GetStampedCacheFilePath(filePath)))
+          TryDelete(fileInfo);
+        continue;
+      }
+
       if (fileInfo.LastAccessTimeUtc >= cutoffUtc)
         continue;
 
-      try
-      {
-        var size = fileInfo.Length;
-        fileInfo.Delete();
-        deletedCount++;
-        deletedBytes += size;
-      }
-      catch (Exception ex)
-      {
-        logger.LogWarning(ex, "Failed to delete {Path}", filePath);
-      }
+      TryDelete(fileInfo);
     }
 
     var durationSeconds = stopwatch.Elapsed.TotalSeconds;
@@ -121,5 +122,20 @@ public class CleanupService(TimeProvider timeProvider, CachingProxyConfig config
     }
 
     return Task.CompletedTask;
+
+    void TryDelete(FileInfo file)
+    {
+      try
+      {
+        var size = file.Length;
+        file.Delete();
+        deletedCount++;
+        deletedBytes += size;
+      }
+      catch (Exception ex)
+      {
+        logger.LogWarning(ex, "Failed to delete {Path}", file.FullName);
+      }
+    }
   }
 }

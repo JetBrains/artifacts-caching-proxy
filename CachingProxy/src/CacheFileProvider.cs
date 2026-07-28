@@ -10,6 +10,26 @@ public static class CacheFileProvider
 {
   private static readonly string ourGzippedContentSuffix = "-gzip-Ege4dHyCEA7IM";
 
+  // Suffix of the companion "stamp" file whose LastWriteTime records when we stored a cache file —
+  // the anchor of its freshness window (CachingRule.RefreshAfter). Obfuscated like
+  // ourGzippedContentSuffix so it can never collide with a mangled artifact path.
+  private static readonly string ourStoredDateSuffix = "-stamp-Kx2QwRm9Xb4tP";
+
+  /// <summary>
+  /// The stamp file recording when <paramref name="cacheFilePath"/> was stored. The date cannot live
+  /// on the cache file itself: its LastWriteTime is deliberately the upstream's <c>Last-Modified</c>
+  /// (so the served header and the ETag stay stable), and its creation time is unusable on Linux,
+  /// where .NET reports <c>CreationTimeUtc</c> as <c>min(btime, mtime)</c> and cannot write btime at
+  /// all — a forward touch is silently dropped there.
+  /// </summary>
+  public static string GetStoredDateStampPath(string cacheFilePath) => cacheFilePath + ourStoredDateSuffix;
+
+  /// <summary>Whether <paramref name="path"/> is a stamp written by <see cref="GetStoredDateStampPath"/>.</summary>
+  public static bool IsStoredDateStamp(string path) => path.EndsWith(ourStoredDateSuffix, StringComparison.Ordinal);
+
+  /// <summary>The cache file a stamp belongs to. Only valid when <see cref="IsStoredDateStamp"/> holds.</summary>
+  public static string GetStampedCacheFilePath(string stampPath) => stampPath[..^ourStoredDateSuffix.Length];
+
   extension(Uri uri)
   {
     public string GetFutureCacheFileLocation(string? contentEncoding = null) =>

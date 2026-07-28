@@ -45,6 +45,11 @@ public class UpstreamTestServer : IAsyncLifetime
   public volatile string RevalidateContent = "v1";
   public int RevalidateRequestCount;
 
+  // Raw Last-Modified header (RFC-1123) the revalidate route reports, or null to send none. Kept as a
+  // string so it can be volatile like the knobs above. Tests set it to a date far in the past to check
+  // that the proxy's freshness window is anchored to its own stored date rather than the upstream's.
+  public volatile string? RevalidateLastModified;
+
   // Counts hits on the maven metadata / snapshot routes used by the caching-profile tests. The
   // maven-metadata route is conditional-aware (a request carrying If-Modified-Since / If-None-Match
   // gets a 304), so a revalidation after the freshness window is served as REVALIDATED (kept).
@@ -109,6 +114,8 @@ public class UpstreamTestServer : IAsyncLifetime
       .MapGet("revalidate.txt", (req, res, data) =>
       {
         Interlocked.Increment(ref RevalidateRequestCount);
+        if (RevalidateLastModified is { } lastModified)
+          res.Headers.LastModified = lastModified;
         switch (Revalidate)
         {
           case RevalidateBehavior.NotModified:

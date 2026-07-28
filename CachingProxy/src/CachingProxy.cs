@@ -90,12 +90,19 @@ public class CachingProxy
 
         // Past its freshness window: revalidate against the upstream before serving (200 replaces,
         // 304 keeps, 404 deletes, any other error serves the stale copy). When the rule sets no
-        // freshness window the stored copy is fresh forever, exactly as before.
-        if (rule?.RefreshAfter is { } refreshAfter &&
-            myTimeProvider.GetUtcNow().UtcDateTime - cachedFile.CreationTimeUtc > refreshAfter)
+        // freshness window the stored copy is fresh forever, exactly as before — and costs no extra
+        // stat, since only a windowed rule reads the stamp.
+        if (rule?.RefreshAfter is { } refreshAfter)
         {
-          await RevalidateAndServeAsync(context, remoteServer, upstreamUri, contentType, contentEncoding, cachedFile);
-          return;
+          var storedDate = GetStoredDate(cachedFile.FullName);
+          // A missing stamp (a file cached before this proxy stamped them, or one dropped out of
+          // band) counts as stale: one conditional GET re-establishes the window, which is far
+          // cheaper than serving a copy of unbounded age.
+          if (storedDate == null || myTimeProvider.GetUtcNow().UtcDateTime - storedDate.Value > refreshAfter)
+          {
+            await RevalidateAndServeAsync(context, remoteServer, upstreamUri, contentType, contentEncoding, cachedFile, storedDate);
+            return;
+          }
         }
 
         await ServeFileAsync(context, cachedFile, contentType, contentEncoding, CachingProxyStatus.HIT);
@@ -108,7 +115,11 @@ public class CachingProxy
       // A non-null response is a GET MISS body for us to stream and persist; otherwise it is handled.
       if (response == null) return;
 
-      await DownloadToDiskAsync(context, response, upstreamUri);
+      var storedPath = await DownloadToDiskAsync(context, response, upstreamUri);
+      // Anchor the freshness window at the moment we stored it, so the copy counts as fresh until the
+      // window elapses. Only windowed rules need a stamp, so artifacts cached forever get no extra file.
+      if (storedPath != null && rule?.RefreshAfter != null)
+        TouchStoredDate(storedPath);
     }
     catch (OperationCanceledException)
     {
@@ -131,11 +142,13 @@ public class CachingProxy
   }
 
   private async Task RevalidateAndServeAsync(HttpContext context, RemoteServers.RemoteServer remoteServer,
-    Uri upstreamUri, string contentType, string? contentEncoding, FileInfo cachedFile)
+    Uri upstreamUri, string contentType, string? contentEncoding, FileInfo cachedFile, DateTime? storedDate)
   {
-    // Disk keeps no ETag, so revalidate with If-Modified-Since from the file's stored date (its
-    // creation time, reset on each store/revalidation to restart the freshness window).
-    var result = await myRemoteProxy.RevalidateAsync(context, upstreamUri, etag: null, cachedFile.CreationTimeUtc, remoteServer.Auth, context.RequestAborted);
+    // Disk keeps no ETag, so revalidate with If-Modified-Since from the file's stored date (reset on
+    // each store/revalidation to restart the freshness window). A null stored date means we have no
+    // stamp to validate against, so the request goes out unconditionally and upstream answers with a
+    // full body (Replaced), which re-stamps the entry.
+    var result = await myRemoteProxy.RevalidateAsync(context, upstreamUri, etag: null, storedDate, remoteServer.Auth, context.RequestAborted);
 
     switch (result.Outcome)
     {
@@ -168,9 +181,12 @@ public class CachingProxy
           if (newPath == null) return;
 
           // The new representation may use a different encoding (hence a different path) than the
-          // stale variant we matched; remove the now-orphaned old variant.
+          // stale variant we matched; remove the now-orphaned old variant and its stamp.
           if (!string.Equals(newPath, cachedFile.FullName, StringComparison.Ordinal))
+          {
             CatchSilently(() => { if (cachedFile.Exists) cachedFile.Delete(); });
+            DeleteStoredDate(cachedFile.FullName);
+          }
 
           TouchStoredDate(newPath);
         }
@@ -230,10 +246,40 @@ public class CachingProxy
     }
   }
 
-  // Resets a cache file's stored date so the freshness window restarts. Set explicitly (rather than
-  // relying on the temp-file move) to defeat NTFS creation-time tunneling on same-name rewrites.
-  private void TouchStoredDate(string path) =>
-    CatchSilently(() => File.SetCreationTimeUtc(path, myTimeProvider.GetUtcNow().UtcDateTime));
+  // When we stored a cache file, read from its companion stamp's LastWriteTime; null when unstamped.
+  // One extra stat, and only on paths whose rule sets a freshness window.
+  //
+  // The date deliberately lives beside the cache file rather than on it. The file's own LastWriteTime
+  // is the upstream's Last-Modified (see DownloadToDiskAsync), which must stay put so the served
+  // header and the ETag TypedResults.PhysicalFile derives from it do not churn on every revalidation.
+  // Its creation time cannot be used either: on Linux .NET reports CreationTimeUtc as
+  // min(btime, mtime) and has no way to write btime, so moving the stored date forward is silently
+  // dropped (the window never restarts) while the upstream Last-Modified sitting in mtime drags the
+  // reported creation time into the past (every entry born stale, revalidating on every request).
+  private DateTime? GetStoredDate(string cacheFilePath)
+  {
+    var stamp = new FileInfo(CacheFileProvider.GetStoredDateStampPath(cacheFilePath));
+    return stamp.Exists ? stamp.LastWriteTimeUtc : null;
+  }
+
+  // Records "stored now" for a cache file, restarting its freshness window. The stamp is empty: only
+  // its LastWriteTime carries the date, so reading it back later costs a stat and never an open.
+  private void TouchStoredDate(string cacheFilePath) =>
+    CatchSilently(() =>
+    {
+      var stamp = CacheFileProvider.GetStoredDateStampPath(cacheFilePath);
+      if (!File.Exists(stamp))
+        File.Create(stamp).Dispose();
+      File.SetLastWriteTimeUtc(stamp, myTimeProvider.GetUtcNow().UtcDateTime);
+    });
+
+  // A stamp is meaningless without its cache file, so the two are always dropped together.
+  private void DeleteStoredDate(string cacheFilePath) =>
+    CatchSilently(() =>
+    {
+      var stamp = CacheFileProvider.GetStoredDateStampPath(cacheFilePath);
+      if (File.Exists(stamp)) File.Delete(stamp);
+    });
 
   private void DeleteCachedVariants(Uri upstreamUri)
   {
@@ -241,6 +287,7 @@ public class CachingProxy
     {
       var path = Path.Combine(myLocalCachePath, upstreamUri.GetFutureCacheFileLocation(encoding));
       CatchSilently(() => { if (File.Exists(path)) File.Delete(path); });
+      DeleteStoredDate(path);
     }
   }
 
