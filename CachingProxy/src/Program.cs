@@ -71,69 +71,9 @@ public static class Program
       .AddOpenTelemetry()
       .ConfigureResource(resource => resource.AddService(builder.Environment.ApplicationName))
       .WithMetrics(metrics => metrics
-        .AddRuntimeInstrumentation()
-        // explicit configuration of AspNetCoreInstrumentation
-        .AddMeter(
-          "Microsoft.AspNetCore.Hosting",
-          // "Microsoft.AspNetCore.Server.Kestrel",
-          "Microsoft.AspNetCore.Http.Connections",
-          "Microsoft.AspNetCore.Routing",
-          "Microsoft.AspNetCore.Diagnostics",
-          "Microsoft.AspNetCore.RateLimiting",
-          "Microsoft.AspNetCore.Components",
-          "Microsoft.AspNetCore.Components.Server.Circuits",
-          "Microsoft.AspNetCore.Components.Lifecycle",
-          "Microsoft.AspNetCore.Authorization",
-          "Microsoft.AspNetCore.Authentication",
-          "Microsoft.AspNetCore.Identity",
-          "Microsoft.AspNetCore.MemoryPool")
-        // Inbound duration sits at 15 of Prometheus's 16 labels, so it is one tag away from the
-        // same scrape failure the client metrics caused: ASP.NET Core adds http.route once an
-        // endpoint matches and error.type on unhandled exceptions. Pre-emptively drop the tags
-        // that carry no signal here -- url.scheme is always http behind the ingress, the protocol
-        // version is uniformly 1.1, and this proxy serves everything from catch-all middleware so
-        // http.route is "(missing)" rather than a real route.
-        .AddView("http.server.request.duration", new MetricStreamConfiguration
-        {
-          TagKeys =
-          ["http.request.method", "http.response.status_code", "error.type", "aspnetcore.request.is_unhandled"]
-        })
-        // Outbound instrumentation: http.client.* (request duration incl. error.type,
-        // open_connections, connection duration) and dns.lookup.duration. Upstream connect
-        // failures are otherwise invisible -- they are folded into NEGATIVE_MISS alongside
-        // genuine 404s, so they cannot be told apart in caching_requests_total.
-        .AddMeter(
-          "System.Net.Http",
-          "System.Net.NameResolution")
-        // Trim the http.client.* tag sets. Two independent reasons:
-        // 1. Prometheus counts target labels (app, instance, namespace, pod index, node, version, ...)
-        //    plus __name__ towards its per-series label_limit (16 for kubernetes-pods). The default
-        //    9 tags on http.client.request.duration_bucket push the total to 17 and the whole scrape
-        //    is rejected, not just that one metric.
-        // 2. network.peer.address is unbounded: upstreams are CDNs whose IPs rotate, so every new
-        //    edge IP forks a fresh series (x17 for a histogram) that never gets written to again.
-        // server.address is the dimension we actually slice by; port/scheme/protocol are constant
-        // per upstream and recoverable from it.
-        .AddView("http.client.request.duration", new MetricStreamConfiguration
-        {
-          TagKeys = ["server.address", "http.request.method", "http.response.status_code", "error.type"]
-        })
-        .AddView("http.client.request.time_in_queue", new MetricStreamConfiguration
-        {
-          TagKeys = ["server.address", "http.request.method"]
-        })
-        .AddView("http.client.connection_duration", new MetricStreamConfiguration
-        {
-          TagKeys = ["server.address"]
-        })
-        .AddView("http.client.open_connections", new MetricStreamConfiguration
-        {
-          TagKeys = ["server.address", "http.connection.state"]
-        })
-        .AddMeter(CachingProxyMetrics.MeterName)
+        .ConfigureOurMetrics()
         .AddPrometheusExporter()
-        .AddOtlpExporter()
-      );
+        .AddOtlpExporter());
 
     var app = builder.Build();
 
