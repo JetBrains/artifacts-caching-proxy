@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
@@ -29,11 +30,16 @@ namespace JetBrains.CachingProxy.Tests;
 // interop contract. Asserts: valid signature -> proxied (and Cache-Control: private), and every failure
 // mode (no signature, tampered path, wrong key, expired) -> 401. Also asserts the JWT path still works
 // when a signature key is configured, and that signatures are inert when it is not.
+//
+// The rotation tests further down cover the three states of a rotation against a multi-key ring (active
+// accepted, retiring still accepted, dropped rejected) plus a forgery attempt against one.
 public class RedirectSignatureAuthTest : IAsyncLifetime
 {
   private const string Issuer = "https://issuer.example.com";
   private const string Audience = "artifacts-caching-proxy";
   private const string SigningKey = "super-secret-shared-hmac-key-32bytes";
+  // A second, distinct key of legal length, used for the rotation-overlap tests below.
+  private const string RotatedSigningKey = "the-next-shared-hmac-key-32bytes-ok";
 
   private readonly RSA myRsa = RSA.Create(2048);
   private const string Kid = "test-key-1";
@@ -213,6 +219,77 @@ public class RedirectSignatureAuthTest : IAsyncLifetime
     }
   }
 
+  // The three states of a key rotation, exercised end to end. The wire format is unchanged in all of
+  // them — nothing on the URL says which key was used.
+
+  [Fact]
+  public async Task Signature_From_Active_Key_Is_Served_During_Rotation()
+  {
+    // Mid-rotation ring: new key staged first, retiring key second.
+    await WithSignatureKeyRing($"{RotatedSigningKey} {SigningKey}", async client =>
+    {
+      var response = await client.GetAsync(Sign("/private/one.jar", key: RotatedSigningKey));
+
+      Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    });
+  }
+
+  [Fact]
+  public async Task Signature_From_Retiring_Key_Is_Served_During_Rotation()
+  {
+    // The point of the whole feature: redirector tasks that have not rolled over yet keep working, so
+    // private artifacts do not 401 for the duration of the rotation.
+    await WithSignatureKeyRing($"{RotatedSigningKey} {SigningKey}", async client =>
+    {
+      var response = await client.GetAsync(Sign("/private/one.jar", key: SigningKey));
+
+      Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+      Assert.Equal("artifact-body", await response.Content.ReadAsStringAsync());
+    });
+  }
+
+  [Fact]
+  public async Task Signature_From_Key_Dropped_From_The_Ring_Is_Unauthorized()
+  {
+    // Final rotation step: dropping the retiring key must actually revoke it, otherwise nothing rotated.
+    await WithSignatureKeyRing(RotatedSigningKey, async client =>
+    {
+      var response = await client.GetAsync(Sign("/private/one.jar", key: SigningKey));
+
+      Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    });
+  }
+
+  [Fact]
+  public async Task Tampered_Path_Is_Unauthorized_With_A_Multi_Key_Ring()
+  {
+    // A larger ring must not become a way in: a forgery has to fail against every key, not just the active one.
+    await WithSignatureKeyRing($"{RotatedSigningKey} {SigningKey}", async client =>
+    {
+      var signed = Sign("/private/one.jar", key: SigningKey);
+
+      var response = await client.GetAsync(signed.Replace("/private/one.jar", "/private/evil.jar"));
+
+      Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    });
+  }
+
+  // A second host with the given (possibly multi-key) value, since the ring is parsed once at startup.
+  private async Task WithSignatureKeyRing(string keyRing, Func<HttpClient, Task> assertions)
+  {
+    using var host = BuildProxyHost(BuildConfig(signatureKey: keyRing));
+    await host.StartAsync();
+    try
+    {
+      using var client = host.GetTestServer().CreateClient();
+      await assertions(client);
+    }
+    finally
+    {
+      await host.StopAsync();
+    }
+  }
+
   // Faithful C# port of the redirector's auth.lua signing: sig = base64url(HMAC-SHA256(key,
   // path_and_query + "\n" + exp)), URL-safe base64 without padding, cr_exp/cr_sig appended last.
   private static string Sign(string pathAndQuery, string key = SigningKey, DateTimeOffset? expiry = null)
@@ -258,7 +335,7 @@ public class RedirectSignatureAuthTest : IAsyncLifetime
     await myProxyHost.StartAsync();
   }
 
-  private CachingProxyConfig BuildConfig(bool withSignature = true)
+  private CachingProxyConfig BuildConfig(bool withSignature = true, string signatureKey = SigningKey)
   {
     var upstreamUrl = UrlOf(myUpstreamServer);
     return new CachingProxyConfig
@@ -282,7 +359,7 @@ public class RedirectSignatureAuthTest : IAsyncLifetime
         Audiences = [Audience],
         JwksUrl = new Uri(UrlOf(myAuthServer), "jwks.json"),
         RedirectSignature = withSignature
-          ? new CachingProxyConfig.RedirectSignatureConfig { Key = SigningKey }
+          ? new CachingProxyConfig.RedirectSignatureConfig { Key = signatureKey }
           : null,
       },
     };

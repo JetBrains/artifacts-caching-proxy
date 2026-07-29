@@ -19,6 +19,11 @@ public class RedirectSignatureOptions : AuthenticationSchemeOptions
   // Set from InboundAuthConfig.RedirectSignature (see AuthExtensions.AddInboundAuth). Non-null
   // whenever this scheme is registered.
   public CachingProxyConfig.RedirectSignatureConfig Config { get; set; } = null!;
+
+  // Config.Key parsed and validated once at startup, so the per-request path never re-encodes key
+  // material. Non-null whenever this scheme is registered.
+  public RedirectSignatureKeyRing KeyRing { get; set; } = null!;
+
   public string? Challenge { get; set; }
 }
 
@@ -33,9 +38,14 @@ public class RedirectSignatureOptions : AuthenticationSchemeOptions
 /// on its own to satisfy the prefix's <c>[Authorize]</c>. Direct clients presenting a JWT go through the
 /// JwtBearer scheme instead; the forwarding policy scheme in <see cref="AuthExtensions"/> routes between
 /// the two on the presence of <c>cr_sig</c>.
+/// <para>
+/// The signature is checked against every key in <see cref="RedirectSignatureKeyRing"/> so that a rotation
+/// has an overlap window. Which key matched is reported (log + metric) but never taken from the request.
+/// </para>
 /// </summary>
 public sealed class RedirectSignatureAuthenticationHandler(
-  IOptionsMonitor<RedirectSignatureOptions> options, ILoggerFactory logger, UrlEncoder encoder, TimeProvider timeProvider)
+  IOptionsMonitor<RedirectSignatureOptions> options, ILoggerFactory logger, UrlEncoder encoder,
+  TimeProvider timeProvider, CachingProxyMetrics metrics)
   : AuthenticationHandler<RedirectSignatureOptions>(options, logger, encoder)
 {
   public const string SchemeName = "RedirectSignature";
@@ -73,18 +83,31 @@ public sealed class RedirectSignatureAuthenticationHandler(
       return Fail("cr_sig is not valid base64url");
     }
 
-    var signedPayload = $"{PathAndQueryWithoutSignatureParams()}\n{expiry}";
-    var expectedSignature = HMACSHA256.HashData(
-      Encoding.UTF8.GetBytes(Options.Config.Key), Encoding.UTF8.GetBytes(signedPayload));
+    var signedPayload = Encoding.UTF8.GetBytes($"{PathAndQueryWithoutSignatureParams()}\n{expiry}");
 
-    if (!CryptographicOperations.FixedTimeEquals(providedSignature, expectedSignature))
-      return Fail("signature mismatch");
+    // Try each key: the first is the active one, any later one a retiring key still honoured mid-rotation.
+    // Each comparison is constant-time; the number of them reveals only which key matched, not secret.
+    var keys = Options.KeyRing.Keys;
+    for (var i = 0; i < keys.Length; i++)
+    {
+      if (!CryptographicOperations.FixedTimeEquals(
+            providedSignature, HMACSHA256.HashData(keys[i].Bytes, signedPayload)))
+        continue;
 
-    // Establish an authenticated (but claim-less) principal: it satisfies the prefix's [Authorize] and,
-    // just like a JWT-authenticated request, marks the response Cache-Control: private so the private
-    // artifact is not stored by shared caches.
-    var principal = new ClaimsPrincipal(new ClaimsIdentity(SchemeName));
-    return Task.FromResult(AuthenticateResult.Success(new AuthenticationTicket(principal, Scheme.Name)));
+      // Counted, not logged: a retiring-key match is a successful request on every artifact fetch.
+      metrics.IncrementRedirectSignatureVerification(i == 0 ? "active" : "retiring", keys[i].Fingerprint);
+
+      // Establish an authenticated (but claim-less) principal: it satisfies the prefix's [Authorize] and,
+      // just like a JWT-authenticated request, marks the response Cache-Control: private so the private
+      // artifact is not stored by shared caches.
+      var principal = new ClaimsPrincipal(new ClaimsIdentity(SchemeName));
+      return Task.FromResult(AuthenticateResult.Success(new AuthenticationTicket(principal, Scheme.Name)));
+    }
+
+    // Its own metric tag because mid-rotation this means the steps ran out of order — the signer moved to
+    // a key never staged here. The ring's fingerprints are not secret, so log them to make that visible.
+    metrics.IncrementRedirectSignatureVerification("mismatch", "none");
+    return Fail($"signature mismatch (tried {keys.Length} key(s), fingerprints: {Options.KeyRing})");
   }
 
   // Reconstruct the exact string the redirector signed: the raw (undecoded) request line with the

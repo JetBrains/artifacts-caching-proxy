@@ -147,10 +147,11 @@ public static class AuthExtensions
       throw new ArgumentException("InboundAuth.Audiences must contain at least one non-empty audience.");
     if (inboundAuth.JwksUrl == null || !inboundAuth.JwksUrl.IsSecureOrLoopback())
       throw new ArgumentException("InboundAuth.JwksUrl must use HTTPS except on loopback.");
+    // Parsed and validated once here, so the per-request path never touches raw key text.
+    RedirectSignatureKeyRing? keyRing = null;
     if (inboundAuth.RedirectSignature is { } signatureConfig)
     {
-      if (string.IsNullOrEmpty(signatureConfig.Key) || Encoding.UTF8.GetByteCount(signatureConfig.Key) < 32)
-        throw new ArgumentException("InboundAuth.RedirectSignature.Key must contain at least 32 UTF-8 bytes.");
+      keyRing = RedirectSignatureKeyRing.Parse(signatureConfig.Key);
       if (signatureConfig.MaxLifetime <= TimeSpan.Zero)
         throw new ArgumentException("InboundAuth.RedirectSignature.MaxLifetime must be positive.");
       if (signatureConfig.ClockSkew < TimeSpan.Zero)
@@ -190,6 +191,7 @@ public static class AuthExtensions
           options =>
           {
             options.Config = redirectSignature;
+            options.KeyRing = keyRing!;
             options.Challenge = basicChallenge;
           });
     }

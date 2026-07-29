@@ -56,8 +56,14 @@ public class CachingProxyConfig
   // signed URL authorizes exactly one path until it expires and cannot be replayed against another.
   public record RedirectSignatureConfig
   {
-    // The HMAC-SHA256 key, shared out-of-band with the redirector (its CR_SIGNING_KEY). Same value,
+    // The HMAC-SHA256 key(s), shared out-of-band with the redirector (its CR_SIGNING_KEY). Same value,
     // duplicated across the two AWS accounts (see the redirector repo's README).
+    //
+    // One or more whitespace-separated keys: a signature verifies if it matches any of them, while the
+    // redirector signs with the first. That overlap is what makes rotation a rolling change instead of a
+    // flag day. Both sides parse the value identically, so the same string goes to both accounts, and a
+    // lone key is a one-element ring. See RedirectSignatureKeyRing and the redirector repo's
+    // docs/design/MRI-3622-private-caching-proxy.md.
     public required string Key { get; init; }
 
     // Reject correctly signed URLs that claim an unexpectedly distant expiry. This limits replay if a
