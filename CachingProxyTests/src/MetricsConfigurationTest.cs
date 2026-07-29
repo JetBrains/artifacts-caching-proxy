@@ -55,17 +55,15 @@ public class MetricsConfigurationTest(ITestOutputHelper output)
   private static readonly string[] ourInboundStatusCodes = ["200", "302", "400", "404", "500"];
 
   [Theory]
-  // Samples one series costs in the exposition: one _bucket line per boundary plus +Inf, then _sum and
-  // _count. These are the numbers that multiply against a series count we do not control, so they are
-  // pinned rather than merely bounded. Zero boundaries emits no bucket lines at all, leaving sum/count.
+  // Samples one series costs: one _bucket line per boundary plus +Inf, then _sum and _count. Pinned rather
+  // than bounded, because they multiply against a series count we do not control.
   //
-  // The instrument names are transcribed from the runtime's own declarations, NOT copied from the views
-  // under test: this test supplies the name it records under, so a name shared with a typo'd view agrees
-  // with itself and passes while production publishes an unshaped stream. That is exactly how the
-  // connection.duration typo survived to production; EveryTrimmedStream_DropsTheTagsWeDoNotSliceBy is the
-  // guard that does not depend on any name matching.
-  [InlineData("System.Net.Http", "http.client.request.duration", "http_client_request_duration_seconds", 6)]
-  [InlineData("Microsoft.AspNetCore.Hosting", "http.server.request.duration", "http_server_request_duration_seconds", 8)]
+  // Instrument names come from the runtime's declarations, NOT from the views under test -- this test
+  // supplies the name it records under, so it would agree with a typo'd view and pass while production
+  // publishes an unshaped stream. EveryTrimmedStream_DropsTheTagsWeDoNotSliceBy is the name-independent
+  // guard.
+  [InlineData("System.Net.Http", "http.client.request.duration", "http_client_request_duration_seconds", 8)]
+  [InlineData("Microsoft.AspNetCore.Hosting", "http.server.request.duration", "http_server_request_duration_seconds", 9)]
   [InlineData("System.Net.Http", "http.client.connection.duration", "http_client_connection_duration_seconds", 5)]
   [InlineData("System.Net.Http", "http.client.request.time_in_queue", "http_client_request_time_in_queue_seconds", 2)]
   [InlineData("System.Net.NameResolution", "dns.lookup.duration", "dns_lookup_duration_seconds", 2)]
@@ -106,33 +104,30 @@ public class MetricsConfigurationTest(ITestOutputHelper output)
   }
 
   /// <summary>
-  /// The guard for a view that matches no instrument at all. A view is keyed by instrument name and is
-  /// silently inert when that name is wrong, and the Prometheus exporter sanitizes dots to underscores --
-  /// so <c>http.client.connection_duration</c> and the real <c>http.client.connection.duration</c> both
-  /// surface as <c>http_client_connection_duration_seconds</c>, and neither the exposition nor a test that
-  /// records under its own copy of the name can tell them apart. That typo shipped, and left the stream
-  /// dominating the scrape with the unbounded peer IP still attached.
+  /// The guard for a view that matches no instrument. Views are keyed by instrument name and go silently
+  /// inert when it is wrong, and the exporter sanitizes dots to underscores, so
+  /// <c>http.client.connection_duration</c> and the real <c>http.client.connection.duration</c> both surface
+  /// as <c>http_client_connection_duration_seconds</c> -- indistinguishable in the exposition. That typo
+  /// shipped.
   ///
-  /// So this test compares no names. It records every trimmed instrument with the full tag set the runtime
-  /// really attaches and asserts the dropped tags are gone from the output: a view that matches nothing
-  /// leaves them behind, whatever it is called.
+  /// So this test compares no names: it records every trimmed instrument with the runtime's full tag set and
+  /// asserts the dropped tags are gone. A view matching nothing leaves them behind, whatever it is called.
   /// </summary>
   [Fact]
   public async Task EveryTrimmedStream_DropsTheTagsWeDoNotSliceBy()
   {
     using var scrape = await MetricsScrape.Of(RecordWithFullDefaultTags);
 
-    // Dropped either as constant per upstream and recoverable from server.address (port, scheme, protocol),
-    // as unbounded (peer address -- upstreams are CDNs whose edge IPs rotate), or as "(missing)" behind
-    // catch-all middleware (route). Each is dropped by some view, so none may survive anywhere.
+    // Dropped as constant per upstream (port, scheme, protocol), unbounded (peer address), or "(missing)"
+    // behind catch-all middleware (route). Each is dropped by some view, so none may survive anywhere.
     string[] droppedLabels =
     [
       "server_port", "url_scheme", "network_protocol_version", "network_protocol_name",
       "network_peer_address", "network_peer_port", "http_route", "url_template"
     ];
 
-    // Scoped to the families a view trims: http.server.active_requests and http.client.active_requests are
-    // published untouched and keep their default tags legitimately, at one cheap sample per series.
+    // Scoped to the families a view trims: the active_requests gauges are published untouched and keep
+    // their default tags legitimately, at one cheap sample per series.
     string[] trimmedFamilies =
     [
       "http_client_request_duration_seconds", "http_client_connection_duration_seconds",
@@ -195,18 +190,16 @@ public class MetricsConfigurationTest(ITestOutputHelper output)
   }
 
   /// <summary>
-  /// The regression test for the outage itself. Streams here are cumulative and series never retire while
-  /// the process lives, so a long-running pod converges on every combination it can produce -- this drives
-  /// that saturated state and asserts the exposition still fits one scrape. The same input published 17
-  /// samples per series before this configuration existed, which is what tripped <c>sample_limit</c>.
+  /// The regression test for the outage itself. Series never retire while the process lives, so a
+  /// long-running pod converges on every combination it can produce: this drives that saturated state and
+  /// asserts the exposition still fits one scrape. The same input cost 17 samples per series before this
+  /// configuration existed, which is what tripped <c>sample_limit</c>.
   /// </summary>
   [Fact]
   public async Task SaturatedExposition_FitsInOneScrape()
   {
-    // A self-imposed ceiling, deliberately well under any sample_limit a deployment is likely to set. The
-    // real cap lives in someone else's scrape config, guards every pod in the job and is not ours to raise,
-    // so the budget here is the one number we control -- kept low enough to leave room for the cardinality
-    // a long-running pod discovers after this test has had its say.
+    // A self-imposed ceiling, well under any sample_limit a deployment is likely to set. The real cap lives
+    // in someone else's scrape config and is not ours to raise, so this is the one number we control.
     const int sampleBudget = 1000;
 
     using var scrape = await MetricsScrape.Of(meter =>
@@ -228,10 +221,9 @@ public class MetricsConfigurationTest(ITestOutputHelper output)
         queueTime.Record(0.001, address);
         lookup.Record(0.01, new KeyValuePair<string, object?>("dns.question.name", upstream));
 
-        // Connection duration is the one stream the runtime tags with the peer IP, and upstreams are CDNs
-        // whose edge IPs rotate: production saw several times more peers than upstreams within minutes of
-        // startup, each forking a series that never gets written to again. Drive a few per upstream so the
-        // count below reflects the view collapsing them onto server.address.
+        // Connection duration is the one stream the runtime tags with the peer IP, and CDN edge IPs rotate:
+        // production saw several times more peers than upstreams within minutes of startup. Drive a few per
+        // upstream so the count below reflects the view collapsing them onto server.address.
         foreach (var peer in (string[]) ["151.101.2.132", "151.101.66.132", "151.101.130.132"])
           connection.Record(120, address, new KeyValuePair<string, object?>("network.peer.address", peer));
 
