@@ -10,11 +10,14 @@ namespace JetBrains.CachingProxy;
 /// </summary>
 public static class MetricsConfiguration
 {
-  // Prometheus caps the number of samples it accepts from one scrape (sample_limit), and histogram
-  // buckets dominate this exposition: 1717 of 1857 samples in production. Every *.duration instrument
-  // inherits .NET's advice boundaries, which are 14 wide (0.005s..10s), so a single series costs 17
-  // samples -- 15 buckets plus sum and count. The boundary sets below trade quantile resolution for a
-  // per-series cost of 3-7 samples.
+  // Prometheus caps the number of samples it accepts from one scrape (sample_limit) and rejects the whole
+  // scrape when it is exceeded, not just the offending series. The cap is set per deployment on the scrape
+  // job, so it is not ours to raise and not a constant to code against -- the exposition has to stay small
+  // enough that any reasonable cap holds, and stay that way as the process runs.
+  // Histogram buckets dominate this exposition, by an order of magnitude over everything else we publish:
+  // every *.duration instrument inherits .NET's advice boundaries, which are 14 wide (0.005s..10s), so one
+  // series costs 17 samples -- 15 buckets plus sum and count. The boundary sets below trade quantile
+  // resolution for a per-series cost of 2-8 samples.
   //
   // Boundaries, not tags, are the lever that lasts: these streams are cumulative and series never retire
   // while the process lives, so a long-running pod keeps discovering new upstream/method/status
@@ -34,8 +37,8 @@ public static class MetricsConfiguration
   // only question worth bucketing is whether they reach that cap or are torn down early.
   private static readonly double[] ourConnectionLifetimeBoundaries = [10, 600];
 
-  // No boundaries leaves a single +Inf bucket, so the stream degenerates to sum and count: 3 samples per
-  // series. Used where the distribution is not something we would act on.
+  // An empty boundary set emits no _bucket lines at all (not even +Inf), so the stream degenerates to sum
+  // and count: 2 samples per series. Used where the distribution is not something we would act on.
   private static readonly double[] ourCountAndSumOnly = [];
 
   public static MeterProviderBuilder ConfigureOurMetrics(this MeterProviderBuilder metrics) => metrics
@@ -105,7 +108,13 @@ public static class MetricsConfiguration
       TagKeys = ["server.address"],
       Boundaries = ourCountAndSumOnly
     })
-    .AddView("http.client.connection_duration", new ExplicitBucketHistogramConfiguration
+    // NOTE: dotted throughout -- "connection.duration", not "connection_duration". A view whose name
+    // matches no instrument is silently inert, and the Prometheus exporter sanitizes both spellings to
+    // http_client_connection_duration_seconds, so the scraped output cannot tell a matched view from an
+    // unmatched one. That typo shipped: the stream went out with the untouched advice set and the peer IP
+    // still attached, dominating the scrape and climbing steadily back towards sample_limit as new edge IPs
+    // appeared. Take these names from the runtime's instrument declarations, never from the scraped output.
+    .AddView("http.client.connection.duration", new ExplicitBucketHistogramConfiguration
     {
       TagKeys = ["server.address"],
       Boundaries = ourConnectionLifetimeBoundaries

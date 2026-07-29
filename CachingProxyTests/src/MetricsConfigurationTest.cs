@@ -58,9 +58,15 @@ public class MetricsConfigurationTest(ITestOutputHelper output)
   // Samples one series costs in the exposition: one _bucket line per boundary plus +Inf, then _sum and
   // _count. These are the numbers that multiply against a series count we do not control, so they are
   // pinned rather than merely bounded. Zero boundaries emits no bucket lines at all, leaving sum/count.
+  //
+  // The instrument names are transcribed from the runtime's own declarations, NOT copied from the views
+  // under test: this test supplies the name it records under, so a name shared with a typo'd view agrees
+  // with itself and passes while production publishes an unshaped stream. That is exactly how the
+  // connection.duration typo survived to production; EveryTrimmedStream_DropsTheTagsWeDoNotSliceBy is the
+  // guard that does not depend on any name matching.
   [InlineData("System.Net.Http", "http.client.request.duration", "http_client_request_duration_seconds", 6)]
   [InlineData("Microsoft.AspNetCore.Hosting", "http.server.request.duration", "http_server_request_duration_seconds", 8)]
-  [InlineData("System.Net.Http", "http.client.connection_duration", "http_client_connection_duration_seconds", 5)]
+  [InlineData("System.Net.Http", "http.client.connection.duration", "http_client_connection_duration_seconds", 5)]
   [InlineData("System.Net.Http", "http.client.request.time_in_queue", "http_client_request_time_in_queue_seconds", 2)]
   [InlineData("System.Net.NameResolution", "dns.lookup.duration", "dns_lookup_duration_seconds", 2)]
   [InlineData("Microsoft.AspNetCore.Authentication", "aspnetcore.authentication.authenticate.duration",
@@ -100,6 +106,95 @@ public class MetricsConfigurationTest(ITestOutputHelper output)
   }
 
   /// <summary>
+  /// The guard for a view that matches no instrument at all. A view is keyed by instrument name and is
+  /// silently inert when that name is wrong, and the Prometheus exporter sanitizes dots to underscores --
+  /// so <c>http.client.connection_duration</c> and the real <c>http.client.connection.duration</c> both
+  /// surface as <c>http_client_connection_duration_seconds</c>, and neither the exposition nor a test that
+  /// records under its own copy of the name can tell them apart. That typo shipped, and left the stream
+  /// dominating the scrape with the unbounded peer IP still attached.
+  ///
+  /// So this test compares no names. It records every trimmed instrument with the full tag set the runtime
+  /// really attaches and asserts the dropped tags are gone from the output: a view that matches nothing
+  /// leaves them behind, whatever it is called.
+  /// </summary>
+  [Fact]
+  public async Task EveryTrimmedStream_DropsTheTagsWeDoNotSliceBy()
+  {
+    using var scrape = await MetricsScrape.Of(RecordWithFullDefaultTags);
+
+    // Dropped either as constant per upstream and recoverable from server.address (port, scheme, protocol),
+    // as unbounded (peer address -- upstreams are CDNs whose edge IPs rotate), or as "(missing)" behind
+    // catch-all middleware (route). Each is dropped by some view, so none may survive anywhere.
+    string[] droppedLabels =
+    [
+      "server_port", "url_scheme", "network_protocol_version", "network_protocol_name",
+      "network_peer_address", "network_peer_port", "http_route", "url_template"
+    ];
+
+    // Scoped to the families a view trims: http.server.active_requests and http.client.active_requests are
+    // published untouched and keep their default tags legitimately, at one cheap sample per series.
+    string[] trimmedFamilies =
+    [
+      "http_client_request_duration_seconds", "http_client_connection_duration_seconds",
+      "http_client_request_time_in_queue_seconds", "http_client_open_connections",
+      "dns_lookup_duration_seconds", "http_server_request_duration_seconds"
+    ];
+
+    var surviving = scrape.SampleLines
+      .Where(line => trimmedFamilies.Any(family => line.StartsWith(family, StringComparison.Ordinal)))
+      .Where(line => droppedLabels.Any(label => line.Contains(label + "=\"", StringComparison.Ordinal)))
+      .Select(static line => line.Split('}')[0] + "}")
+      .Distinct()
+      .ToList();
+
+    Assert.Empty(surviving);
+  }
+
+  /// <summary>
+  /// Records one point on every instrument a view trims, carrying the complete tag set the runtime attaches
+  /// to it. Only the views decide what survives, which is what makes an unmatched view visible.
+  /// </summary>
+  private static void RecordWithFullDefaultTags(Func<string, Meter> meter)
+  {
+    var http = meter("System.Net.Http");
+    var dns = meter("System.Net.NameResolution");
+    var hosting = meter("Microsoft.AspNetCore.Hosting");
+    var authentication = meter("Microsoft.AspNetCore.Authentication");
+
+    static KeyValuePair<string, object?> Tag(string key, object? value) => new(key, value);
+
+    KeyValuePair<string, object?>[] endpoint =
+    [
+      Tag("server.address", "repo.maven.apache.org"), Tag("server.port", 443), Tag("url.scheme", "https"),
+      Tag("network.protocol.version", "1.1"), Tag("network.protocol.name", "http")
+    ];
+    KeyValuePair<string, object?>[] peer =
+      [Tag("network.peer.address", "151.101.2.132"), Tag("network.peer.port", 443)];
+
+    http.CreateHistogram<double>("http.client.request.duration", "s").Record(0.5,
+    [
+      .. endpoint, .. peer, Tag("http.request.method", "GET"), Tag("http.response.status_code", 200),
+      Tag("url.template", "/{**path}")
+    ]);
+    http.CreateHistogram<double>("http.client.connection.duration", "s").Record(120, [.. endpoint, .. peer]);
+    http.CreateHistogram<double>("http.client.request.time_in_queue", "s")
+      .Record(0.001, [.. endpoint, Tag("http.request.method", "GET")]);
+    http.CreateUpDownCounter<long>("http.client.open_connections")
+      .Add(1, [.. endpoint, .. peer, Tag("http.connection.state", "active")]);
+
+    dns.CreateHistogram<double>("dns.lookup.duration", "s")
+      .Record(0.01, Tag("dns.question.name", "repo.maven.apache.org"));
+
+    hosting.CreateHistogram<double>("http.server.request.duration", "s").Record(0.002,
+      Tag("http.request.method", "GET"), Tag("http.response.status_code", 200), Tag("url.scheme", "http"),
+      Tag("network.protocol.version", "1.1"), Tag("http.route", "(missing)"),
+      Tag("aspnetcore.request.is_unhandled", true));
+
+    authentication.CreateHistogram<double>("aspnetcore.authentication.authenticate.duration", "s")
+      .Record(0.003, Tag("aspnetcore.authentication.scheme", "Bearer"));
+  }
+
+  /// <summary>
   /// The regression test for the outage itself. Streams here are cumulative and series never retire while
   /// the process lives, so a long-running pod converges on every combination it can produce -- this drives
   /// that saturated state and asserts the exposition still fits one scrape. The same input published 17
@@ -108,8 +203,10 @@ public class MetricsConfigurationTest(ITestOutputHelper output)
   [Fact]
   public async Task SaturatedExposition_FitsInOneScrape()
   {
-    // Prometheus's sample_limit for the kubernetes-pods job. Not ours to raise: it guards every pod in
-    // that job, so the exposition has to fit it rather than the other way round.
+    // A self-imposed ceiling, deliberately well under any sample_limit a deployment is likely to set. The
+    // real cap lives in someone else's scrape config, guards every pod in the job and is not ours to raise,
+    // so the budget here is the one number we control -- kept low enough to leave room for the cardinality
+    // a long-running pod discovers after this test has had its say.
     const int sampleBudget = 1000;
 
     using var scrape = await MetricsScrape.Of(meter =>
@@ -120,7 +217,7 @@ public class MetricsConfigurationTest(ITestOutputHelper output)
 
       var duration = http.CreateHistogram<double>("http.client.request.duration", "s");
       var queueTime = http.CreateHistogram<double>("http.client.request.time_in_queue", "s");
-      var connection = http.CreateHistogram<double>("http.client.connection_duration", "s");
+      var connection = http.CreateHistogram<double>("http.client.connection.duration", "s");
       var openConnections = http.CreateUpDownCounter<long>("http.client.open_connections");
       var lookup = dns.CreateHistogram<double>("dns.lookup.duration", "s");
       var inbound = hosting.CreateHistogram<double>("http.server.request.duration", "s");
@@ -129,8 +226,14 @@ public class MetricsConfigurationTest(ITestOutputHelper output)
       {
         var address = new KeyValuePair<string, object?>("server.address", upstream);
         queueTime.Record(0.001, address);
-        connection.Record(120, address);
         lookup.Record(0.01, new KeyValuePair<string, object?>("dns.question.name", upstream));
+
+        // Connection duration is the one stream the runtime tags with the peer IP, and upstreams are CDNs
+        // whose edge IPs rotate: production saw several times more peers than upstreams within minutes of
+        // startup, each forking a series that never gets written to again. Drive a few per upstream so the
+        // count below reflects the view collapsing them onto server.address.
+        foreach (var peer in (string[]) ["151.101.2.132", "151.101.66.132", "151.101.130.132"])
+          connection.Record(120, address, new KeyValuePair<string, object?>("network.peer.address", peer));
 
         foreach (var state in (string[]) ["active", "idle"])
           openConnections.Add(1, address, new KeyValuePair<string, object?>("http.connection.state", state));
@@ -202,6 +305,8 @@ public class MetricsConfigurationTest(ITestOutputHelper output)
       myMeters.Add(meter);
       return meter;
     }
+
+    public IReadOnlyList<string> SampleLines => mySampleLines;
 
     public int TotalSamples => mySampleLines.Length;
 
