@@ -74,11 +74,16 @@ public class CachingProxy
     if (rule?.RefreshAfter is { } window)
       context.Items[CachingProxyConstants.RefreshAfterItemKey] = window;
 
+    // A content-negotiated endpoint keeps one entry per requested representation, so the variant has to
+    // reach every key derived below: the in-memory key and the cache file name (see GetCacheVariant).
+    var variant = RemoteProxy.GetCacheVariant(context, rule);
+    var cacheKey = upstreamUri.ManglePath(variant);
+
     try
     {
       foreach (var contentEncoding in GetCacheLookupContentEncodings(context))
       {
-        var cachedFile = new FileInfo(Path.Combine(myLocalCachePath, upstreamUri.GetFutureCacheFileLocation(contentEncoding)));
+        var cachedFile = new FileInfo(Path.Combine(myLocalCachePath, upstreamUri.GetFutureCacheFileLocation(contentEncoding, variant)));
         if (!cachedFile.Exists)
           continue;
 
@@ -94,7 +99,7 @@ public class CachingProxy
         // copy is fresh forever.
         if (rule?.RefreshAfter is { } refreshAfter && UtcNow - metadata.StoredAtUtc > refreshAfter)
         {
-          await RevalidateAndServeAsync(context, remoteServer, upstreamUri, contentEncoding, cachedFile, metadata);
+          await RevalidateAndServeAsync(context, remoteServer, upstreamUri, cacheKey, contentEncoding, cachedFile, metadata, rule, variant);
           return;
         }
 
@@ -102,13 +107,13 @@ public class CachingProxy
         return;
       }
 
-      using var response = await myRemoteProxy.ProcessAsync(context, upstreamUri.ManglePath(),
-        remoteServer.CacheDuration, upstreamUri, remoteServer.Auth, rule);
+      using var response = await myRemoteProxy.ProcessAsync(context, cacheKey,
+        remoteServer.CacheDuration, upstreamUri, remoteServer.Auth, rule, remoteServer.Profile);
 
       // A non-null response is a GET MISS body for us to stream and persist; otherwise it is handled.
       if (response == null) return;
 
-      var storedPath = await DownloadToDiskAsync(context, response, upstreamUri);
+      var storedPath = await DownloadToDiskAsync(context, response, upstreamUri, variant);
       if (storedPath == null) return;
 
       // Unconditional, unlike the freshness stamp this replaced: a stored copy needs its head back
@@ -154,14 +159,15 @@ public class CachingProxy
     etag != null && EntityTagHeaderValue.TryParse(etag, out var parsed) ? parsed : null;
 
   private async Task RevalidateAndServeAsync(HttpContext context, RemoteServers.RemoteServer remoteServer,
-    Uri upstreamUri, string? contentEncoding, FileInfo cachedFile, CacheEntryMetadata metadata)
+    Uri upstreamUri, string cacheKey, string? contentEncoding, FileInfo cachedFile,
+    CacheEntryMetadata metadata, CachingRule? rule, string? variant)
   {
     // The conditional validators come from the entry's metadata. Last-Modified falls back to when we
     // stored the copy for an upstream that sent none: that is never earlier than the upstream's own, so
     // a resource changed since is still answered with a full body while an unchanged one still 304s.
     var result = await myRemoteProxy.RevalidateAsync(context, upstreamUri, metadata.ETag,
       metadata.LastModified ?? new DateTimeOffset(metadata.StoredAtUtc, TimeSpan.Zero),
-      remoteServer.Auth, context.RequestAborted);
+      remoteServer.Auth, rule, remoteServer.Profile, context.RequestAborted);
 
     switch (result.Outcome)
     {
@@ -174,9 +180,9 @@ public class CachingProxy
       case RevalidationOutcome.Gone:
         // Removed upstream: drop both encoding variants and cache+serve the 404, matching a MISS 404.
         // The 404 replaces any stored head under the same key, so nothing points at the deleted body.
-        DeleteCachedVariants(upstreamUri);
+        DeleteCachedVariants(upstreamUri, variant);
         await myRemoteProxy.SetStatusAsync(context, CachingProxyStatus.NEGATIVE_MISS,
-          await myResponseCache.PutStatusCode(upstreamUri.ManglePath(), HttpStatusCode.NotFound, remoteServer.CacheDuration, context.RequestAborted));
+          await myResponseCache.PutStatusCode(cacheKey, HttpStatusCode.NotFound, remoteServer.CacheDuration, context.RequestAborted));
         return;
 
       case RevalidationOutcome.UpstreamError:
@@ -192,7 +198,7 @@ public class CachingProxy
           // recorded below, so this response and every later HIT agree.
           await myRemoteProxy.SetStatusAsync(context, CachingProxyStatus.REVALIDATED, new CachedResponse(response));
 
-          var newPath = await DownloadToDiskAsync(context, response, upstreamUri);
+          var newPath = await DownloadToDiskAsync(context, response, upstreamUri, variant);
           if (newPath == null) return;
 
           // The new representation may use a different encoding (hence a different path) than the
@@ -212,13 +218,13 @@ public class CachingProxy
   // Streams the upstream body to the client while persisting it to the local cache via an atomic
   // temp-file + move, validating Content-Length. Returns the final cache file path, or null when the
   // download was aborted (content-length mismatch or cancellation). Leaves no orphaned temp file.
-  private async Task<string?> DownloadToDiskAsync(HttpContext context, HttpResponseMessage response, Uri upstreamUri)
+  private async Task<string?> DownloadToDiskAsync(HttpContext context, HttpResponseMessage response, Uri upstreamUri, string? variant)
   {
     var contentEncoding = response.Content.Headers.ContentEncoding.FirstOrDefault();
     var contentLength = response.Content.Headers.ContentLength;
     var contentLastModified = response.Content.Headers.LastModified;
 
-    var cachedFile = Path.Combine(myLocalCachePath, upstreamUri.GetFutureCacheFileLocation(contentEncoding));
+    var cachedFile = Path.Combine(myLocalCachePath, upstreamUri.GetFutureCacheFileLocation(contentEncoding, variant));
     var tempFile = cachedFile + ".tmp." + Guid.NewGuid();
 
     var parent = Directory.GetParent(cachedFile);
@@ -287,11 +293,13 @@ public class CachingProxy
       if (File.Exists(path)) File.Delete(path);
     });
 
-  private void DeleteCachedVariants(Uri upstreamUri)
+  // Both content-encoding variants of one entry. Not the Accept variants: those are separate entries under
+  // their own keys, and each revalidates (or 404s) on its own request.
+  private void DeleteCachedVariants(Uri upstreamUri, string? variant)
   {
     foreach (var encoding in new string?[] { null, "gzip" })
     {
-      var path = Path.Combine(myLocalCachePath, upstreamUri.GetFutureCacheFileLocation(encoding));
+      var path = Path.Combine(myLocalCachePath, upstreamUri.GetFutureCacheFileLocation(encoding, variant));
       CatchSilently(() => { if (File.Exists(path)) File.Delete(path); });
       DeleteMetadata(path);
     }

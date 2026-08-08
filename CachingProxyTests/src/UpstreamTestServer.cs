@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.IO.Compression;
@@ -62,6 +63,35 @@ public class UpstreamTestServer : IAsyncLifetime
   public int PackumentRequestCount;
   public int TarballRequestCount;
 
+  // Counts hits on the OCI distribution routes. The manifest-by-tag route is conditional-aware and
+  // honours the shared Revalidate behavior, like the npm packument. ManifestAcceptHeaders records the
+  // Accept of every manifest request in arrival order, so the tests can assert the client's own Accept
+  // reached the upstream (and not a proxy-invented one).
+  public int ManifestByTagRequestCount;
+  public int ManifestByDigestRequestCount;
+  public int BlobRequestCount;
+  public int TokenRequestCount;
+  public readonly ConcurrentQueue<string> ManifestAcceptHeaders = new();
+
+  // Set to make every OCI route answer 401 + a Bearer challenge unless the request carries
+  // "Authorization: Bearer <TokenToIssue>", so a test can drive the full challenge/token/retry dance.
+  // The realm points back at this server's own /oauth/token route.
+  public volatile bool RequireRegistryToken;
+  public volatile string TokenToIssue = "test-registry-token";
+
+  // The last Authorization the token route received, or "" for an anonymous token request. The whole
+  // point of the service-account model is that a client's own credentials never reach an upstream, so a
+  // test asserts on this rather than trusting the code path.
+  public volatile string LastTokenRequestAuthorization = "";
+
+  // Digest of the manifest body below, as the upstream reports it in Docker-Content-Digest. A fixed
+  // literal, not a hash of the body: a real registry's digest covers the exact stored bytes, which is
+  // precisely why the proxy has to carry the header through rather than recompute it.
+  public const string ManifestDigest = "sha256:1e9f7c94ac5b1e1cb1ee5cf1f2a4e6d7c8b90a1234567890abcdef1234567890";
+  public const string BlobDigest = "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+  public const string IndexMediaType = "application/vnd.oci.image.index.v1+json";
+  public const string ManifestMediaType = "application/vnd.oci.image.manifest.v1+json";
+
   public UpstreamTestServer()
   {
     var builder = WebApplication.CreateBuilder();
@@ -73,9 +103,90 @@ public class UpstreamTestServer : IAsyncLifetime
       {
         LastUserAgent = context.Request.Headers.UserAgent.ToString();
         LastRawTarget = context.Features.Get<IHttpRequestFeature>()?.RawTarget ?? "";
+
+        // A real registry gates the whole /v2/ tree, not individual routes, and answers with the
+        // challenge that names where a token comes from. Modelled here so the proxy's token dance is
+        // exercised end to end rather than per route.
+        if (RequireRegistryToken && context.Request.Path.StartsWithSegments("/v2") &&
+            context.Request.Headers.Authorization.ToString() != $"Bearer {TokenToIssue}")
+        {
+          context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+          // Deliberately in the wire shape Docker Hub uses: several comma-separated auth-params whose
+          // quoted values themselves contain commas' neighbours ('/' and ':'). This is what the framework's
+          // own WWW-Authenticate parser mangles, hence RegistryTokenProvider's hand parser.
+          context.Response.Headers.WWWAuthenticate =
+            $"Bearer realm=\"{Url}oauth/token\",service=\"upstream-test\",scope=\"repository:testimage:pull\"";
+          return context.Response.WriteAsync("{\"errors\":[{\"code\":\"UNAUTHORIZED\"}]}");
+        }
+
         return next(context);
       })
       .UseRouter(router => router
+      .MapGet("oauth/token", (req, res, data) =>
+      {
+        Interlocked.Increment(ref TokenRequestCount);
+        LastTokenRequestAuthorization = req.Headers.Authorization.ToString();
+        res.ContentType = MediaTypeNames.Application.Json;
+        // expires_in is short but longer than RegistryTokenProvider's refresh skew, so the token is
+        // cached rather than re-minted on the very next request.
+        return res.WriteAsync($"{{\"token\":\"{TokenToIssue}\",\"expires_in\":300}}");
+      })
+      .MapGet("v2/testimage/manifests/24.04", (req, res, data) =>
+      {
+        Interlocked.Increment(ref ManifestByTagRequestCount);
+        var accept = req.Headers.Accept.ToString();
+        ManifestAcceptHeaders.Enqueue(accept);
+
+        // Conditional revalidation after the freshness window: honour the scripted behavior, like the
+        // npm packument route.
+        if (req.Headers.ContainsKey("If-Modified-Since") || req.Headers.ContainsKey("If-None-Match"))
+        {
+          switch (Revalidate)
+          {
+            case RevalidateBehavior.NotModified:
+              res.StatusCode = StatusCodes.Status304NotModified;
+              return Task.CompletedTask;
+            case RevalidateBehavior.NotFound:
+              res.StatusCode = StatusCodes.Status404NotFound;
+              return res.WriteAsync("{\"errors\":[{\"code\":\"MANIFEST_UNKNOWN\"}]}");
+            case RevalidateBehavior.ServerError:
+              res.StatusCode = StatusCodes.Status500InternalServerError;
+              return res.WriteAsync("boom");
+          }
+        }
+
+        // The negotiation itself: a client that accepts an index gets one, everyone else gets a
+        // single-arch manifest. Same URL, two representations, which is what VaryByAccept is for.
+        var wantsIndex = accept.Contains(IndexMediaType, StringComparison.OrdinalIgnoreCase);
+        res.ContentType = wantsIndex ? IndexMediaType : ManifestMediaType;
+        res.Headers[CachedResponse.DockerContentDigestHeader] = ManifestDigest;
+        return res.WriteAsync(wantsIndex ? "{\"manifests\":[]}" : "{\"layers\":[]}");
+      })
+      .MapGet($"v2/testimage/manifests/{ManifestDigest}", (req, res, data) =>
+      {
+        Interlocked.Increment(ref ManifestByDigestRequestCount);
+        ManifestAcceptHeaders.Enqueue(req.Headers.Accept.ToString());
+        res.ContentType = ManifestMediaType;
+        res.Headers[CachedResponse.DockerContentDigestHeader] = ManifestDigest;
+        return res.WriteAsync("{\"layers\":[]}");
+      })
+      .MapGet($"v2/testimage/blobs/{BlobDigest}", (req, res, data) =>
+      {
+        Interlocked.Increment(ref BlobRequestCount);
+        res.ContentType = MediaTypeNames.Application.Octet;
+        res.Headers[CachedResponse.DockerContentDigestHeader] = BlobDigest;
+        return res.WriteAsync("blob-content");
+      })
+      .MapGet("v2/testimage/tags/list", (req, res, data) =>
+      {
+        res.ContentType = MediaTypeNames.Application.Json;
+        return res.WriteAsync("{\"name\":\"testimage\",\"tags\":[\"24.04\"]}");
+      })
+      .MapGet("v2/_catalog", (req, res, data) =>
+      {
+        res.ContentType = MediaTypeNames.Application.Json;
+        return res.WriteAsync("{\"repositories\":[\"testimage\"]}");
+      })
       .MapGet("conditional-500.txt", (req, res, data) =>
       {
         if (Conditional500SendErrorOnce)

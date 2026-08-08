@@ -160,6 +160,40 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   }
 
   [Fact]
+  public async Task Oci_Digest_Travels_With_The_Object()
+  {
+    // Docker-Content-Digest covers the exact bytes of one representation, so it cannot be recomputed from
+    // the stored copy - it has to travel with the object. An OCI client resolves a manifest by it and
+    // verifies the body against it, so a hit that dropped it would break a pull that a miss served fine.
+    // Nothing profile-specific about it: any object whose upstream sent one keeps it.
+    var server = CreateServer(signedLinks: false);
+    var path = $"/real/v2/testimage/manifests/{UpstreamTestServer.ManifestDigest}";
+    var key = GetPathKey(path);
+
+    using (var miss = await server.CreateRequest(path).SendAsync(HttpMethod.Get.Method))
+    {
+      // The digest-addressed path also proves ':' survives request validation, which used to 400.
+      Assert.Equal(HttpStatusCode.RedirectKeepVerb, miss.StatusCode);
+      AssertStatusHeader(miss, CachingProxyStatus.MISS);
+    }
+
+    Assert.Equal(1, myS3.PutObjectCalls);
+    Assert.Equal(UpstreamTestServer.ManifestDigest, myS3.Digests[key]);
+
+    // Read back by a replica that never saw the upstream response, so the header can only have come off
+    // the object's metadata and not from an in-memory entry left over from the request above.
+    var replica = CreateServer(signedLinks: false);
+    using var hit = await replica.CreateRequest(path).SendAsync(HttpMethod.Get.Method);
+
+    Assert.Equal(HttpStatusCode.OK, hit.StatusCode); // a manifest is small enough to inline
+    Assert.Equal(UpstreamTestServer.ManifestDigest,
+      hit.Headers.GetValues(CachedResponse.DockerContentDigestHeader).Single());
+    Assert.Equal(UpstreamTestServer.ManifestMediaType, hit.Content.Headers.ContentType?.ToString());
+    Assert.Equal("{\"layers\":[]}", await hit.Content.ReadAsStringAsync());
+    Assert.Equal(1, myS3.PutObjectCalls); // already stored, not re-uploaded
+  }
+
+  [Fact]
   public async Task Path_With_Multiple_Slashes_Is_Bad_Request()
   {
     // A degenerate URL such as "/maven-central////-.jar" resolves the "///-.jar" remainder to an
@@ -782,6 +816,9 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     public readonly Dictionary<string, (byte[] Body, string? ContentType, string? ETag)> Objects = new();
     // The "uri" user-metadata stored alongside each PutObject, keyed by object key.
     public readonly Dictionary<string, string?> PutObjectUris = new();
+    // The "docker-content-digest" user-metadata, keyed by object key. Written by PutObject and replayed
+    // by GetObject, like the real bucket - an OCI digest cannot be recomputed from the stored bytes.
+    public readonly Dictionary<string, string?> Digests = new();
     // The object's "created-at" user-metadata (our freshness clock), keyed by object key. Absent
     // unless written by a PutObject/CopyObject or seeded by a test; revalidation tests backdate it
     // to make the object appear stale.
@@ -852,6 +889,8 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
       response.Headers.ContentType = obj.ContentType;
       if (CreatedAt.TryGetValue(request.Key, out var createdAt))
         response.Metadata["created-at"] = createdAt.ToString("O");
+      if (Digests.GetValueOrDefault(request.Key) is { } digest)
+        response.Metadata[CachedResponse.DockerContentDigestMetadataKey] = digest;
       return response;
     }
 
@@ -862,6 +901,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
       await request.InputStream.CopyToAsync(ms, cancellationToken);
       Objects[request.Key] = (ms.ToArray(), request.Headers.ContentType, null);
       PutObjectUris[request.Key] = request.Metadata["uri"];
+      Digests[request.Key] = request.Metadata[CachedResponse.DockerContentDigestMetadataKey];
       if (request.Metadata["created-at"] is { } createdAt)
         CreatedAt[request.Key] = DateTimeOffset.Parse(createdAt);
       return new PutObjectResponse { HttpStatusCode = HttpStatusCode.OK };

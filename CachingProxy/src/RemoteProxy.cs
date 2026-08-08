@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using System.Net;
@@ -27,9 +28,14 @@ public partial class RemoteProxy(
   ResponseCache responseCache,
   CachingProxyMetrics metrics,
   ILogger<RemoteProxy> logger,
-  IUpstreamAuthorizationProvider? authProvider = null)
+  IUpstreamAuthorizationProvider? authProvider = null,
+  RegistryTokenProvider? registryTokenProvider = null)
 {
-  [GeneratedRegex(@"^([\x20a-zA-Z_\-0-9./+@]|%[0-9a-fA-F]{2})+$", RegexOptions.Compiled)]
+  // ':' is here for OCI digest references ("/blobs/sha256:<hex>", "/manifests/sha256:<hex>"), which are
+  // how a registry client addresses every layer and every resolved manifest. It cannot reach a cache
+  // filename: those are SHA256 hashes plus Path.GetExtension of the path, which is empty for a segment
+  // whose only ':' follows no dot (so NTFS alternate data streams stay out of reach).
+  [GeneratedRegex(@"^([\x20a-zA-Z_\-0-9./+@:]|%[0-9a-fA-F]{2})+$", RegexOptions.Compiled)]
   private static partial Regex OurGoodPathChars { get; }
 
   private readonly Regex? myBlacklistRegex = !string.IsNullOrWhiteSpace(config.BlacklistUrlRegex) ?
@@ -73,6 +79,35 @@ public partial class RemoteProxy(
     }
   }
 
+  /// <summary>
+  /// The extra cache-key dimension for this request, or <c>null</c> for the usual path-only key. Only a
+  /// content-negotiated rule (<see cref="CachingRule.VaryByAccept"/>) has one; it is the client's
+  /// <c>Accept</c>, canonicalized so that two clients asking for the same set of media types share one
+  /// entry: media types lower-cased, parameters (notably <c>q=</c>) dropped, de-duplicated and sorted.
+  /// <para>Callers must fold it into every derived key — the in-memory key, the stored file name and the
+  /// S3 object key — via the <c>variant</c> argument of <c>Uri.ManglePath</c>, or a client that asked for
+  /// one representation could be served another's cached copy.</para>
+  /// </summary>
+  public static string? GetCacheVariant(HttpContext context, CachingRule? rule)
+  {
+    if (rule is not { VaryByAccept: true }) return null;
+
+    var mediaTypes = new SortedSet<string>(StringComparer.Ordinal);
+    foreach (var header in context.Request.Headers.Accept)
+    {
+      foreach (var range in (header ?? "").Split(','))
+      {
+        // Everything from the first ';' on is parameters; only the media type identifies the entry.
+        var mediaType = range.Split(';', 2)[0].Trim();
+        if (mediaType.Length > 0) mediaTypes.Add(mediaType.ToLowerInvariant());
+      }
+    }
+
+    // An empty string, not null, when the client sent no Accept at all: that is still a distinct
+    // representation request, and ManglePath keeps it distinct from "this endpoint does not vary".
+    return string.Join(',', mediaTypes);
+  }
+
   // 404 and authentication / access errors are surfaced to the client verbatim (we do not mask
   // them); every other non-success status is masked to 404. Used for both negative cache hits and
   // misses so a replayed entry returns the same status the live response did.
@@ -98,7 +133,7 @@ public partial class RemoteProxy(
   /// Content-Encoding off the response) and must dispose it; in every other case the request is
   /// fully handled, the response (if any) is disposed internally, and <c>null</c> is returned.
   /// </summary>
-  public async Task<HttpResponseMessage?> ProcessAsync(HttpContext context, string cacheKey, CacheDuration cacheDuration, Uri upstreamUri, UpstreamAuth? auth = null, CachingRule? rule = null)
+  public async Task<HttpResponseMessage?> ProcessAsync(HttpContext context, string cacheKey, CacheDuration cacheDuration, Uri upstreamUri, UpstreamAuth? auth = null, CachingRule? rule = null, CachingProfile? profile = null)
   {
     var isHead = HttpMethods.IsHead(context.Request.Method);
 
@@ -148,6 +183,7 @@ public partial class RemoteProxy(
     logger.LogDebug("Downloading from {UpstreamUri}", upstreamUri);
 
     var request = new HttpRequestMessage(isHead ? HttpMethod.Head : HttpMethod.Get, upstreamUri);
+    ForwardAccept(context, request, rule);
 
     HttpResponseMessage response;
     try
@@ -156,7 +192,7 @@ public partial class RemoteProxy(
       {
         request.Headers.Authorization = await authProvider.GetAuthorizationHeaderAsync(auth, context.RequestAborted);
       }
-      response = await httpClient.Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, context.RequestAborted);
+      response = await SendAsync(request, upstreamUri, auth, profile, context.RequestAborted);
     }
     catch (OperationCanceledException canceledException)
     {
@@ -216,6 +252,9 @@ public partial class RemoteProxy(
             $"{upstreamUri} returned Content-Encoding '{contentEncoding}' which is not supported");
       }
 
+      // An upstream that sends no Content-Type at all falls back to octet-stream rather than to no
+      // header, so a MISS and every later HIT (which reads it back off the stored copy, where "absent"
+      // is indistinguishable from "never sent") agree on what the bytes are.
       var responseEntry = new CachedResponse(response)
       {
         Headers =
@@ -256,7 +295,8 @@ public partial class RemoteProxy(
   /// </list>
   /// </summary>
   public async Task<RevalidationResult> RevalidateAsync(HttpContext context, Uri upstreamUri,
-    string? etag, DateTimeOffset? lastModified, UpstreamAuth? auth, CancellationToken cancellationToken)
+    string? etag, DateTimeOffset? lastModified, UpstreamAuth? auth, CachingRule? rule, CachingProfile? profile,
+    CancellationToken cancellationToken)
   {
     logger.LogDebug("Revalidating {UpstreamUri}", upstreamUri);
 
@@ -265,13 +305,16 @@ public partial class RemoteProxy(
       request.Headers.IfNoneMatch.Add(parsedEtag);
     if (lastModified.HasValue)
       request.Headers.IfModifiedSince = lastModified.Value;
+    // The same Accept as the original fetch, or the upstream could answer 304 for — or replace the entry
+    // with — a representation other than the one this cache entry holds.
+    ForwardAccept(context, request, rule);
 
     HttpResponseMessage response;
     try
     {
       if (authProvider != null && auth != null)
         request.Headers.Authorization = await authProvider.GetAuthorizationHeaderAsync(auth, cancellationToken);
-      response = await httpClient.Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+      response = await SendAsync(request, upstreamUri, auth, profile, cancellationToken);
     }
     catch (OperationCanceledException canceledException)
     {
@@ -318,6 +361,79 @@ public partial class RemoteProxy(
     {
       if (!transferOwnership) response.Dispose();
     }
+  }
+
+  // Forwards the client's Accept, but only for a content-negotiated endpoint whose cache key includes it
+  // (see GetCacheVariant). Everywhere else the request deliberately carries no client headers: one
+  // client's Accept would otherwise pick the representation that every later client is served from the
+  // single, Accept-blind cache entry.
+  private static void ForwardAccept(HttpContext context, HttpRequestMessage request, CachingRule? rule)
+  {
+    if (rule is not { VaryByAccept: true }) return;
+
+    foreach (var value in context.Request.Headers.Accept)
+    {
+      // TryAddWithoutValidation: an OCI client's Accept is a long list of vnd.* types, and we are
+      // relaying it verbatim rather than reinterpreting it.
+      if (!string.IsNullOrEmpty(value)) request.Headers.TryAddWithoutValidation("Accept", value);
+    }
+  }
+
+  /// <summary>
+  /// Sends an upstream request, adding the OCI registry token dance for profiles that ask for it (see
+  /// <see cref="CachingProfile.Oci"/>). Every other upstream goes out untouched.
+  /// <para>Two paths. Steady state: this host's realm is already known, so a token is attached up front
+  /// and no 401 is paid. First contact: the registry's 401 carries the challenge, we mint a token for it,
+  /// remember the realm for next time and retry — <b>once</b>, so a registry that keeps answering 401
+  /// (genuinely unauthorized, wrong service account) has that answer relayed instead of being retried in
+  /// a loop.</para>
+  /// </summary>
+  private async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, Uri upstreamUri,
+    UpstreamAuth? auth, CachingProfile? profile, CancellationToken cancellationToken)
+  {
+    if (registryTokenProvider == null || profile is not { Oci: true })
+      return await httpClient.Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+
+    // Whatever UpstreamAuth produced (null for a public mirror). It is the service account the token is
+    // minted against, and it is part of that token's cache identity — see RegistryTokenProvider.
+    var credentials = request.Headers.Authorization;
+
+    if (await registryTokenProvider.GetRememberedChallengeAsync(upstreamUri, cancellationToken) is { } known &&
+        await registryTokenProvider.GetTokenAsync(known, upstreamUri, auth, credentials, cancellationToken) is { } cached)
+      request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", cached);
+
+    var response = await httpClient.Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+    if (response.StatusCode != HttpStatusCode.Unauthorized ||
+        RegistryTokenProvider.TryParseChallenge(response, upstreamUri) is not { } challenge)
+      return response;
+
+    var token = await registryTokenProvider.GetTokenAsync(challenge, upstreamUri, auth, credentials, cancellationToken);
+    if (token == null)
+      return response;
+
+    // Only remembered once a token was actually obtained, so a bogus challenge cannot poison the
+    // preemptive path for the whole host.
+    await registryTokenProvider.RememberChallengeAsync(upstreamUri, challenge, cancellationToken);
+
+    var retry = CloneForRetry(request);
+    retry.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+    var retried = await httpClient.Client.SendAsync(retry, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+    response.Dispose();
+    return retried;
+  }
+
+  // An HttpRequestMessage cannot be re-sent, so a retry needs a copy. Carries over the conditional
+  // revalidation headers and the forwarded Accept, but not the Authorization the caller is replacing.
+  private static HttpRequestMessage CloneForRetry(HttpRequestMessage request)
+  {
+    var clone = new HttpRequestMessage(request.Method, request.RequestUri);
+    foreach (var (name, values) in request.Headers)
+    {
+      if (!string.Equals(name, "Authorization", StringComparison.OrdinalIgnoreCase))
+        clone.Headers.TryAddWithoutValidation(name, values);
+    }
+
+    return clone;
   }
 
   private enum ContentEncodingValidation { Ok, Multiple, Unsupported }

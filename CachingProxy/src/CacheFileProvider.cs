@@ -123,8 +123,8 @@ public static class CacheFileProvider
 
   extension(Uri uri)
   {
-    public string GetFutureCacheFileLocation(string? contentEncoding = null) =>
-      uri.ManglePath()
+    public string GetFutureCacheFileLocation(string? contentEncoding = null, string? variant = null) =>
+      uri.ManglePath(variant)
       + Path.GetExtension(uri.AbsolutePath)
       + contentEncoding switch
       {
@@ -133,10 +133,17 @@ public static class CacheFileProvider
         _ => throw new ArgumentException("Invalid content encoding", nameof(contentEncoding)),
       };
 
-    public string ManglePath()
+    /// <param name="variant">
+    /// Extra cache-key dimension for a content-negotiated endpoint (see
+    /// <see cref="RemoteProxy.GetCacheVariant"/>), or null for the usual path-only key. It is hashed
+    /// after a newline, which an escaped URI path can never contain, so a variant-keyed entry can never
+    /// collide with a plain one — including for the empty variant a client that sent no Accept yields.
+    /// </param>
+    public string ManglePath(string? variant = null)
     {
       var path = uri.GetHostPortPath();
-      var maxBytes = Encoding.UTF8.GetMaxByteCount(path.Length);
+      var maxBytes = Encoding.UTF8.GetMaxByteCount(path.Length)
+                     + (variant != null ? 1 + Encoding.UTF8.GetMaxByteCount(variant.Length) : 0);
 
       byte[]? rented = null;
       var buffer = maxBytes <= 512 ? stackalloc byte[512] : rented = ArrayPool<byte>.Shared.Rent(maxBytes);
@@ -154,6 +161,13 @@ public static class CacheFileProvider
             if (buffer[i] == (byte)Path.DirectorySeparatorChar)
               buffer[i] = (byte)Path.AltDirectorySeparatorChar;
           }
+        }
+        // Appended after the separator normalization above: a media type contains '/', which is the
+        // delimiter that loop rewrites *to*, so normalizing it would be a no-op at best.
+        if (variant != null)
+        {
+          buffer[written++] = (byte)'\n';
+          written += Encoding.UTF8.GetBytes(variant, buffer[written..]);
         }
         var hash = Convert.ToHexStringLower(SHA256.HashData(buffer[..written]));
         return $"{hash[..2]}/{hash[2..4]}/{hash}";

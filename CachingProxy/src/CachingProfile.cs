@@ -11,11 +11,24 @@ namespace JetBrains.CachingProxy;
 /// rule matches the caller treats it as "cache forever, never redirect" — the immutable default.
 /// Profiles let different endpoints of one repository use different caching timing (e.g. immutable
 /// Maven coordinates cached for a year, mutable metadata revalidated hourly) and are meant to grow to
-/// other repository types (nuget v3, docker) over time.
+/// other repository types (nuget v3) over time.
 /// </summary>
 public class CachingProfile
 {
   public CachingRule[] Rules { get; init; } = [];
+
+  /// <summary>
+  /// Marks the prefixes carrying this profile as speaking the OCI distribution (Docker registry v2)
+  /// API upstream. A registry answers even an anonymous pull with <c>401</c> plus a
+  /// <c>WWW-Authenticate: Bearer realm=…</c> challenge and expects a token fetched from that realm, so
+  /// these prefixes perform the token dance and retry once (see <see cref="RegistryTokenProvider"/>).
+  /// <para>Gated on a flag rather than done for every upstream: the realm is a URL the response itself
+  /// names, and a stray or forged challenge from a Maven/npm upstream must not be able to send us
+  /// fetching a token from a URL of its choosing.</para>
+  /// Purely about the upstream side. Our own inbound 401 needs no OCI special case, because it
+  /// advertises <c>Basic</c> alone for every prefix (see <see cref="AuthExtensions"/>).
+  /// </summary>
+  public bool Oci { get; init; }
 
   // First matching rule, or null when none matches.
   public CachingRule? Match(string path) => Rules.FirstOrDefault(rule => rule.IsMatch(path));
@@ -51,6 +64,18 @@ public class CachingRule
   /// dynamic, non-cacheable endpoints). <see cref="RefreshAfter"/> is ignored.
   /// </summary>
   public bool Redirect { get; init; }
+
+  /// <summary>
+  /// When true the endpoint is content-negotiated: the client's <c>Accept</c> is forwarded upstream and
+  /// folded into the cache key, so representations of one URL are cached separately.
+  /// <para>Both halves are required for OCI manifests. Without a forwarded <c>Accept</c> a registry
+  /// answers with the legacy schema1 manifest, which modern clients reject; and since the key is
+  /// otherwise the path alone (see <c>CacheFileProvider.ManglePath</c>), a client that asked for a
+  /// single-arch manifest could be served an image index cached for another client, or vice versa.</para>
+  /// Off by default: for an endpoint that ignores <c>Accept</c> the extra key dimension would only
+  /// fragment the cache once clients differ in the header they happen to send.
+  /// </summary>
+  public bool VaryByAccept { get; init; }
 
   // Compiled lazily and cached; warmed up by CachingProfile.Compile at startup. RegexOptions.Compiled
   // matches the other request-path regexes in this codebase (see RemoteProxy).

@@ -46,6 +46,18 @@ public record UpstreamAuth
   public string? PrivateKey { get; init; }
   public string GitHubApiBaseUrl { get; init; } = "https://api.github.com";
 
+  /// <summary>
+  /// Extra token-endpoint URL prefixes this entry's credentials may be sent to, for an OCI upstream that
+  /// issues its <c>WWW-Authenticate</c> challenge naming a realm on a different host (see
+  /// <see cref="RegistryTokenProvider"/>). A realm on the upstream's own host is always allowed and needs
+  /// no entry here.
+  /// <para>An allowlist because the realm is a URL chosen by the response we are authenticating to: with
+  /// no match the token is requested <b>anonymously</b> instead, so a public mirror needs no configuration
+  /// and a spoofed or compromised upstream cannot redirect a service account to a collector of its
+  /// choosing. Matched by literal, case-insensitive prefix, so include the scheme and a trailing slash.</para>
+  /// </summary>
+  public string[] TokenRealms { get; init; } = [];
+
   // True when this entry uses GitHub App auth (a private key is configured); ClientId then acts as the
   // JWT issuer rather than an OAuth client id.
   public bool IsGitHubApp => !string.IsNullOrEmpty(PrivateKey);

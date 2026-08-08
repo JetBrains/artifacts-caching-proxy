@@ -93,4 +93,88 @@ public class CachingProfileTest
     Assert.NotNull(security);
     Assert.True(security!.Redirect);
   }
+
+  [Fact]
+  public void Docker_Profile_Rules_Resolve_By_Endpoint_Kind()
+  {
+    // Mirrors the shipped docker profile ordering (appsettings.json). Digest-addressed content is
+    // immutable, tag-addressed content is not, and _catalog is a dynamic listing.
+    var profile = DockerProfile();
+
+    // A digest-addressed blob is content-addressed: eternal, and no negotiation (a layer is bytes).
+    var blob = profile.Match("/v2/docker-hub/library/ubuntu/blobs/sha256:" + new string('a', 64));
+    Assert.NotNull(blob);
+    Assert.Null(blob!.RefreshAfter);
+    Assert.False(blob.Redirect);
+    Assert.False(blob.VaryByAccept);
+
+    // A digest-addressed manifest is equally immutable, but still negotiated: one digest can be served
+    // as more than one media type, and a client rejects a schema it did not ask for.
+    var byDigest = profile.Match("/v2/docker-hub/library/ubuntu/manifests/sha256:" + new string('b', 64));
+    Assert.NotNull(byDigest);
+    Assert.Null(byDigest!.RefreshAfter);
+    Assert.True(byDigest.VaryByAccept);
+
+    // A tag moves, so it revalidates on a short window - and negotiates.
+    var byTag = profile.Match("/v2/docker-hub/library/ubuntu/manifests/24.04");
+    Assert.NotNull(byTag);
+    Assert.Equal(TimeSpan.FromMinutes(5), byTag!.RefreshAfter);
+    Assert.True(byTag.VaryByAccept);
+
+    // Tag lists and referrers are mutable but not negotiated.
+    var tags = profile.Match("/v2/docker-hub/library/ubuntu/tags/list");
+    Assert.NotNull(tags);
+    Assert.Equal(TimeSpan.FromMinutes(5), tags!.RefreshAfter);
+    Assert.False(tags.VaryByAccept);
+
+    var referrers = profile.Match("/v2/docker-hub/library/ubuntu/referrers/sha256:" + new string('c', 64));
+    Assert.NotNull(referrers);
+    Assert.Equal(TimeSpan.FromMinutes(5), referrers!.RefreshAfter);
+
+    // The registry-wide listing is dynamic.
+    var catalog = profile.Match("/v2/docker-hub/_catalog");
+    Assert.NotNull(catalog);
+    Assert.True(catalog!.Redirect);
+
+    // An unrecognised endpoint hits the catch-all: a short window, never a redirect, so it is never
+    // bounced to an origin the client has no credentials for.
+    var unknown = profile.Match("/v2/docker-hub/library/ubuntu/something-new");
+    Assert.NotNull(unknown);
+    Assert.Equal(TimeSpan.FromMinutes(5), unknown!.RefreshAfter);
+    Assert.False(unknown.Redirect);
+  }
+
+  [Fact]
+  public void Docker_Digest_Rules_Reject_Malformed_Digests()
+  {
+    // The eternal rules must not swallow a tag that merely looks digest-ish: caching a mutable
+    // reference forever is the one mistake there is no recovering from short of a cache wipe.
+    var profile = DockerProfile();
+
+    // Too short for a digest hex.
+    var shortHex = profile.Match("/v2/docker-hub/library/ubuntu/manifests/sha256:abc123");
+    Assert.NotNull(shortHex);
+    Assert.Equal(TimeSpan.FromMinutes(5), shortHex!.RefreshAfter);
+
+    // Trailing junk after the hex: not the whole reference, so not content-addressed.
+    var trailing = profile.Match("/v2/docker-hub/library/ubuntu/manifests/sha256:" + new string('a', 64) + "-latest");
+    Assert.NotNull(trailing);
+    Assert.Equal(TimeSpan.FromMinutes(5), trailing!.RefreshAfter);
+  }
+
+  // The shipped docker profile, kept in the same order as CachingProxy/appsettings.json.
+  private static CachingProfile DockerProfile() => new()
+  {
+    Oci = true,
+    Rules =
+    [
+      new CachingRule { Pattern = "/blobs/[a-z0-9]+(?:[+._-][a-z0-9]+)*:[0-9a-fA-F]{32,}$" },
+      new CachingRule { Pattern = "/manifests/[a-z0-9]+(?:[+._-][a-z0-9]+)*:[0-9a-fA-F]{32,}$", VaryByAccept = true },
+      new CachingRule { Pattern = "/manifests/", RefreshAfter = TimeSpan.FromMinutes(5), VaryByAccept = true },
+      new CachingRule { Pattern = "/tags/list", RefreshAfter = TimeSpan.FromMinutes(5) },
+      new CachingRule { Pattern = "/referrers/", RefreshAfter = TimeSpan.FromMinutes(5) },
+      new CachingRule { Pattern = "/_catalog", Redirect = true },
+      new CachingRule { Pattern = ".", RefreshAfter = TimeSpan.FromMinutes(5) },
+    ]
+  };
 }

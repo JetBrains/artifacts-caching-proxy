@@ -82,7 +82,9 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
     if (rule?.RefreshAfter is { } window)
       context.Items[CachingProxyConstants.RefreshAfterItemKey] = window;
 
-    var s3Key = upstreamUri.ManglePath();
+    // A content-negotiated endpoint keeps one object per requested representation (see GetCacheVariant),
+    // so the variant is folded into the object key — and thereby into the in-memory keys derived from it.
+    var s3Key = upstreamUri.ManglePath(RemoteProxy.GetCacheVariant(context, rule));
 
     // A HEAD is always answered from memory with the object's metadata (never redirected), and a
     // redirect is therefore produced only for a GET. So the verb-specific key holds, per verb, a
@@ -146,7 +148,8 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
               DateTimeOffset.TryParse(s3Object.Metadata[CreatedAtMetadataKey], CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var createdAt) &&
               timeProvider.GetUtcNow() - createdAt > refreshAfter)
           {
-            var result = await remoteProxy.RevalidateAsync(context, upstreamUri, s3Object.ETag, createdAt, remoteServer.Auth, context.RequestAborted);
+            var result = await remoteProxy.RevalidateAsync(context, upstreamUri, s3Object.ETag, createdAt,
+              remoteServer.Auth, rule, remoteServer.Profile, context.RequestAborted);
             switch (result.Outcome)
             {
               case RevalidationOutcome.Replaced:
@@ -226,7 +229,8 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
         catch (AmazonServiceException ex) when (ex.StatusCode is HttpStatusCode.NotFound) { }
       }
 
-      using var response = await remoteProxy.ProcessAsync(context, s3Key, remoteServer.CacheDuration, upstreamUri, auth: remoteServer.Auth, rule: rule);
+      using var response = await remoteProxy.ProcessAsync(context, s3Key, remoteServer.CacheDuration, upstreamUri,
+        auth: remoteServer.Auth, rule: rule, profile: remoteServer.Profile);
 
       // A non-null response is a GET MISS body for us to stream and persist; otherwise it is handled.
       if (response == null) return;

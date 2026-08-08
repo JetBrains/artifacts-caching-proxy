@@ -90,6 +90,11 @@ public static class AuthExtensions
     services.AddSingleton<GitHubAppInstallationTokenProvider>();
     services.AddSingleton<IUpstreamAuthorizationProvider, UpstreamAuthorizationProvider>();
 
+    // The OCI registry token dance. Not driven by UpstreamAuth entries at all — a registry demands a token
+    // for anonymous pulls too — so it is registered unconditionally and engages only for prefixes whose
+    // profile sets Oci.
+    services.AddSingleton<RegistryTokenProvider>();
+
     return services;
   }
 

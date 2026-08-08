@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using Xunit;
 
 namespace JetBrains.CachingProxy.Tests;
@@ -52,6 +53,42 @@ public class CacheFileProviderTest
     var plain = ourServer.GetUpstreamUri("a.jar").GetFutureCacheFileLocation();
     var gzip = ourServer.GetUpstreamUri("a.jar").GetFutureCacheFileLocation("gzip");
     Assert.Equal(plain + "-gzip-Ege4dHyCEA7IM", gzip);
+  }
+
+  [Fact]
+  public void ManglePath_AcceptVariantIsADistinctEntry()
+  {
+    // A content-negotiated endpoint keeps one entry per requested representation. Two different
+    // representations must not share a cache file, and neither may collide with the path-only entry -
+    // including the empty variant a client that sent no Accept produces.
+    var uri = ourServer.GetUpstreamUri("v2/testimage/manifests/24.04");
+    var noVariant = uri.GetFutureCacheFileLocation();
+    var index = uri.GetFutureCacheFileLocation(variant: "application/vnd.oci.image.index.v1+json");
+    var manifest = uri.GetFutureCacheFileLocation(variant: "application/vnd.oci.image.manifest.v1+json");
+    var empty = uri.GetFutureCacheFileLocation(variant: "");
+
+    Assert.Equal(4, new HashSet<string> { noVariant, index, manifest, empty }.Count);
+  }
+
+  [Fact]
+  public void ManglePath_SameVariantIsTheSameEntry()
+  {
+    var uri = ourServer.GetUpstreamUri("v2/testimage/manifests/24.04");
+    Assert.Equal(
+      uri.GetFutureCacheFileLocation(variant: "application/vnd.oci.image.index.v1+json"),
+      uri.GetFutureCacheFileLocation(variant: "application/vnd.oci.image.index.v1+json"));
+  }
+
+  [Fact]
+  public void ManglePath_VariantComposesWithContentEncoding()
+  {
+    // Both dimensions have to reach the file name: a gzip copy of one representation is not a copy of
+    // another, and the encoding suffix must still be recognisable.
+    var uri = ourServer.GetUpstreamUri("v2/testimage/manifests/24.04");
+    const string variant = "application/vnd.oci.image.index.v1+json";
+    Assert.Equal(
+      uri.GetFutureCacheFileLocation(variant: variant) + "-gzip-Ege4dHyCEA7IM",
+      uri.GetFutureCacheFileLocation("gzip", variant));
   }
 
   [Fact]

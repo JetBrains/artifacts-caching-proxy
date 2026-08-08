@@ -74,6 +74,24 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
             new CachingRule { Pattern = ".", RefreshAfter = TimeSpan.FromHours(1) },
           ]
         },
+        // The docker profile, in the shipped order (appsettings.json): digest-addressed blobs and
+        // manifests are content-addressed and cached forever, tag-addressed content revalidates on a
+        // short window, _catalog is a dynamic listing. Oci makes the prefix speak the registry token
+        // dance upstream.
+        ["docker"] = new()
+        {
+          Oci = true,
+          Rules =
+          [
+            new CachingRule { Pattern = @"/blobs/[a-z0-9]+(?:[+._-][a-z0-9]+)*:[0-9a-fA-F]{32,}$" },
+            new CachingRule { Pattern = @"/manifests/[a-z0-9]+(?:[+._-][a-z0-9]+)*:[0-9a-fA-F]{32,}$", VaryByAccept = true },
+            new CachingRule { Pattern = "/manifests/", RefreshAfter = TimeSpan.FromMinutes(5), VaryByAccept = true },
+            new CachingRule { Pattern = "/tags/list", RefreshAfter = TimeSpan.FromMinutes(5) },
+            new CachingRule { Pattern = "/referrers/", RefreshAfter = TimeSpan.FromMinutes(5) },
+            new CachingRule { Pattern = "/_catalog", Redirect = true },
+            new CachingRule { Pattern = ".", RefreshAfter = TimeSpan.FromMinutes(5) },
+          ]
+        },
       },
       Prefixes =
       [
@@ -90,6 +108,9 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
         new CachingProxyPrefix($"/real={upstreamServer.Url}", Profile: "maven"),
         new CachingProxyPrefix($"/real-redirect={upstreamServer.Url}", Profile: "redirect-all"),
         new CachingProxyPrefix($"/real-npm={upstreamServer.Url}", Profile: "npm"),
+        // An OCI prefix carries the "/v2" on both sides, exactly as config-gen emits it: the client
+        // inserts "/v2/" after the host itself, so the alias is "/v2/<name>" and the origin ends in /v2.
+        new CachingProxyPrefix($"/v2/real-docker={upstreamServer.Url}v2", Profile: "docker"),
         new CachingProxyPrefix($"/real-custom-ttl={upstreamServer.Url}", new CacheDuration
         {
           [HttpStatusCode.OK] = TimeSpan.FromMinutes(30),
@@ -634,6 +655,149 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
     // The bare form redirects to it, as a real registry does, and clients follow that.
     await AssertGetResponse("/v2", HttpStatusCode.RedirectKeepVerb,
       (message, bytes) => Assert.Equal("/v2/", message.Headers.Location?.ToString()));
+  }
+
+  [Fact]
+  public async Task Oci_Manifest_By_Digest_Is_Cached_Eternally()
+  {
+    // A digest reference is the shape that used to be rejected outright: ':' was not in the allowed path
+    // characters, so every layer and every resolved manifest came back 400.
+    var path = $"/v2/real-docker/testimage/manifests/{UpstreamTestServer.ManifestDigest}";
+
+    // Content-addressed, so the eternal (no window) rule applies and the digest header - which a client
+    // verifies the body against - has to survive the round trip through the cache.
+    foreach (var expectedStatus in new[] { CachingProxyStatus.MISS, CachingProxyStatus.HIT })
+    {
+      await AssertGetResponse(path, HttpStatusCode.OK,
+        (message, bytes) =>
+        {
+          AssertStatusHeader(message, expectedStatus);
+          Assert.Equal("public, max-age=31536000", message.Headers.CacheControl?.ToString());
+          Assert.Equal(UpstreamTestServer.ManifestDigest,
+            message.Headers.GetValues(CachedResponse.DockerContentDigestHeader).Single());
+          Assert.Equal(UpstreamTestServer.ManifestMediaType, message.Content.Headers.ContentType?.ToString());
+          Assert.Equal("{\"layers\":[]}", Encoding.UTF8.GetString(bytes));
+        });
+    }
+
+    // The colon reached the upstream verbatim rather than percent-encoded: a registry matches the
+    // reference literally.
+    Assert.Equal($"/v2/testimage/manifests/{UpstreamTestServer.ManifestDigest}", myUpstreamServer.LastRawTarget);
+  }
+
+  [Fact]
+  public async Task Oci_Blob_Is_Cached_Eternally()
+  {
+    var path = $"/v2/real-docker/testimage/blobs/{UpstreamTestServer.BlobDigest}";
+    var before = myUpstreamServer.BlobRequestCount;
+
+    foreach (var expectedStatus in new[] { CachingProxyStatus.MISS, CachingProxyStatus.HIT })
+    {
+      await AssertGetResponse(path, HttpStatusCode.OK,
+        (message, bytes) =>
+        {
+          AssertStatusHeader(message, expectedStatus);
+          Assert.Equal("public, max-age=31536000", message.Headers.CacheControl?.ToString());
+          Assert.Equal(UpstreamTestServer.BlobDigest,
+            message.Headers.GetValues(CachedResponse.DockerContentDigestHeader).Single());
+          Assert.Equal("blob-content", Encoding.UTF8.GetString(bytes));
+        });
+    }
+
+    // A layer is what the cache exists for: fetched once, served from the copy afterwards.
+    Assert.Equal(before + 1, myUpstreamServer.BlobRequestCount);
+  }
+
+  [Fact]
+  public async Task Oci_Manifest_Representations_Are_Cached_Separately()
+  {
+    // One tag, two representations. Without Accept in the cache key the first client's choice would be
+    // served to every later one, so a client that asked for a single-arch manifest gets an image index
+    // (or the reverse) and rejects it.
+    const string indexAccept = UpstreamTestServer.IndexMediaType;
+    const string manifestAccept = UpstreamTestServer.ManifestMediaType;
+    const string path = "/v2/real-docker/testimage/manifests/24.04";
+
+    myUpstreamServer.ManifestAcceptHeaders.Clear();
+    var before = myUpstreamServer.ManifestByTagRequestCount;
+
+    foreach (var (accept, expectedType, expectedBody) in new[]
+             {
+               (indexAccept, UpstreamTestServer.IndexMediaType, "{\"manifests\":[]}"),
+               (manifestAccept, UpstreamTestServer.ManifestMediaType, "{\"layers\":[]}"),
+             })
+    {
+      // Each representation misses on its first request and hits on its second, independently of the
+      // other: two entries, not one shared one.
+      foreach (var expectedStatus in new[] { CachingProxyStatus.MISS, CachingProxyStatus.HIT })
+      {
+        await AssertGetResponse(path, HttpStatusCode.OK,
+          (message, bytes) =>
+          {
+            AssertStatusHeader(message, expectedStatus);
+            Assert.Equal(expectedType, message.Content.Headers.ContentType?.ToString());
+            Assert.Equal(expectedBody, Encoding.UTF8.GetString(bytes));
+          },
+          accept);
+      }
+    }
+
+    // Two upstream fetches for four client requests, and each carried the client's own Accept - without
+    // it Docker Hub answers with the legacy schema1 manifest that modern clients refuse.
+    Assert.Equal(before + 2, myUpstreamServer.ManifestByTagRequestCount);
+    Assert.Equal(new[] { indexAccept, manifestAccept }, myUpstreamServer.ManifestAcceptHeaders);
+  }
+
+  [Fact]
+  public async Task Oci_Catalog_Is_Redirected()
+  {
+    // A registry-wide listing is dynamic, so it is bounced rather than cached.
+    await AssertGetResponse("/v2/real-docker/_catalog", HttpStatusCode.RedirectKeepVerb,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.ALWAYS_REDIRECT);
+        Assert.Equal($"{myUpstreamServer.Url}v2/_catalog", message.Headers.Location?.ToString());
+      });
+  }
+
+  [Fact]
+  public async Task Oci_Registry_Token_Is_Minted_Once_And_Reused()
+  {
+    // A registry answers even an anonymous pull with 401 + a Bearer challenge and expects a token
+    // fetched from the realm it names. Nothing about that is configured here: the challenge drives it.
+    myUpstreamServer.RequireRegistryToken = true;
+    var tokensBefore = myUpstreamServer.TokenRequestCount;
+    try
+    {
+      await AssertGetResponse("/v2/real-docker/testimage/manifests/24.04", HttpStatusCode.OK,
+        (message, bytes) =>
+        {
+          AssertStatusHeader(message, CachingProxyStatus.MISS);
+          Assert.Equal("{\"manifests\":[]}", Encoding.UTF8.GetString(bytes));
+        },
+        UpstreamTestServer.IndexMediaType);
+
+      // A different resource in the same repository: the realm is remembered and the token is cached
+      // under its scope, so it is attached up front - no second 401, no second mint.
+      await AssertGetResponse($"/v2/real-docker/testimage/blobs/{UpstreamTestServer.BlobDigest}",
+        HttpStatusCode.OK,
+        (message, bytes) =>
+        {
+          AssertStatusHeader(message, CachingProxyStatus.MISS);
+          Assert.Equal("blob-content", Encoding.UTF8.GetString(bytes));
+        });
+
+      Assert.Equal(tokensBefore + 1, myUpstreamServer.TokenRequestCount);
+
+      // The mint went out anonymously. No UpstreamAuth matches this prefix, and a client's own
+      // credentials are never forwarded to an upstream or to its token endpoint: each upstream is
+      // reached under its own service account or not at all.
+      Assert.Equal("", myUpstreamServer.LastTokenRequestAuthorization);
+    }
+    finally
+    {
+      myUpstreamServer.RequireRegistryToken = false;
+    }
   }
 
   [Fact]
@@ -1258,10 +1422,13 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
     Assert.Empty(CacheFiles()); // the stale copy was removed
   }
 
-  private async Task AssertGetResponse(string url, HttpStatusCode expectedCode, Action<HttpResponseMessage, byte[]> assertions)
+  private async Task AssertGetResponse(string url, HttpStatusCode expectedCode,
+    Action<HttpResponseMessage, byte[]> assertions, string? accept = null)
   {
-    myOutput.WriteLine("*** GET " + url);
-    using var response = await myServer.CreateRequest(url).GetAsync();
+    myOutput.WriteLine($"*** GET {url}{(accept == null ? "" : $" (Accept: {accept})")}");
+    var request = myServer.CreateRequest(url);
+    if (accept != null) request.AddHeader("Accept", accept);
+    using var response = await request.GetAsync();
     var bytes = await response.Content.ReadAsByteArrayAsync();
 
     myOutput.WriteLine(response.ToString());
