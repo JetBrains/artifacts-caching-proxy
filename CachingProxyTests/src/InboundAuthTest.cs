@@ -85,17 +85,19 @@ public class InboundAuthTest : IAsyncLifetime
   }
 
   [Fact]
-  public async Task Protected_Prefix_Without_Token_Challenges_Bearer_And_Basic()
+  public async Task Protected_Prefix_Without_Token_Challenges_Basic_Only()
   {
     // Basic-only clients (Maven/Gradle/npm) need a Basic challenge to prompt for / send the JWT as the
-    // password; the JwtBearer default Bearer challenge is advertised alongside it, not replaced.
+    // password. Bearer is deliberately not advertised even though a Bearer token is still accepted: an
+    // OCI client reads a Bearer challenge as "fetch a token from realm", and the realm here is an
+    // application name rather than a token endpoint, so it would abort instead of falling back to Basic.
     using var client = myProxyHost!.GetTestServer().CreateClient();
 
     var response = await client.GetAsync("/private/one.jar");
 
     Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
-    Assert.Contains(response.Headers.WwwAuthenticate, h => h.Scheme == "Bearer");
-    var basic = Assert.Single(response.Headers.WwwAuthenticate, h => h.Scheme == "Basic");
+    var basic = Assert.Single(response.Headers.WwwAuthenticate);
+    Assert.Equal("Basic", basic.Scheme);
     Assert.Equal("realm=\"CachingProxyTests\"", basic.Parameter);
   }
 

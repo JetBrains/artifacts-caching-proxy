@@ -174,8 +174,12 @@ public static class AuthExtensions
     var authenticationBuilder = services.AddAuthentication(
       redirectSignature != null ? CombinedInboundScheme : JwtBearerDefaults.AuthenticationScheme);
 
-    // Advertised on 401s so Basic-only clients (Maven/Gradle/npm) prompt for / send the JWT as the
-    // Basic password. Appended alongside the JwtBearer "Bearer" challenge, and standalone in the deny path.
+    // The only challenge we advertise on a 401, so clients prompt for / send the JWT as the Basic
+    // password. We do not advertise Bearer even though we accept it: our realm is an application name
+    // rather than a token endpoint, and an OCI client reads a Bearer challenge as "fetch a token from
+    // realm" (the registry token dance) and fails `docker pull` outright instead of retrying with the
+    // `docker login` credentials. Nothing is lost — clients that authenticate with a bearer token
+    // (npm, CI) send it unprompted.
     var basicChallenge = $"Basic realm=\"{hostEnvironment.ApplicationName}\"";
 
     if (redirectSignature != null)
@@ -220,13 +224,15 @@ public static class AuthExtensions
               context.Token = GetTokenFromBasicPassword(context.Request.Headers.Authorization.ToString());
             return Task.CompletedTask;
           },
-          // Advertise Basic in addition to the default Bearer challenge. We deliberately do NOT call
-          // context.HandleResponse(), so the base JwtBearerHandler still appends its "Bearer" value after
-          // this returns; the two WWW-Authenticate values coexist. Basic lets Basic-only clients
-          // (Maven/Gradle/npm) prompt for / send the JWT as the Basic password.
+          // Challenge with Basic *instead of* the handler's default Bearer (see basicChallenge above for
+          // why Bearer is not advertised). HandleResponse() is what suppresses it: the base
+          // JwtBearerHandler returns early when the event is handled, so it also stops setting the status
+          // code and we set 401 ourselves.
           OnChallenge = context =>
           {
+            context.Response.StatusCode = StatusCodes.Status401Unauthorized;
             context.Response.Headers.Append(HeaderNames.WWWAuthenticate, basicChallenge);
+            context.HandleResponse();
             return Task.CompletedTask;
           },
         };
