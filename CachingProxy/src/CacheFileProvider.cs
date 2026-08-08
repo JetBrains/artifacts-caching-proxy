@@ -1,34 +1,125 @@
 using System;
 using System.Buffers;
+using System.Globalization;
 using System.IO;
+using System.Linq;
+using System.Net.Http;
 using System.Security.Cryptography;
 using System.Text;
+using Microsoft.Net.Http.Headers;
 
 namespace JetBrains.CachingProxy;
+
+/// <summary>
+/// What a stored cache file needs beside its bytes: when we stored it — the anchor of its freshness
+/// window, see <see cref="CachingRule.RefreshAfter"/> — plus the parts of the upstream's response head
+/// that the bytes alone cannot reproduce.
+/// <para>All of it lives in one small companion text file per cache file (see
+/// <see cref="CacheFileProvider.GetMetadataPath"/>), so a stored copy costs one write to record and one
+/// read to replay however many values it carries. That set mirrors what the S3 backend reads back off
+/// the object and its user metadata (see the <c>GetObjectResponse</c> constructor of
+/// <see cref="CachedResponse"/>), so a HIT is served with the same head whichever backend holds it.</para>
+/// </summary>
+public sealed record CacheEntryMetadata(
+  DateTime StoredAtUtc,
+  string? ContentType = null,
+  string? ETag = null,
+  DateTimeOffset? LastModified = null,
+  string? Digest = null)
+{
+  // Our own field, so it gets a name no HTTP header has.
+  private const string StoredAtField = "StoredAt";
+
+  /// <summary>The metadata to record for a body just fetched from the upstream.</summary>
+  public static CacheEntryMetadata FromResponse(DateTime storedAtUtc, HttpResponseMessage response) => new(
+    storedAtUtc,
+    response.Content.Headers.ContentType?.ToString(),
+    response.Headers.ETag?.ToString(),
+    response.Content.Headers.LastModified,
+    response.Headers.TryGetValues(CachedResponse.DockerContentDigestHeader, out var digest) ? digest.FirstOrDefault() : null);
+
+  /// <summary>One <c>Name: value</c> per line; absent values are omitted.</summary>
+  public string Format()
+  {
+    var text = new StringBuilder();
+    Append(text, StoredAtField, StoredAtUtc.ToString("O", CultureInfo.InvariantCulture));
+    Append(text, HeaderNames.ContentType, ContentType);
+    Append(text, HeaderNames.ETag, ETag);
+    Append(text, HeaderNames.LastModified, LastModified?.ToString("R", CultureInfo.InvariantCulture));
+    Append(text, CachedResponse.DockerContentDigestHeader, Digest);
+    return text.ToString();
+  }
+
+  // HTTP header parsing rejects a newline inside a value, so one cannot reach here from an upstream;
+  // stripped anyway so a malformed value can only truncate itself rather than the rest of the file.
+  private static void Append(StringBuilder text, string name, string? value)
+  {
+    if (string.IsNullOrEmpty(value)) return;
+    text.Append(name).Append(": ").Append(value.Replace('\r', ' ').Replace('\n', ' ')).Append('\n');
+  }
+
+  /// <summary>
+  /// Null when <paramref name="text"/> carries no stored date: an empty or truncated companion file, or
+  /// one written in a shape this version does not recognise. The caller treats that as "no metadata",
+  /// which costs one refetch and heals the entry. Unknown field names are ignored instead, so a file
+  /// written by another version still parses as far as the two agree.
+  /// </summary>
+  public static CacheEntryMetadata? TryParse(string text)
+  {
+    DateTime? storedAt = null;
+    string? contentType = null, etag = null, digest = null;
+    DateTimeOffset? lastModified = null;
+
+    foreach (var line in text.Split('\n'))
+    {
+      // The first ':' is the separator; every value that has one of its own (a date, a digest) keeps it.
+      var colon = line.IndexOf(':');
+      if (colon < 0) continue;
+
+      var name = line[..colon].Trim();
+      var value = line[(colon + 1)..].Trim();
+      if (value.Length == 0) continue;
+
+      if (Is(name, StoredAtField))
+        storedAt = DateTime.TryParseExact(value, "O", CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var parsed) ?
+          parsed.ToUniversalTime() : null;
+      else if (Is(name, HeaderNames.ContentType)) contentType = value;
+      else if (Is(name, HeaderNames.ETag)) etag = value;
+      else if (Is(name, HeaderNames.LastModified))
+        lastModified = DateTimeOffset.TryParseExact(value, "R", CultureInfo.InvariantCulture, DateTimeStyles.None, out var parsed) ?
+          parsed : null;
+      else if (Is(name, CachedResponse.DockerContentDigestHeader)) digest = value;
+    }
+
+    return storedAt is { } when ? new CacheEntryMetadata(when, contentType, etag, lastModified, digest) : null;
+  }
+
+  private static bool Is(string name, string field) => name.Equals(field, StringComparison.OrdinalIgnoreCase);
+}
 
 public static class CacheFileProvider
 {
   private static readonly string ourGzippedContentSuffix = "-gzip-Ege4dHyCEA7IM";
 
-  // Suffix of the companion "stamp" file whose LastWriteTime records when we stored a cache file —
-  // the anchor of its freshness window (CachingRule.RefreshAfter). Obfuscated like
+  // Suffix of the companion metadata file (see CacheEntryMetadata). Obfuscated like
   // ourGzippedContentSuffix so it can never collide with a mangled artifact path.
-  private static readonly string ourStoredDateSuffix = "-stamp-Kx2QwRm9Xb4tP";
+  private static readonly string ourMetadataSuffix = "-meta-Kx2QwRm9Xb4tP";
 
   /// <summary>
-  /// The stamp file recording when <paramref name="cacheFilePath"/> was stored. The date cannot live
-  /// on the cache file itself: its LastWriteTime is deliberately the upstream's <c>Last-Modified</c>
-  /// (so the served header and the ETag stay stable), and its creation time is unusable on Linux,
-  /// where .NET reports <c>CreationTimeUtc</c> as <c>min(btime, mtime)</c> and cannot write btime at
-  /// all — a forward touch is silently dropped there.
+  /// The metadata file belonging to <paramref name="cacheFilePath"/>. A companion file rather than the
+  /// cache file's own attributes because a filesystem has nowhere to put a media type, an ETag or a
+  /// digest — and no usable slot for the stored date either: the file's LastWriteTime is deliberately
+  /// the upstream's <c>Last-Modified</c>, and its creation time is unusable on Linux, where .NET
+  /// reports <c>CreationTimeUtc</c> as <c>min(btime, mtime)</c> and cannot write btime at all, so a
+  /// forward touch is silently dropped there.
   /// </summary>
-  public static string GetStoredDateStampPath(string cacheFilePath) => cacheFilePath + ourStoredDateSuffix;
+  public static string GetMetadataPath(string cacheFilePath) => cacheFilePath + ourMetadataSuffix;
 
-  /// <summary>Whether <paramref name="path"/> is a stamp written by <see cref="GetStoredDateStampPath"/>.</summary>
-  public static bool IsStoredDateStamp(string path) => path.EndsWith(ourStoredDateSuffix, StringComparison.Ordinal);
+  /// <summary>Whether <paramref name="path"/> is a metadata file written for some cache file.</summary>
+  public static bool IsMetadata(string path) => path.EndsWith(ourMetadataSuffix, StringComparison.Ordinal);
 
-  /// <summary>The cache file a stamp belongs to. Only valid when <see cref="IsStoredDateStamp"/> holds.</summary>
-  public static string GetStampedCacheFilePath(string stampPath) => stampPath[..^ourStoredDateSuffix.Length];
+  /// <summary>The cache file metadata belongs to. Only valid when <see cref="IsMetadata"/> holds.</summary>
+  public static string GetMetadataOwnerPath(string metadataPath) => metadataPath[..^ourMetadataSuffix.Length];
 
   extension(Uri uri)
   {

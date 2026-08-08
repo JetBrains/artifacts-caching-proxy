@@ -10,9 +10,9 @@ using System.Net.Mime;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
-using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Logging;
+using Microsoft.Net.Http.Headers;
 
 namespace JetBrains.CachingProxy;
 
@@ -21,7 +21,6 @@ public class CachingProxy
 {
   private readonly RequestDelegate myRequestDelegate;
   private readonly ILogger<CachingProxy> myLogger;
-  private readonly IContentTypeProvider myContentTypeProvider;
   private readonly RemoteProxy myRemoteProxy;
   private readonly ResponseCache myResponseCache;
   private readonly TimeProvider myTimeProvider;
@@ -33,7 +32,6 @@ public class CachingProxy
     RequestDelegate requestDelegate,
     ILogger<CachingProxy> logger,
     CachingProxyConfig config,
-    IContentTypeProvider contentTypeProvider,
     RemoteProxy remoteProxy,
     ResponseCache responseCache,
     TimeProvider timeProvider)
@@ -51,7 +49,6 @@ public class CachingProxy
 
     myRequestDelegate = requestDelegate;
     myLogger = logger;
-    myContentTypeProvider = contentTypeProvider;
     myRemoteProxy = remoteProxy;
     myResponseCache = responseCache;
     myTimeProvider = timeProvider;
@@ -69,9 +66,6 @@ public class CachingProxy
     if (upstreamUri == null)
       return;
 
-    var contentType = myContentTypeProvider.TryGetContentType(remainingPath ?? "", out var resolvedContentType) ?
-      resolvedContentType : MediaTypeNames.Application.Octet;
-
     // The caching-profile rule for this path decides how it is cached: a freshness window (revalidate
     // when older) or an always-redirect. A null rule (no profile / no match) means cache forever. The
     // freshness window is also advertised to the client as Cache-Control max-age (see
@@ -88,38 +82,38 @@ public class CachingProxy
         if (!cachedFile.Exists)
           continue;
 
+        // Everything needed to replay the stored bytes faithfully — the upstream's head and the date the
+        // window is anchored to — comes from one companion file. Without it there is no media type we
+        // could honestly serve the copy as (guessing one is what makes a registry client reject a
+        // manifest outright), so treat the entry as absent and let the request refetch and rewrite it.
+        if (ReadMetadata(cachedFile.FullName) is not { } metadata)
+          break;
+
         // Past its freshness window: revalidate against the upstream before serving (200 replaces,
-        // 304 keeps, 404 deletes, any other error serves the stale copy). When the rule sets no
-        // freshness window the stored copy is fresh forever, exactly as before — and costs no extra
-        // stat, since only a windowed rule reads the stamp.
-        if (rule?.RefreshAfter is { } refreshAfter)
+        // 304 keeps, 404 deletes, any other error serves the stale copy). With no window the stored
+        // copy is fresh forever.
+        if (rule?.RefreshAfter is { } refreshAfter && UtcNow - metadata.StoredAtUtc > refreshAfter)
         {
-          var storedDate = GetStoredDate(cachedFile.FullName);
-          // A missing stamp (a file cached before this proxy stamped them, or one dropped out of
-          // band) counts as stale: one conditional GET re-establishes the window, which is far
-          // cheaper than serving a copy of unbounded age.
-          if (storedDate == null || myTimeProvider.GetUtcNow().UtcDateTime - storedDate.Value > refreshAfter)
-          {
-            await RevalidateAndServeAsync(context, remoteServer, upstreamUri, contentType, contentEncoding, cachedFile, storedDate);
-            return;
-          }
+          await RevalidateAndServeAsync(context, remoteServer, upstreamUri, contentEncoding, cachedFile, metadata);
+          return;
         }
 
-        await ServeFileAsync(context, cachedFile, contentType, contentEncoding, CachingProxyStatus.HIT);
+        await ServeFileAsync(context, cachedFile, metadata, contentEncoding, CachingProxyStatus.HIT);
         return;
       }
 
       using var response = await myRemoteProxy.ProcessAsync(context, upstreamUri.ManglePath(),
-        remoteServer.CacheDuration, upstreamUri, contentType, remoteServer.Auth, rule);
+        remoteServer.CacheDuration, upstreamUri, remoteServer.Auth, rule);
 
       // A non-null response is a GET MISS body for us to stream and persist; otherwise it is handled.
       if (response == null) return;
 
       var storedPath = await DownloadToDiskAsync(context, response, upstreamUri);
-      // Anchor the freshness window at the moment we stored it, so the copy counts as fresh until the
-      // window elapses. Only windowed rules need a stamp, so artifacts cached forever get no extra file.
-      if (storedPath != null && rule?.RefreshAfter != null)
-        TouchStoredDate(storedPath);
+      if (storedPath == null) return;
+
+      // Unconditional, unlike the freshness stamp this replaced: a stored copy needs its head back
+      // whether or not its rule sets a window, and it is the same single write either way.
+      WriteMetadata(storedPath, CacheEntryMetadata.FromResponse(UtcNow, response));
     }
     catch (OperationCanceledException)
     {
@@ -130,36 +124,56 @@ public class CachingProxy
     }
   }
 
-  private async Task ServeFileAsync(HttpContext context, FileInfo cachedFile, string contentType, string? contentEncoding, CachingProxyStatus status)
+  // Replays the stored copy under the upstream's own head: its media type, its validators (so the
+  // client's conditional requests are answered against the upstream's ETag and Last-Modified rather than
+  // ones derived from the local file) and its Docker-Content-Digest, which an OCI client verifies the
+  // body against. Content-Length and range handling stay with the file, which is what actually ships.
+  private async Task ServeFileAsync(HttpContext context, FileInfo cachedFile, CacheEntryMetadata metadata,
+    string? contentEncoding, CachingProxyStatus status)
   {
     myRemoteProxy.SetStatusHeader(context, status);
     CachedResponse.SetCachingHeaderFor(context);
     if (contentEncoding != null)
       context.Response.Headers.ContentEncoding = contentEncoding;
+    if (metadata.Digest != null)
+      context.Response.Headers[CachedResponse.DockerContentDigestHeader] = metadata.Digest;
+
     await TypedResults
-      .PhysicalFile(cachedFile.FullName, contentType, enableRangeProcessing: true)
+      .PhysicalFile(cachedFile.FullName,
+        // Octet-stream only for an upstream that sent no media type at all, matching what MISS emitted.
+        metadata.ContentType ?? MediaTypeNames.Application.Octet,
+        lastModified: metadata.LastModified,
+        entityTag: ParseETag(metadata.ETag),
+        enableRangeProcessing: true)
       .ExecuteAsync(context);
   }
 
+  // Null for an upstream that sent no ETag, or one this framework will not parse — the served head then
+  // simply carries no ETag, exactly as before it was recorded.
+  private static EntityTagHeaderValue? ParseETag(string? etag) =>
+    etag != null && EntityTagHeaderValue.TryParse(etag, out var parsed) ? parsed : null;
+
   private async Task RevalidateAndServeAsync(HttpContext context, RemoteServers.RemoteServer remoteServer,
-    Uri upstreamUri, string contentType, string? contentEncoding, FileInfo cachedFile, DateTime? storedDate)
+    Uri upstreamUri, string? contentEncoding, FileInfo cachedFile, CacheEntryMetadata metadata)
   {
-    // Disk keeps no ETag, so revalidate with If-Modified-Since from the file's stored date (reset on
-    // each store/revalidation to restart the freshness window). A null stored date means we have no
-    // stamp to validate against, so the request goes out unconditionally and upstream answers with a
-    // full body (Replaced), which re-stamps the entry.
-    var result = await myRemoteProxy.RevalidateAsync(context, upstreamUri, etag: null, storedDate, remoteServer.Auth, context.RequestAborted);
+    // The conditional validators come from the entry's metadata. Last-Modified falls back to when we
+    // stored the copy for an upstream that sent none: that is never earlier than the upstream's own, so
+    // a resource changed since is still answered with a full body while an unchanged one still 304s.
+    var result = await myRemoteProxy.RevalidateAsync(context, upstreamUri, metadata.ETag,
+      metadata.LastModified ?? new DateTimeOffset(metadata.StoredAtUtc, TimeSpan.Zero),
+      remoteServer.Auth, context.RequestAborted);
 
     switch (result.Outcome)
     {
       case RevalidationOutcome.NotModified:
-        // Still valid: reset the stored date so the window restarts, then serve the existing copy.
-        TouchStoredDate(cachedFile.FullName);
-        await ServeFileAsync(context, cachedFile, contentType, contentEncoding, CachingProxyStatus.REVALIDATED);
+        // Still valid: restart the window, keeping the head the stored bytes were fetched under.
+        WriteMetadata(cachedFile.FullName, metadata with { StoredAtUtc = UtcNow });
+        await ServeFileAsync(context, cachedFile, metadata, contentEncoding, CachingProxyStatus.REVALIDATED);
         return;
 
       case RevalidationOutcome.Gone:
         // Removed upstream: drop both encoding variants and cache+serve the 404, matching a MISS 404.
+        // The 404 replaces any stored head under the same key, so nothing points at the deleted body.
         DeleteCachedVariants(upstreamUri);
         await myRemoteProxy.SetStatusAsync(context, CachingProxyStatus.NEGATIVE_MISS,
           await myResponseCache.PutStatusCode(upstreamUri.ManglePath(), HttpStatusCode.NotFound, remoteServer.CacheDuration, context.RequestAborted));
@@ -167,28 +181,29 @@ public class CachingProxy
 
       case RevalidationOutcome.UpstreamError:
         // Could not reach/validate the upstream: keep and serve the stale copy.
-        await ServeFileAsync(context, cachedFile, contentType, contentEncoding, CachingProxyStatus.STALE);
+        await ServeFileAsync(context, cachedFile, metadata, contentEncoding, CachingProxyStatus.STALE);
         return;
 
       case RevalidationOutcome.Replaced:
         using (var response = result.Response!)
         {
-          // Write the (revalidated) response head, then stream+persist the new body.
-          await myRemoteProxy.SetStatusAsync(context, CachingProxyStatus.REVALIDATED,
-            new CachedResponse(response) { Headers = { ContentType = contentType } });
+          // Write the (revalidated) response head, then stream+persist the new body. The head carries
+          // the upstream's own Content-Type, which CachedResponse already copied over — the same one
+          // recorded below, so this response and every later HIT agree.
+          await myRemoteProxy.SetStatusAsync(context, CachingProxyStatus.REVALIDATED, new CachedResponse(response));
 
           var newPath = await DownloadToDiskAsync(context, response, upstreamUri);
           if (newPath == null) return;
 
           // The new representation may use a different encoding (hence a different path) than the
-          // stale variant we matched; remove the now-orphaned old variant and its stamp.
+          // stale variant we matched; remove the now-orphaned old variant and its metadata.
           if (!string.Equals(newPath, cachedFile.FullName, StringComparison.Ordinal))
           {
             CatchSilently(() => { if (cachedFile.Exists) cachedFile.Delete(); });
-            DeleteStoredDate(cachedFile.FullName);
+            DeleteMetadata(cachedFile.FullName);
           }
 
-          TouchStoredDate(newPath);
+          WriteMetadata(newPath, CacheEntryMetadata.FromResponse(UtcNow, response));
         }
         return;
     }
@@ -246,39 +261,30 @@ public class CachingProxy
     }
   }
 
-  // When we stored a cache file, read from its companion stamp's LastWriteTime; null when unstamped.
-  // One extra stat, and only on paths whose rule sets a freshness window.
-  //
-  // The date deliberately lives beside the cache file rather than on it. The file's own LastWriteTime
-  // is the upstream's Last-Modified (see DownloadToDiskAsync), which must stay put so the served
-  // header and the ETag TypedResults.PhysicalFile derives from it do not churn on every revalidation.
-  // Its creation time cannot be used either: on Linux .NET reports CreationTimeUtc as
-  // min(btime, mtime) and has no way to write btime, so moving the stored date forward is silently
-  // dropped (the window never restarts) while the upstream Last-Modified sitting in mtime drags the
-  // reported creation time into the past (every entry born stale, revalidating on every request).
-  private DateTime? GetStoredDate(string cacheFilePath)
+  private DateTime UtcNow => myTimeProvider.GetUtcNow().UtcDateTime;
+
+  // What a stored copy needs to be replayed (see CacheEntryMetadata), or null when the companion file is
+  // missing or unreadable — the caller then treats the entry as absent and refetches, which rewrites it.
+  // One read, on the one path that has to hit the disk anyway.
+  private static CacheEntryMetadata? ReadMetadata(string cacheFilePath)
   {
-    var stamp = new FileInfo(CacheFileProvider.GetStoredDateStampPath(cacheFilePath));
-    return stamp.Exists ? stamp.LastWriteTimeUtc : null;
+    try
+    {
+      return CacheEntryMetadata.TryParse(File.ReadAllText(CacheFileProvider.GetMetadataPath(cacheFilePath)));
+    }
+    catch (IOException) { return null; }
+    catch (UnauthorizedAccessException) { return null; }
   }
 
-  // Records "stored now" for a cache file, restarting its freshness window. The stamp is empty: only
-  // its LastWriteTime carries the date, so reading it back later costs a stat and never an open.
-  private void TouchStoredDate(string cacheFilePath) =>
-    CatchSilently(() =>
-    {
-      var stamp = CacheFileProvider.GetStoredDateStampPath(cacheFilePath);
-      if (!File.Exists(stamp))
-        File.Create(stamp).Dispose();
-      File.SetLastWriteTimeUtc(stamp, myTimeProvider.GetUtcNow().UtcDateTime);
-    });
+  private void WriteMetadata(string cacheFilePath, CacheEntryMetadata metadata) =>
+    CatchSilently(() => File.WriteAllText(CacheFileProvider.GetMetadataPath(cacheFilePath), metadata.Format()));
 
-  // A stamp is meaningless without its cache file, so the two are always dropped together.
-  private void DeleteStoredDate(string cacheFilePath) =>
+  // Metadata is meaningless without its cache file, so the two are always dropped together.
+  private void DeleteMetadata(string cacheFilePath) =>
     CatchSilently(() =>
     {
-      var stamp = CacheFileProvider.GetStoredDateStampPath(cacheFilePath);
-      if (File.Exists(stamp)) File.Delete(stamp);
+      var path = CacheFileProvider.GetMetadataPath(cacheFilePath);
+      if (File.Exists(path)) File.Delete(path);
     });
 
   private void DeleteCachedVariants(Uri upstreamUri)
@@ -287,7 +293,7 @@ public class CachingProxy
     {
       var path = Path.Combine(myLocalCachePath, upstreamUri.GetFutureCacheFileLocation(encoding));
       CatchSilently(() => { if (File.Exists(path)) File.Delete(path); });
-      DeleteStoredDate(path);
+      DeleteMetadata(path);
     }
   }
 

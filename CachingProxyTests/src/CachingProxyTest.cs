@@ -637,58 +637,54 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
   }
 
   [Fact]
-  public async Task Content_Type_Is_Produced_From_Extension()
+  public async Task Content_Type_Is_The_Upstreams_Own()
   {
-    // The upstream sends text/html for a .jar, but the proxy derives the Content-Type from the file
-    // extension. The type is therefore application/java-archive on both MISS and HIT, so a response
-    // streamed on a MISS and the same artifact served from disk on a HIT agree.
-    await AssertGetResponse("/real/wrong-content-type.jar", HttpStatusCode.OK,
-      (message, bytes) =>
-      {
-        AssertStatusHeader(message, CachingProxyStatus.MISS);
-        Assert.Equal("application/java-archive", message.Content.Headers.ContentType?.ToString());
-        Assert.Equal("some html", Encoding.UTF8.GetString(bytes));
-      });
-
-    await AssertGetResponse("/real/wrong-content-type.jar", HttpStatusCode.OK,
-      (message, bytes) =>
-      {
-        AssertStatusHeader(message, CachingProxyStatus.HIT);
-        Assert.Equal("application/java-archive", message.Content.Headers.ContentType?.ToString());
-        Assert.Equal("some html", Encoding.UTF8.GetString(bytes));
-      });
+    // The upstream sends text/html for a .jar and that is relayed verbatim: the type is the upstream's
+    // own, never derived from the path's extension. Deliberate — an OCI manifest path has no usable
+    // extension and its media type is what the client reads the manifest schema off. It also matches
+    // what the S3 backend has always done, so both backends agree.
+    //
+    // MISS streams it off the response; HIT reads it back from the entry's metadata; both must agree.
+    foreach (var expectedStatus in new[] { CachingProxyStatus.MISS, CachingProxyStatus.HIT })
+    {
+      await AssertGetResponse("/real/wrong-content-type.jar", HttpStatusCode.OK,
+        (message, bytes) =>
+        {
+          AssertStatusHeader(message, expectedStatus);
+          Assert.Equal(MediaTypeNames.Text.Html, message.Content.Headers.ContentType?.ToString());
+          Assert.Equal("some html", Encoding.UTF8.GetString(bytes));
+        });
+    }
   }
 
   [Fact]
-  public async Task Pom_Content_Type_Is_Produced_From_Extension()
+  public async Task Content_Type_Falls_Back_To_Octet_Stream()
   {
-    // .pom is not a built-in MIME type; it is configured to map to application/x-maven-pom+xml.
-    // The proxy derives the Content-Type from the extension, so MISS and HIT (served from disk) agree.
-    await AssertGetResponse("/real/artifact.pom", HttpStatusCode.OK,
-      (message, bytes) =>
-      {
-        AssertStatusHeader(message, CachingProxyStatus.MISS);
-        Assert.Equal("application/x-maven-pom+xml", message.Content.Headers.ContentType?.ToString());
-        Assert.Equal("<project/>", Encoding.UTF8.GetString(bytes));
-      });
-
-    await AssertGetResponse("/real/artifact.pom", HttpStatusCode.OK,
-      (message, bytes) =>
-      {
-        AssertStatusHeader(message, CachingProxyStatus.HIT);
-        Assert.Equal("application/x-maven-pom+xml", message.Content.Headers.ContentType?.ToString());
-        Assert.Equal("<project/>", Encoding.UTF8.GetString(bytes));
-      });
+    // This upstream route sends no Content-Type at all. MISS and HIT then both say octet-stream rather
+    // than one of them saying nothing: on disk "absent" and "never sent" are the same thing, so the
+    // fallback has to be the same on the way in and on the way out.
+    foreach (var expectedStatus in new[] { CachingProxyStatus.MISS, CachingProxyStatus.HIT })
+    {
+      await AssertGetResponse("/real/artifact.pom", HttpStatusCode.OK,
+        (message, bytes) =>
+        {
+          AssertStatusHeader(message, expectedStatus);
+          Assert.Equal(MediaTypeNames.Application.Octet, message.Content.Headers.ContentType?.ToString());
+          Assert.Equal("<project/>", Encoding.UTF8.GetString(bytes));
+        });
+    }
   }
 
   [Fact]
   public async Task Always_Cache_Directory_Index()
   {
+    // A directory listing has no extension to derive a type from and the upstream serves it as HTML,
+    // which is what gets relayed.
     await AssertGetResponse("/repo1.maven.org/maven2/org/apache/ant/ant-xz/",
       HttpStatusCode.OK, (message, bytes) =>
       {
         AssertStatusHeader(message, CachingProxyStatus.MISS);
-        Assert.Equal(MediaTypeNames.Application.Octet, message.Content.Headers.ContentType?.ToString());
+        Assert.Equal(MediaTypeNames.Text.Html, message.Content.Headers.ContentType?.MediaType);
       });
   }
 
@@ -699,7 +695,7 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
       HttpStatusCode.OK, (message, bytes) =>
       {
         AssertStatusHeader(message, CachingProxyStatus.MISS);
-        Assert.Equal(MediaTypeNames.Application.Octet, message.Content.Headers.ContentType?.ToString());
+        Assert.Equal(MediaTypeNames.Text.Html, message.Content.Headers.ContentType?.MediaType);
       });
   }
 
@@ -994,13 +990,17 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
       Directory.Delete(directory, true);
     }
     await myServer.CreateRequest("/real/a.jar").GetAsync();
-    var cachedFile = Assert.Single(GetFiles());
+    var cachedFile = Assert.Single(GetArtifacts());
     File.SetLastAccessTimeUtc(cachedFile, myTimeProvider.Start.UtcDateTime);
+    // Every stored copy also gets a metadata companion (see CacheEntryMetadata).
+    Assert.True(File.Exists(CacheFileProvider.GetMetadataPath(cachedFile)));
 
     // Within the retention period: advancing by half of it must not delete the freshly-accessed file.
+    // Its companion survives too - the cutoff does not apply to one whose artifact is still there.
     myTimeProvider.Advance(myConfig.CleanupPeriod / 2);
     await DrainAsync();
-    Assert.Single(GetFiles());
+    Assert.Single(GetArtifacts());
+    Assert.True(File.Exists(CacheFileProvider.GetMetadataPath(cachedFile)));
 
     // Past the retention period: the cron-driven cleanup runs on a background task whose cutoff is
     // computed from GetUtcNow() when its FakeTimeProvider timer continuation runs. Advance a cron
@@ -1012,11 +1012,15 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
       myTimeProvider.Advance(myConfig.CleanupPeriod);
       await DrainAsync();
     }
+    // Both the artifact and the companion it orphaned are gone. The companion may need a second pass:
+    // within one pass it is exempt while its artifact is still on disk, whichever order they are visited.
     Assert.Empty(GetFiles());
     return;
 
     IEnumerable<string> GetFiles() =>
       Directory.EnumerateFiles(myConfig.LocalCachePath, "*", SearchOption.AllDirectories);
+
+    IEnumerable<string> GetArtifacts() => GetFiles().Where(f => !CacheFileProvider.IsMetadata(f));
 
     // Yield repeatedly so the background cleanup loop's continuation can run after a clock change.
     static async Task DrainAsync()

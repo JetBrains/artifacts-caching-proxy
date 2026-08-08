@@ -81,13 +81,12 @@ public class CleanupService(TimeProvider timeProvider, CachingProxyConfig config
         logger.LogDebug(ex, "Failed to get FileInfo for {Path}", filePath);
         continue;
       }
-      // A freshness stamp is exempt from the access-time cutoff: it is only ever stat'ed, never
-      // opened, so its access time does not track use and the cutoff would evict it from under a
-      // busy artifact — costing a needless revalidation. It lives and dies with its artifact
-      // instead, so the only stamp worth deleting here is one whose artifact is already gone.
-      if (CacheFileProvider.IsStoredDateStamp(filePath))
+      // A metadata file is exempt from the access-time cutoff: evicting it from under a busy artifact
+      // would strand bytes with no media type to serve them as, forcing a refetch. It lives and dies
+      // with its artifact instead, so the only one worth deleting here is an orphan.
+      if (CacheFileProvider.IsMetadata(filePath))
       {
-        if (!File.Exists(CacheFileProvider.GetStampedCacheFilePath(filePath)))
+        if (!File.Exists(CacheFileProvider.GetMetadataOwnerPath(filePath)))
           TryDelete(fileInfo);
         continue;
       }

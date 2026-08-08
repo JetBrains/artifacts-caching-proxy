@@ -17,6 +17,22 @@ namespace JetBrains.CachingProxy;
 /// </summary>
 public sealed record CachedResponse(HttpStatusCode StatusCode, IHeaderDictionary Headers, byte[]? Body = null)
 {
+  /// <summary>
+  /// The digest of the manifest or blob a registry returned. An OCI client resolves a tag to this value
+  /// and containerd verifies the body against it, so a cache HIT that dropped the header would break a
+  /// pull that a MISS served fine. It cannot be re-derived from the stored body (it covers the exact
+  /// bytes of the specific representation), hence the pass-through here and the S3 metadata below.
+  /// </summary>
+  public const string DockerContentDigestHeader = "Docker-Content-Digest";
+
+  /// <summary>S3 user-metadata key carrying <see cref="DockerContentDigestHeader"/> through the bucket.</summary>
+  public const string DockerContentDigestMetadataKey = "docker-content-digest";
+
+  // Copied through verbatim. Besides the digest, Docker-Distribution-API-Version is how a client confirms
+  // it is talking to a v2 registry.
+  private static readonly string[] ourRegistryHeaders =
+    [DockerContentDigestHeader, CachingProxyConstants.DockerApiVersionHeader];
+
   public CachedResponse(HttpResponseMessage response) : this(response.StatusCode, new HeaderDictionary())
   {
     Headers.LastModified = response.Content.Headers.LastModified?.ToString("R");
@@ -24,6 +40,11 @@ public sealed record CachedResponse(HttpStatusCode StatusCode, IHeaderDictionary
     Headers.ContentType = response.Content.Headers.ContentType?.ToString();
     Headers.ContentEncoding = new StringValues([..response.Content.Headers.ContentEncoding]);
     Headers.ETag = response.Headers.ETag?.ToString();
+    foreach (var name in ourRegistryHeaders)
+    {
+      if (response.Headers.TryGetValues(name, out var values))
+        Headers[name] = new StringValues([..values]);
+    }
   }
 
   public CachedResponse(GetObjectResponse response) : this(response.HttpStatusCode, new HeaderDictionary())
@@ -33,6 +54,10 @@ public sealed record CachedResponse(HttpStatusCode StatusCode, IHeaderDictionary
     Headers.ContentType = response.Headers.ContentType;
     Headers.ContentEncoding = response.Headers.ContentEncoding;
     Headers.ETag = response.ETag;
+    // Only the digest is kept in the bucket: the API-version header is per-response bookkeeping that the
+    // /v2/ ping and every live response carry anyway, while the digest belongs to the stored bytes.
+    if (response.Metadata[DockerContentDigestMetadataKey] is { Length: > 0 } digest)
+      Headers[DockerContentDigestHeader] = digest;
   }
 
   public async ValueTask InvokeAsync(HttpContext context)

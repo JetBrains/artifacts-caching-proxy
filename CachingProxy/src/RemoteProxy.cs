@@ -92,15 +92,13 @@ public partial class RemoteProxy(
   /// hits, the upstream request and its validation (including Content-Encoding). Writes the full
   /// response head — status, metadata headers (Content-Length, Last-Modified), representation
   /// headers (Content-Type, Content-Encoding) and the proxy bookkeeping headers — to
-  /// <paramref name="context"/>. The Content-Type is the one returned by <paramref name="contentType"/>
-  /// when the caller supplies a resolver (the disk backend resolves it from the file extension, so a
-  /// MISS and a later HIT served from disk agree), and the upstream's own Content-Type otherwise. It
-  /// is stored in the in-memory cache so later HEAD hits agree. For a successful GET the open
+  /// <paramref name="context"/>. The Content-Type is the upstream's own, which both storage backends
+  /// keep with the stored copy so a later HIT serves the very same one. For a successful GET the open
   /// upstream response is returned so the caller can stream and persist the body (reading its
   /// Content-Encoding off the response) and must dispose it; in every other case the request is
   /// fully handled, the response (if any) is disposed internally, and <c>null</c> is returned.
   /// </summary>
-  public async Task<HttpResponseMessage?> ProcessAsync(HttpContext context, string cacheKey, CacheDuration cacheDuration, Uri upstreamUri, string? contentType = null, UpstreamAuth? auth = null, CachingRule? rule = null)
+  public async Task<HttpResponseMessage?> ProcessAsync(HttpContext context, string cacheKey, CacheDuration cacheDuration, Uri upstreamUri, UpstreamAuth? auth = null, CachingRule? rule = null)
   {
     var isHead = HttpMethods.IsHead(context.Request.Method);
 
@@ -222,7 +220,7 @@ public partial class RemoteProxy(
       {
         Headers =
         {
-          ContentType = contentType ?? response.Content.Headers.ContentType?.ToString(),
+          ContentType = response.Content.Headers.ContentType?.ToString() ?? MediaTypeNames.Application.Octet,
         }
       };
 

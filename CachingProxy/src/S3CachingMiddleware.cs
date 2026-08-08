@@ -363,7 +363,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
         uploadStream = body;
       }
 
-      await amazonS3.PutObjectAsync(new PutObjectRequest
+      var put = new PutObjectRequest
       {
         BucketName = config.S3!.BucketName,
         Key = s3Key,
@@ -379,7 +379,16 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
           [CreatedAtMetadataKey] = timeProvider.GetUtcNow().ToString("O", CultureInfo.InvariantCulture),
         },
         InputStream = uploadStream,
-      }, cancellationToken);
+      };
+
+      // An OCI client resolves a manifest by this digest, and it cannot be recomputed from the bytes we
+      // store, so it has to travel with the object (see CachedResponse). Only set when the upstream sent
+      // one, so non-registry objects gain no metadata.
+      if (response.Headers.TryGetValues(CachedResponse.DockerContentDigestHeader, out var digests) &&
+          digests.FirstOrDefault() is { Length: > 0 } digest)
+        put.Metadata[CachedResponse.DockerContentDigestMetadataKey] = digest;
+
+      await amazonS3.PutObjectAsync(put, cancellationToken);
     }
     finally
     {
