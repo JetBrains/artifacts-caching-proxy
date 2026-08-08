@@ -91,7 +91,7 @@ public class CachingProxy
         // window is anchored to — comes from one companion file. Without it there is no media type we
         // could honestly serve the copy as (guessing one is what makes a registry client reject a
         // manifest outright), so treat the entry as absent and let the request refetch and rewrite it.
-        if (ReadMetadata(cachedFile.FullName) is not { } metadata)
+        if (await ReadMetadataAsync(cachedFile.FullName, context.RequestAborted) is not { } metadata)
           break;
 
         // Past its freshness window: revalidate against the upstream before serving (200 replaces,
@@ -118,7 +118,7 @@ public class CachingProxy
 
       // Unconditional, unlike the freshness stamp this replaced: a stored copy needs its head back
       // whether or not its rule sets a window, and it is the same single write either way.
-      WriteMetadata(storedPath, CacheEntryMetadata.FromResponse(UtcNow, response));
+      await WriteMetadataAsync(storedPath, CacheEntryMetadata.FromResponse(UtcNow, response));
     }
     catch (OperationCanceledException)
     {
@@ -173,7 +173,7 @@ public class CachingProxy
     {
       case RevalidationOutcome.NotModified:
         // Still valid: restart the window, keeping the head the stored bytes were fetched under.
-        WriteMetadata(cachedFile.FullName, metadata with { StoredAtUtc = UtcNow });
+        await WriteMetadataAsync(cachedFile.FullName, metadata with { StoredAtUtc = UtcNow });
         await ServeFileAsync(context, cachedFile, metadata, contentEncoding, CachingProxyStatus.REVALIDATED);
         return;
 
@@ -209,7 +209,7 @@ public class CachingProxy
             DeleteMetadata(cachedFile.FullName);
           }
 
-          WriteMetadata(newPath, CacheEntryMetadata.FromResponse(UtcNow, response));
+          await WriteMetadataAsync(newPath, CacheEntryMetadata.FromResponse(UtcNow, response));
         }
         return;
     }
@@ -232,17 +232,19 @@ public class CachingProxy
 
     try
     {
+      long writtenLength;
       await using (var stream = new FileStream(tempFile, FileMode.CreateNew, FileAccess.Write, FileShare.None, BUFFER_SIZE, FileOptions.Asynchronous))
       {
         await using (var sourceStream = await response.Content.ReadAsStreamAsync(context.RequestAborted))
-          await CopyToTwoStreamsAsync(sourceStream, context.Response.Body, stream, context.RequestAborted);
+          writtenLength = await CopyToTwoStreamsAsync(sourceStream, context.Response.Body, stream, context.RequestAborted);
       }
 
-      var tempFileInfo = new FileInfo(tempFile);
-      if (contentLength != null && tempFileInfo.Length != contentLength)
+      // Counted while copying rather than stat'ed off the finished file: the copy knows the number
+      // already, and a stat has no async form to keep this path off the blocking APIs.
+      if (contentLength != null && writtenLength != contentLength)
       {
         myLogger.LogWarning(Event.NotMatchedContentLength, "Expected {ContentLength} bytes from Content-Length, but downloaded {Length}: {RequestPath}",
-          contentLength, tempFileInfo.Length, context.Request.Path);
+          contentLength, writtenLength, context.Request.Path);
         context.Abort();
         return null;
       }
@@ -272,18 +274,22 @@ public class CachingProxy
   // What a stored copy needs to be replayed (see CacheEntryMetadata), or null when the companion file is
   // missing or unreadable — the caller then treats the entry as absent and refetches, which rewrites it.
   // One read, on the one path that has to hit the disk anyway.
-  private static CacheEntryMetadata? ReadMetadata(string cacheFilePath)
+  private static async Task<CacheEntryMetadata?> ReadMetadataAsync(string cacheFilePath, CancellationToken cancellationToken)
   {
     try
     {
-      return CacheEntryMetadata.TryParse(File.ReadAllText(CacheFileProvider.GetMetadataPath(cacheFilePath)));
+      return CacheEntryMetadata.TryParse(
+        await File.ReadAllTextAsync(CacheFileProvider.GetMetadataPath(cacheFilePath), cancellationToken));
     }
     catch (IOException) { return null; }
     catch (UnauthorizedAccessException) { return null; }
   }
 
-  private void WriteMetadata(string cacheFilePath, CacheEntryMetadata metadata) =>
-    CatchSilently(() => File.WriteAllText(CacheFileProvider.GetMetadataPath(cacheFilePath), metadata.Format()));
+  // Deliberately not cancellable: by the time this runs the bytes are already on disk, and a cache file
+  // whose companion never got written reads as absent, so honouring a client disconnect here would trade
+  // a completed store for a guaranteed refetch.
+  private Task WriteMetadataAsync(string cacheFilePath, CacheEntryMetadata metadata) =>
+    CatchSilentlyAsync(() => File.WriteAllTextAsync(CacheFileProvider.GetMetadataPath(cacheFilePath), metadata.Format()));
 
   // Metadata is meaningless without its cache file, so the two are always dropped together.
   private void DeleteMetadata(string cacheFilePath) =>
@@ -318,6 +324,19 @@ public class CachingProxy
     }
   }
 
+  private async Task CatchSilentlyAsync(Func<Task> action)
+  {
+    try
+    {
+      await action();
+    }
+    catch (OperationCanceledException) {}
+    catch (Exception e)
+    {
+      myLogger.Log(LogLevel.Error, e, "LogSilently: {Message}", e.Message);
+    }
+  }
+
   // Only plain and gzip variants are ever stored on disk, so there is no point probing for any other
   // Accept-Encoding token. Prefer the gzip variant when the client asked for it; otherwise prefer
   // plain but still fall back to gzip (a gzip-only cache entry is served to every client, matching
@@ -329,10 +348,12 @@ public class CachingProxy
     return acceptsGzip ? ["gzip", null] : [null, "gzip"];
   }
 
-  private static async Task CopyToTwoStreamsAsync(Stream source, Stream dest1, FileStream dest2, CancellationToken cancellationToken)
+  // Returns the number of bytes copied, so the caller can validate Content-Length without stat'ing.
+  private static async Task<long> CopyToTwoStreamsAsync(Stream source, Stream dest1, FileStream dest2, CancellationToken cancellationToken)
   {
     using var buffer = MemoryPool<byte>.Shared.Rent(BUFFER_SIZE);
     var memory = buffer.Memory;
+    long total = 0;
     while (true)
     {
       var length = await source.ReadAsync(memory, cancellationToken).ConfigureAwait(false);
@@ -341,7 +362,10 @@ public class CachingProxy
 
       await dest1.WriteAsync(memory[..length], cancellationToken).ConfigureAwait(false);
       await dest2.WriteAsync(memory[..length], cancellationToken).ConfigureAwait(false);
+      total += length;
     }
+
+    return total;
   }
 
   public class HealthCheck(CachingProxyConfig config) : IHealthCheck
