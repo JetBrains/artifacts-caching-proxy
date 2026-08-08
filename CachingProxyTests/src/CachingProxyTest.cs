@@ -617,6 +617,26 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
   }
 
   [Fact]
+  public async Task Oci_Base_Endpoint_Answers_The_Ping()
+  {
+    // Every registry client probes the base endpoint before it fetches anything and abandons the pull
+    // unless that answers 2xx. It is not a proxied path, so it carries no proxy status header.
+    await AssertGetResponse("/v2/", HttpStatusCode.OK,
+      (message, bytes) =>
+      {
+        AssertNoStatusHeader(message);
+        Assert.Equal(CachingProxyConstants.DockerApiVersion,
+          message.Headers.GetValues(CachingProxyConstants.DockerApiVersionHeader).Single());
+        Assert.Equal(MediaTypeNames.Application.Json, message.Content.Headers.ContentType?.MediaType);
+        Assert.Equal("{}", Encoding.UTF8.GetString(bytes));
+      });
+
+    // The bare form redirects to it, as a real registry does, and clients follow that.
+    await AssertGetResponse("/v2", HttpStatusCode.RedirectKeepVerb,
+      (message, bytes) => Assert.Equal("/v2/", message.Headers.Location?.ToString()));
+  }
+
+  [Fact]
   public async Task Content_Type_Is_Produced_From_Extension()
   {
     // The upstream sends text/html for a .jar, but the proxy derives the Content-Type from the file
