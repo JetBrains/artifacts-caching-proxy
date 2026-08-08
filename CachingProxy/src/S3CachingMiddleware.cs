@@ -253,7 +253,10 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
       switch (e)
       {
         case AmazonServiceException ase:
-          logger.LogError(Event.FailedToCacheInS3,"Failed to cache {RequestPath} with S3 error {s3ErrorCode}: {s3ErrorMessage}", context.Request.Path, ase.ErrorCode, ase.Message);
+          // Pass the exception, not just its message: without it Sentry has no stack trace and the
+          // throttled call (probe GetObject / PutObject / the CopyObject touch / DeleteObject) is
+          // indistinguishable.
+          logger.LogError(Event.FailedToCacheInS3, ase, "Failed to cache {RequestPath} with S3 error {s3ErrorCode}: {s3ErrorMessage}", context.Request.Path, ase.ErrorCode, ase.Message);
           break;
         default:
           logger.LogError(Event.FailedToCacheInS3, e, "Failed to cache {RequestPath}", context.Request.Path);
