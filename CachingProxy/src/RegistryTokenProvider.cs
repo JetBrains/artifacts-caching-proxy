@@ -62,7 +62,7 @@ public sealed class RegistryTokenProvider(
   private static readonly TimeSpan ourChallengeMemory = TimeSpan.FromHours(1);
 
   // The path segments the OCI distribution API defines after the repository name. Used to split
-  // "<prefix>/v2/<name>/<verb>/<reference>" into the repository name a token scope needs.
+  // "/v2/<name>/<verb>/<reference>" into the repository name a token scope needs.
   private static readonly string[] ourApiVerbs = ["manifests", "blobs", "tags", "referrers"];
 
   // Registry tokens, and the realms they came from, stay in memory: the tokens are short-lived secrets
@@ -164,23 +164,26 @@ public sealed class RegistryTokenProvider(
 
   /// <summary>
   /// The pull scope for an upstream URL, i.e. <c>repository:&lt;name&gt;:pull</c>. The distribution API
-  /// fixes the shape <c>&lt;prefix&gt;/v2/&lt;name&gt;/&lt;verb&gt;/&lt;reference&gt;</c>, where the
-  /// repository name itself may contain slashes and the prefix is whatever path the upstream is mounted
-  /// under (the Space registries mount <c>/v2</c> under <c>/p/&lt;project&gt;/&lt;repo&gt;</c>), so the
-  /// name is read between the last <c>v2</c> segment and the API verb that follows it. Null for anything
-  /// else, including <c>/v2/_catalog</c> (whose scope is <c>registry:catalog:*</c>, and which the docker
-  /// profile redirects rather than proxies).
+  /// fixes the shape <c>/v2/&lt;name&gt;/&lt;verb&gt;/&lt;reference&gt;</c>: <c>/v2</c> is the API root and
+  /// sits directly under the registry host — a client has no way to address it anywhere else — and the
+  /// repository name is everything between it and the verb, slashes included. So a registry serving
+  /// mirrors under a project path simply has longer names, e.g.
+  /// <c>repository:p/ij/docker-hub/library/ubuntu:pull</c>. Null for anything not of that shape, including
+  /// <c>/v2/_catalog</c> (whose scope is <c>registry:catalog:*</c>, and which the docker profile redirects
+  /// rather than proxies).
+  /// <para>Only a fallback: a challenge that names its own scope wins, and some registries scope by
+  /// repository group rather than by image (Space answers the image path above with
+  /// <c>repository:p/ij/docker-hub:pull</c>).</para>
   /// </summary>
   public static string? TryDeriveScope(Uri upstreamUri)
   {
     var segments = upstreamUri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+    if (segments.FirstOrDefault() != "v2") return null;
+
     var verb = Array.FindLastIndex(segments, segment => ourApiVerbs.Contains(segment));
-    if (verb <= 0) return null;
+    if (verb <= 1) return null;
 
-    var v2 = Array.LastIndexOf(segments, "v2", verb - 1);
-    if (v2 < 0 || v2 + 1 >= verb) return null;
-
-    return $"repository:{string.Join('/', segments, v2 + 1, verb - v2 - 1)}:pull";
+    return $"repository:{string.Join('/', segments, 1, verb - 1)}:pull";
   }
 
   /// <summary>

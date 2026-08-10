@@ -121,7 +121,7 @@ public class RegistryServiceAccountTest : IAsyncLifetime
     Assert.Equal(HttpStatusCode.OK, response.StatusCode);
     Assert.Equal(1, myTokenRequests);
     Assert.Equal("", myTokenAuthHeader);
-    Assert.Equal("repository:library/foreign:pull", myTokenScope);
+    Assert.Equal("repository:other/library/foreign:pull", myTokenScope);
   }
 
   private string[] AuthSeenAt(string path) => [.. myRegistryAuthByPath[path]];
@@ -147,9 +147,10 @@ public class RegistryServiceAccountTest : IAsyncLifetime
       Prefixes =
       [
         new CachingProxyPrefix($"/v2/allowlisted={registryUrl}v2", Profile: "docker"),
-        // The same registry mounted under another path, so the two prefixes get different UpstreamAuth
-        // entries (matched by longest URL prefix) while sharing one challenge.
-        new CachingProxyPrefix($"/v2/foreign={registryUrl}other/v2", Profile: "docker"),
+        // A repository group on the same registry - /v2 stays at the root, the group is part of the
+        // repository name - so the two prefixes get different UpstreamAuth entries (matched by longest URL
+        // prefix) while sharing one challenge.
+        new CachingProxyPrefix($"/v2/foreign={registryUrl}v2/other", Profile: "docker"),
       ],
       UpstreamAuth =
       {
@@ -163,7 +164,7 @@ public class RegistryServiceAccountTest : IAsyncLifetime
         },
         ["foreign"] = new UpstreamAuth
         {
-          UrlPrefixes = [new Uri(registryUrl, "other/v2/").GetHostPortPath()],
+          UrlPrefixes = [new Uri(registryUrl, "v2/other/").GetHostPortPath()],
           Username = Account,
           Password = Pat,
           PublicUpstream = true,

@@ -69,8 +69,9 @@ public class RegistryTokenProviderTest
   [InlineData("https://registry-1.docker.io/v2/library/ubuntu/manifests/24.04", "repository:library/ubuntu:pull")]
   [InlineData("https://registry-1.docker.io/v2/library/ubuntu/blobs/sha256:abcdef0123456789abcdef0123456789", "repository:library/ubuntu:pull")]
   [InlineData("https://registry-1.docker.io/v2/library/ubuntu/tags/list", "repository:library/ubuntu:pull")]
-  // The Space registries mount /v2 under a project path, so the scope starts after the *last* v2.
-  [InlineData("https://registry.jetbrains.team/p/ij/containers/v2/team/img/manifests/1.0", "repository:team/img:pull")]
+  // A registry serving mirrors under a project path: /v2 is still at the root, and the project path is
+  // just part of the repository name.
+  [InlineData("https://registry.jetbrains.team/v2/p/ij/containers/team/img/manifests/1.0", "repository:p/ij/containers/team/img:pull")]
   // A repository named after an API verb: the verb that delimits the name is the last one.
   [InlineData("https://registry.example.com/v2/manifests/manifests/latest", "repository:manifests:pull")]
   public void Scope_Is_The_Repository_Between_v2_And_The_Api_Verb(string upstream, string expected) =>
@@ -80,6 +81,9 @@ public class RegistryTokenProviderTest
   [InlineData("https://registry.example.com/v2/")]              // the ping: nothing is being pulled
   [InlineData("https://registry.example.com/v2/_catalog")]      // a registry-wide scope, which the profile redirects
   [InlineData("https://registry.example.com/v2/library/ubuntu")] // no API verb, so no repository boundary
+  // /v2 anywhere but the root is not the distribution API - a misconfigured origin, whose scope we must
+  // not guess at. The registry's own challenge still names one if there is anything to name.
+  [InlineData("https://registry.jetbrains.team/p/ij/containers/v2/team/img/manifests/1.0")]
   public void No_Repository_Means_No_Scope(string upstream) =>
     Assert.Null(RegistryTokenProvider.TryDeriveScope(new Uri(upstream)));
 
