@@ -252,7 +252,26 @@ public class CachingProxy
       if (contentLastModified.HasValue)
         File.SetLastWriteTimeUtc(tempFile, contentLastModified.Value.UtcDateTime);
 
-      File.Move(tempFile, cachedFile, true);
+      // A concurrent request for the same artifact downloads to its own temp file and then moves it onto
+      // this same destination. On Windows that collides: the replace cannot delete a destination another
+      // handle still holds open, whether that handle is the other mover or a reader already serving it.
+      // Both racers fetched the same upstream bytes and the cache is last-writer-wins, so the copy that
+      // is already there is as good as ours. Failing here would abort a response whose body this method
+      // has by now streamed to the client in full, turning cache bookkeeping into a client-visible error.
+      try
+      {
+        File.Move(tempFile, cachedFile, true);
+      }
+      catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+      {
+        // Only a lost race leaves the destination in place. Anything else - a bad path, no permission on
+        // the cache directory - has to keep surfacing rather than be silently downgraded to a cache hit.
+        if (!File.Exists(cachedFile)) throw;
+
+        myLogger.Log(LogLevel.Debug, Event.ConcurrentCacheStore, e,
+          "Another request stored {RequestPath} first, keeping its copy", context.Request.Path);
+      }
+
       // Normalized so callers can compare it against a FileInfo.FullName (see the encoding-changed
       // cleanup in RevalidateAndServeAsync) without a raw-vs-normalized path-string mismatch.
       return Path.GetFullPath(cachedFile);
