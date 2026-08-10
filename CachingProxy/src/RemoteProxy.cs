@@ -188,11 +188,9 @@ public partial class RemoteProxy(
     HttpResponseMessage response;
     try
     {
-      if (authProvider != null && auth != null)
-      {
-        request.Headers.Authorization = await authProvider.GetAuthorizationHeaderAsync(auth, context.RequestAborted);
-      }
-      response = await SendAsync(request, upstreamUri, auth, profile, context.RequestAborted);
+      var credentials = authProvider != null && auth != null ?
+        await authProvider.GetAuthorizationHeaderAsync(auth, context.RequestAborted) : null;
+      response = await SendAsync(request, upstreamUri, auth, profile, credentials, context.RequestAborted);
     }
     catch (OperationCanceledException canceledException)
     {
@@ -312,9 +310,9 @@ public partial class RemoteProxy(
     HttpResponseMessage response;
     try
     {
-      if (authProvider != null && auth != null)
-        request.Headers.Authorization = await authProvider.GetAuthorizationHeaderAsync(auth, cancellationToken);
-      response = await SendAsync(request, upstreamUri, auth, profile, cancellationToken);
+      var credentials = authProvider != null && auth != null ?
+        await authProvider.GetAuthorizationHeaderAsync(auth, cancellationToken) : null;
+      response = await SendAsync(request, upstreamUri, auth, profile, credentials, cancellationToken);
     }
     catch (OperationCanceledException canceledException)
     {
@@ -380,23 +378,29 @@ public partial class RemoteProxy(
   }
 
   /// <summary>
-  /// Sends an upstream request, adding the OCI registry token dance for profiles that ask for it (see
-  /// <see cref="CachingProfile.Oci"/>). Every other upstream goes out untouched.
+  /// Sends an upstream request with <paramref name="credentials"/> as its <c>Authorization</c>, adding the
+  /// OCI registry token dance for profiles that ask for it (see <see cref="CachingProfile.Oci"/>). Every
+  /// other upstream goes out with the header as given.
+  /// <para><b>An OCI registry never sees the credentials themselves.</b> A registry takes an account at the
+  /// token endpoint its challenge names, not on <c>/v2/…</c>, so the account goes there (subject to
+  /// <see cref="RegistryTokenProvider.MayForwardCredentials"/>) and the only thing this request ever
+  /// carries is a minted token. Offering the account to the registry as well would hand a long-lived
+  /// credential to an endpoint that has no use for it.</para>
   /// <para>Two paths. Steady state: this host's realm is already known, so a token is attached up front
-  /// and no 401 is paid. First contact: the registry's 401 carries the challenge, we mint a token for it,
-  /// remember the realm for next time and retry — <b>once</b>, so a registry that keeps answering 401
-  /// (genuinely unauthorized, wrong service account) has that answer relayed instead of being retried in
-  /// a loop.</para>
+  /// and no 401 is paid. First contact: the request goes out unauthenticated, the registry's 401 carries
+  /// the challenge, we mint a token for it, remember the realm for next time and retry — <b>once</b>, so a
+  /// registry that keeps answering 401 (genuinely unauthorized, wrong service account) has that answer
+  /// relayed instead of being retried in a loop.</para>
   /// </summary>
   private async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, Uri upstreamUri,
-    UpstreamAuth? auth, CachingProfile? profile, CancellationToken cancellationToken)
+    UpstreamAuth? auth, CachingProfile? profile, AuthenticationHeaderValue? credentials,
+    CancellationToken cancellationToken)
   {
     if (registryTokenProvider == null || profile is not { Oci: true })
+    {
+      request.Headers.Authorization = credentials;
       return await httpClient.Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
-
-    // Whatever UpstreamAuth produced (null for a public mirror). It is the service account the token is
-    // minted against, and it is part of that token's cache identity — see RegistryTokenProvider.
-    var credentials = request.Headers.Authorization;
+    }
 
     if (await registryTokenProvider.GetRememberedChallengeAsync(upstreamUri, cancellationToken) is { } known &&
         await registryTokenProvider.GetTokenAsync(known, upstreamUri, auth, credentials, cancellationToken) is { } cached)

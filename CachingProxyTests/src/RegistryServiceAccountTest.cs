@@ -98,11 +98,12 @@ public class RegistryServiceAccountTest : IAsyncLifetime
     // One token for both tags: same scope, same account, so it is minted once and reused.
     Assert.Equal(1, myTokenRequests);
 
-    // The first pull pays the 401 and retries with the minted token. Note the PAT is offered upstream too
-    // (a registry that takes Basic directly then needs no dance at all), and is replaced on the retry.
-    Assert.Equal(
-      ["Basic " + Convert.ToBase64String(Encoding.UTF8.GetBytes($"{Account}:{Pat}")), $"Bearer {IssuedToken}"],
-      AuthSeenAt("v2/library/allowed/manifests/1.0"));
+    // The first pull goes out unauthenticated, pays the 401 and retries with the minted token. The PAT is
+    // never offered to the registry itself: it has no use for it, and the token endpoint is the only place
+    // an account belongs.
+    Assert.Equal(["", $"Bearer {IssuedToken}"], AuthSeenAt("v2/library/allowed/manifests/1.0"));
+    // Scheme-level, so it holds however the credential is encoded.
+    Assert.DoesNotContain("Basic", string.Join(" ", myRegistryAuthByPath.Values.SelectMany(queue => queue)));
 
     // The second pull pays no 401: the realm learned from the first is reused to mint up front.
     Assert.Equal([$"Bearer {IssuedToken}"], AuthSeenAt("v2/library/allowed/manifests/2.0"));

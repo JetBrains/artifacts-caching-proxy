@@ -10,11 +10,10 @@ namespace JetBrains.CachingProxy;
 /// Builds the <c>Authorization</c> header sent to an authenticated upstream, dispatching on the matched
 /// <see cref="UpstreamAuth"/> entry's mode. Returns <c>null</c> when there is nothing to add (unauthenticated
 /// upstream, or an entry with neither a client id nor a service account).
-/// <para>For an OCI upstream the result also goes somewhere else: most registries ignore an
-/// <c>Authorization</c> header on <c>/v2/…</c> and take an account only at the token endpoint their
-/// challenge names, so <see cref="RegistryTokenProvider"/> presents this same header there and the
-/// minted token replaces it on the retry. It is still sent upstream first, which is what makes a
-/// registry that does accept Basic directly work without a token dance at all.</para>
+/// <para>For an OCI upstream the result goes somewhere else entirely: a registry takes an account at the
+/// token endpoint its challenge names, not on <c>/v2/…</c>, so <see cref="RegistryTokenProvider"/>
+/// presents this header there and only the minted token is sent to the registry. The account itself never
+/// reaches <c>/v2/…</c> — see <see cref="RemoteProxy"/>.</para>
 /// </summary>
 public interface IUpstreamAuthorizationProvider
 {

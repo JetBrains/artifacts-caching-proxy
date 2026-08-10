@@ -28,13 +28,13 @@ namespace JetBrains.CachingProxy;
 /// private artifacts, so it also requires a validated inbound client JWT.</para>
 ///
 /// <para><b>Service-account mode</b> (<see cref="Username"/> and <see cref="Password"/> set): a fixed
-/// credential sent as <c>Authorization: Basic base64(<see cref="Username"/>:<see cref="Password"/>)</c>
+/// credential encoded as <c>Authorization: Basic base64(<see cref="Username"/>:<see cref="Password"/>)</c>
 /// with nothing exchanged for it. This is the shape a container registry takes an account in - a Docker
-/// Hub personal access token is the password, the account name the username - and note where it lands:
-/// most registries ignore an <c>Authorization</c> header on <c>/v2/…</c> and accept an account only at
-/// the token endpoint their challenge names, so for an OCI upstream this credential is also what
-/// <see cref="RegistryTokenProvider"/> presents there, subject to <see cref="TokenRealms"/>. Set
-/// <see cref="PublicUpstream"/> when the account only buys rate limit on a public registry.</para>
+/// Hub personal access token is the password, the account name the username - and note where it lands: a
+/// registry accepts an account at the token endpoint its challenge names, not on <c>/v2/…</c>, so for an
+/// OCI upstream this credential goes only there, subject to <see cref="TokenRealms"/>, and the registry
+/// itself sees just the minted token. Set <see cref="PublicUpstream"/> when the account only buys rate
+/// limit on a public registry.</para>
 /// </summary>
 public record UpstreamAuth
 {
