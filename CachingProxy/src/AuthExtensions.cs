@@ -37,17 +37,37 @@ public static class AuthExtensions
   private const string CombinedInboundScheme = "CombinedInbound";
 
   /// <summary>
-  /// Per-upstream auth. Two credential modes coexist (see <see cref="UpstreamAuth"/>): OAuth
-  /// client-credentials (Duende token management, one client per entry named by its ClientId) and GitHub
+  /// Per-upstream auth. Three credential modes coexist (see <see cref="UpstreamAuth"/>): OAuth
+  /// client-credentials (Duende token management, one client per entry named by its ClientId), GitHub
   /// App (a signed JWT exchanged for an installation token — GitHub does not support the client-credentials
-  /// grant). The dispatch between them lives in <see cref="IUpstreamAuthorizationProvider"/>, which
-  /// RemoteProxy resolves optionally, so unauthenticated deployments pull in nothing extra.
+  /// grant), and a fixed service account sent as Basic (a container-registry PAT), which needs no
+  /// registration here at all. The dispatch between them lives in
+  /// <see cref="IUpstreamAuthorizationProvider"/>, which RemoteProxy resolves optionally, so
+  /// unauthenticated deployments pull in nothing extra.
   /// </summary>
   public static IServiceCollection AddUpstreamAuth(this IServiceCollection services, IConfiguration configuration)
   {
     ClientCredentialsTokenManagementBuilder? tokenManagement = null;
     foreach (var (name, auth) in configuration.Get<CachingProxyConfig>()?.UpstreamAuth ?? [])
     {
+      // Service-account mode: nothing to register, since no token is exchanged for this credential -
+      // only a shape to check.
+      if (auth.IsServiceAccount || !string.IsNullOrEmpty(auth.Password))
+      {
+        if (!string.IsNullOrEmpty(auth.ClientId) || !string.IsNullOrEmpty(auth.PrivateKey))
+          throw new ArgumentException(
+            $"UpstreamAuth '{name}' mixes a Username/Password service account with ClientId/PrivateKey. " +
+            "An entry authenticates one way only.");
+        // Half a credential is what an unresolved {{resolve:secretsmanager:…}} reference looks like, and
+        // the quiet consequence is a registry token minted anonymously: pulls keep working until the
+        // anonymous rate limit bites, with nothing in the response to say why.
+        if (string.IsNullOrEmpty(auth.Username) || string.IsNullOrEmpty(auth.Password))
+          throw new ArgumentException(
+            $"UpstreamAuth '{name}' sets only one of Username/Password. Set both, or neither for an " +
+            "upstream that is reached anonymously.");
+        continue;
+      }
+
       if (string.IsNullOrEmpty(auth.ClientId))
         continue;
 

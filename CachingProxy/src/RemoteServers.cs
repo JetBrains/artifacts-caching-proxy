@@ -44,8 +44,10 @@ public class RemoteServers : EndpointDataSource
       // A prefix with a matched UpstreamAuth serves proxy-fetched private artifacts, so its inbound route
       // must require a validated client JWT too: attach an AuthorizeAttribute (enforced by
       // UseAuthentication/UseAuthorization). A prefix with no matched auth has no upstream credentials and
-      // is left public/un-gated.
-      var metadata = remoteServer.Auth is not null ?
+      // is left public/un-gated. The exception is an entry declaring UpstreamAuth.PublicUpstream: there
+      // the credential buys rate limit on a public registry rather than access, and gating the prefix
+      // would break the anonymous `docker pull` it exists to speed up.
+      var metadata = remoteServer.Auth is { PublicUpstream: false } ?
         new EndpointMetadataCollection(remoteServer, new AuthorizeAttribute()) :
         new EndpointMetadataCollection(remoteServer);
 

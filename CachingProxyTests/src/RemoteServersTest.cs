@@ -1,5 +1,6 @@
 using System;
 using System.Linq;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
@@ -76,5 +77,35 @@ public class RemoteServersTest
     Assert.Same(hostWide, servers.Single(s => s.Prefix == "/a").Auth);
     Assert.Same(pathScoped, servers.Single(s => s.Prefix == "/b").Auth);
     Assert.Null(servers.Single(s => s.Prefix == "/c").Auth);
+  }
+
+  [Fact]
+  public void Only_A_Private_Upstreams_Prefix_Requires_An_Inbound_Client_Jwt()
+  {
+    var privateRepo = new UpstreamAuth
+    {
+      UrlPrefixes = ["private.example.com/"], TokenEndpoint = new Uri("https://private.example.com/"), ClientId = "c",
+    };
+    // A service account on a public registry buys rate limit, not access: gating the prefix would break
+    // the anonymous pull it exists to speed up.
+    var rateLimitOnly = new UpstreamAuth
+    {
+      UrlPrefixes = ["registry-1.docker.io/"], Username = "svc", Password = "pat", PublicUpstream = true,
+    };
+
+    var config = new CachingProxyConfig
+    {
+      Prefixes = ["/a=private.example.com/maven", "/v2/docker-hub=registry-1.docker.io/v2", "/c=open.example.com"],
+      UpstreamAuth = { [nameof(privateRepo)] = privateRepo, [nameof(rateLimitOnly)] = rateLimitOnly },
+    };
+
+    var gated = new RemoteServers(config, new NullLogger<RemoteServers>()).Endpoints
+      .ToDictionary(
+        e => e.Metadata.GetMetadata<RemoteServers.RemoteServer>()!.Prefix.Value!,
+        e => e.Metadata.GetMetadata<IAuthorizeData>() != null);
+
+    Assert.True(gated["/a"]);
+    Assert.False(gated["/v2/docker-hub"]);
+    Assert.False(gated["/c"]); // no credentials to protect
   }
 }

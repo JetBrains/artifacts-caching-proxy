@@ -184,14 +184,18 @@ public sealed class RegistryTokenProvider(
   }
 
   /// <summary>
-  /// Whether the matched upstream's credentials may be sent to this realm. Same-host realms are allowed
-  /// outright (a registry that authenticates its own pulls), and anything else must be declared in
-  /// <see cref="UpstreamAuth.TokenRealms"/>. So Docker Hub's cross-host <c>auth.docker.io</c> is still
-  /// used — just anonymously, which is all a public mirror needs — while a compromised or spoofed
-  /// upstream cannot redirect a service account to a realm of its choosing.
+  /// Whether the matched upstream's credentials may be sent to this realm. A realm on the upstream's own
+  /// host and port is allowed outright (a registry that authenticates its own pulls), and anything else
+  /// must be declared in <see cref="UpstreamAuth.TokenRealms"/>. So Docker Hub's cross-host
+  /// <c>auth.docker.io</c> is still used — just anonymously, which is all a public mirror needs — while a
+  /// compromised or spoofed upstream cannot redirect a service account to a realm of its choosing.
+  /// <para>The port is part of "its own": another port is another service, which on a shared host may
+  /// well belong to someone else. A registry that really does host its token endpoint elsewhere needs one
+  /// <see cref="UpstreamAuth.TokenRealms"/> entry, and until it has one its pulls degrade to anonymous
+  /// rather than leaking the account.</para>
   /// </summary>
   public static bool MayForwardCredentials(Uri realm, Uri upstreamUri, UpstreamAuth? auth) =>
-    string.Equals(realm.Host, upstreamUri.Host, StringComparison.OrdinalIgnoreCase) ||
+    (string.Equals(realm.Host, upstreamUri.Host, StringComparison.OrdinalIgnoreCase) && realm.Port == upstreamUri.Port) ||
     (auth?.TokenRealms ?? []).Any(allowed => realm.AbsoluteUri.StartsWith(allowed, StringComparison.OrdinalIgnoreCase));
 
   private async Task<(string Token, TimeSpan ExpiresIn)> FetchTokenAsync(
