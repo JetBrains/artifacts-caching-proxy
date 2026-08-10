@@ -63,6 +63,18 @@ public class UpstreamTestServer : IAsyncLifetime
   public int PackumentRequestCount;
   public int TarballRequestCount;
 
+  // How long the /slow.txt route stalls before answering, so a test can put RequestTimeoutSec on either
+  // side of the upstream's own latency. The stall precedes the response head, which is the only phase
+  // that budget covers.
+  public volatile int SlowResponseDelayMs = 1500;
+
+  // Shape of the /slow-body.bin route: a complete head with a declared Content-Length, then the body
+  // dribbled out in chunks. That is a large layer on a slow link - the phase RequestTimeoutSec does not
+  // reach and IdleReadTimeoutSec does, with the chunk delay deciding which of the two a test exercises.
+  public volatile int SlowBodyChunks = 20;
+  public volatile int SlowBodyChunkDelayMs = 200;
+  public const int SlowBodyChunkSize = 1024;
+
   // Counts hits on the OCI distribution routes. The manifest-by-tag route is conditional-aware and
   // honours the shared Revalidate behavior, like the npm packument. ManifestAcceptHeaders records the
   // Accept of every manifest request in arrival order, so the tests can assert the client's own Accept
@@ -176,6 +188,43 @@ public class UpstreamTestServer : IAsyncLifetime
         res.ContentType = MediaTypeNames.Application.Octet;
         res.Headers[CachedResponse.DockerContentDigestHeader] = BlobDigest;
         return res.WriteAsync("blob-content");
+      })
+      .MapGet("slow.txt", async (req, res, data) =>
+      {
+        // Bail out on the abort the proxy raises when its budget expires, rather than writing into a dead
+        // connection and surfacing as a Kestrel error in the middle of an otherwise passing test.
+        try
+        {
+          await Task.Delay(SlowResponseDelayMs, req.HttpContext.RequestAborted);
+        }
+        catch (OperationCanceledException)
+        {
+          return;
+        }
+
+        res.ContentType = MediaTypeNames.Text.Plain;
+        await res.WriteAsync("slow-content");
+      })
+      .MapGet("slow-body.bin", async (req, res, data) =>
+      {
+        res.ContentType = MediaTypeNames.Application.Octet;
+        res.ContentLength = (long)SlowBodyChunks * SlowBodyChunkSize;
+
+        var chunk = new byte[SlowBodyChunkSize];
+        try
+        {
+          for (var i = 0; i < SlowBodyChunks; i++)
+          {
+            await res.Body.WriteAsync(chunk, req.HttpContext.RequestAborted);
+            await res.Body.FlushAsync(req.HttpContext.RequestAborted);
+            await Task.Delay(SlowBodyChunkDelayMs, req.HttpContext.RequestAborted);
+          }
+        }
+        catch (OperationCanceledException)
+        {
+          // The proxy gave up on the stall and dropped the connection; stop rather than surface a Kestrel
+          // error from writing into it.
+        }
       })
       .MapGet("v2/testimage/tags/list", (req, res, data) =>
       {

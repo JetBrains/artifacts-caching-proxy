@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Linq;
@@ -1420,6 +1421,153 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
     }
 
     Assert.Empty(CacheFiles()); // the stale copy was removed
+  }
+
+  // A proxy host with the two upstream time bounds under test, over its own cache directory: these tests
+  // share one upstream path and would otherwise HIT each other's stored copy instead of the upstream.
+  // No profile, so the path is cached forever and no revalidation muddies the timing.
+  private sealed record TimeoutProxy(TestServer Server, string CachePath);
+
+  private TimeoutProxy CreateTimeoutProxy(long requestTimeoutSec, long idleReadTimeoutSec)
+  {
+    var cachePath = Path.Combine(myTempDirectory, Path.GetRandomFileName());
+    Directory.CreateDirectory(cachePath);
+
+    var config = new CachingProxyConfig
+    {
+      LocalCachePath = cachePath,
+      Prefixes = [$"/slow={myUpstreamServer.Url}"],
+      MinimumFreeDiskSpaceMb = 2,
+      RequestTimeoutSec = requestTimeoutSec,
+      IdleReadTimeoutSec = idleReadTimeoutSec,
+    };
+
+    var host = new HostBuilder()
+      .ConfigureWebHost(webHostBuilder => webHostBuilder
+        .UseTestServer()
+        .ConfigureAppConfiguration(cfg =>
+          cfg.AddJsonStream(new MemoryStream(JsonSerializer.SerializeToUtf8Bytes(config))))
+        .ConfigureOurServices()
+        .ConfigureServices(services => services
+          .AddSingleton(config)
+          .Replace(ServiceDescriptor.Singleton<TimeProvider>(myTimeProvider)))
+        .Configure((context, builder) => builder.ConfigureOurApp(context.Configuration)))
+      .Build();
+
+    myExtraHosts.Add(host);
+    host.Start();
+    return new TimeoutProxy(host.GetTestServer(), cachePath);
+  }
+
+  private IEnumerable<string> StoredFiles(string cachePath) =>
+    Directory.EnumerateFiles(cachePath, "*", SearchOption.AllDirectories)
+      .Where(f => !f.Contains(".dataprotection-keys"));
+
+  [Fact]
+  public async Task Request_Budget_Bounds_The_Response_Head()
+  {
+    // The control for the test below: RequestTimeoutSec does bound something, namely the wait for the
+    // response head. Here the upstream stalls before answering at all, so the budget expires first and
+    // the request is negative-cached and served as a 404.
+    myUpstreamServer.SlowResponseDelayMs = 1500;
+    var proxy = CreateTimeoutProxy(requestTimeoutSec: 1, idleReadTimeoutSec: 60);
+
+    var stopwatch = Stopwatch.StartNew();
+    using var response = await proxy.Server.CreateRequest("/slow/slow.txt").GetAsync();
+    stopwatch.Stop();
+
+    Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    AssertStatusHeader(response, CachingProxyStatus.NEGATIVE_MISS);
+    // A missing route would 404 immediately and an unbounded wait would return the upstream's 200, so
+    // "404 after roughly the budget" is the only outcome that means the budget fired. Without the lower
+    // bound this assertion would also pass against an upstream that simply has no such route.
+    Assert.True(stopwatch.Elapsed > TimeSpan.FromMilliseconds(750),
+      $"expected to wait out the 1s budget, but the request returned in {stopwatch.ElapsedMilliseconds}ms");
+  }
+
+  [Fact]
+  public async Task Request_Budget_Does_Not_Bound_The_Body_Transfer()
+  {
+    // Pins a load-bearing and easily-misread property of HttpClient.Timeout: under
+    // HttpCompletionOption.ResponseHeadersRead it bounds the wait for the response head only, and stops
+    // counting once the head arrives. So no request budget limits how long a body takes - which is the
+    // entire download for an OCI layer, and why IdleReadTimeoutSec exists.
+    //
+    // Asserted rather than left implicit because the opposite is the intuitive reading, and sizing
+    // RequestTimeoutSec for a large download would be cargo-culting a bound that was never applied. If a
+    // future runtime starts charging the body against the budget, this test fails and the timeout
+    // comments in CachingProxyConfig and appsettings.json need revisiting.
+    myUpstreamServer.SlowBodyChunks = 8;
+    myUpstreamServer.SlowBodyChunkDelayMs = 500; // ~4s of body against the 1s budget below
+    var proxy = CreateTimeoutProxy(requestTimeoutSec: 1, idleReadTimeoutSec: 60);
+
+    var stopwatch = Stopwatch.StartNew();
+    using var response = await proxy.Server.CreateRequest("/slow/slow-body.bin").GetAsync();
+    var body = await response.Content.ReadAsByteArrayAsync();
+    stopwatch.Stop();
+
+    Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    AssertStatusHeader(response, CachingProxyStatus.MISS);
+    Assert.Equal(UpstreamTestServer.SlowBodyChunkSize * 8, body.Length);
+    Assert.True(stopwatch.Elapsed > TimeSpan.FromSeconds(2),
+      $"expected the body to outlast the 1s budget, but the whole request took {stopwatch.ElapsedMilliseconds}ms");
+  }
+
+  [Fact]
+  public async Task Idle_Read_Timeout_Abandons_A_Stalled_Body()
+  {
+    // The bound that does cover the body: the upstream sends a head and one chunk, then goes silent for
+    // far longer than IdleReadTimeoutSec. Nothing else would stop this - the head budget is already spent
+    // and RequestAborted only fires when our own client leaves.
+    myUpstreamServer.SlowBodyChunks = 5;
+    myUpstreamServer.SlowBodyChunkDelayMs = 5000;
+    var proxy = CreateTimeoutProxy(requestTimeoutSec: 20, idleReadTimeoutSec: 1);
+
+    using var client = proxy.Server.CreateClient();
+    var stopwatch = Stopwatch.StartNew();
+    using var response = await client.GetAsync("/slow/slow-body.bin", HttpCompletionOption.ResponseHeadersRead);
+
+    // The head was committed before the stall, so there is no error status to serve: 200 with a declared
+    // Content-Length the body will never reach.
+    Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    Assert.Equal(UpstreamTestServer.SlowBodyChunkSize * 5, GetContentLength(response));
+
+    // Which leaves aborting as the only honest signal, and HttpClient surfaces the short body as an error.
+    var error = await Record.ExceptionAsync(() => response.Content.ReadAsByteArrayAsync());
+    stopwatch.Stop();
+    Assert.NotNull(error);
+    Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(4),
+      $"expected to give up ~1s into the stall, but took {stopwatch.ElapsedMilliseconds}ms");
+
+    // A partial body must never become a cache entry, and the temp file it was written to must be gone.
+    Assert.Empty(StoredFiles(proxy.CachePath));
+  }
+
+  [Fact]
+  public async Task Idle_Read_Timeout_Tolerates_A_Slow_But_Progressing_Body()
+  {
+    // The point of an idle bound rather than a total one: this transfer takes ~2.4s with a 1s timeout and
+    // must still succeed, because no single gap exceeds it. A total budget generous enough for a
+    // multi-gigabyte layer would be useless as a hang detector; this one stays useful at any size.
+    myUpstreamServer.SlowBodyChunks = 8;
+    myUpstreamServer.SlowBodyChunkDelayMs = 300;
+    var proxy = CreateTimeoutProxy(requestTimeoutSec: 20, idleReadTimeoutSec: 1);
+
+    var stopwatch = Stopwatch.StartNew();
+    using var response = await proxy.Server.CreateRequest("/slow/slow-body.bin").GetAsync();
+    var body = await response.Content.ReadAsByteArrayAsync();
+    stopwatch.Stop();
+
+    Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    AssertStatusHeader(response, CachingProxyStatus.MISS);
+    Assert.Equal(UpstreamTestServer.SlowBodyChunkSize * 8, body.Length);
+    Assert.True(stopwatch.Elapsed > TimeSpan.FromSeconds(1),
+      $"expected the transfer to outlast the 1s idle timeout, but it took {stopwatch.ElapsedMilliseconds}ms");
+
+    // And it was stored, so the timeout did not quietly truncate what it let through.
+    using var hit = await proxy.Server.CreateRequest("/slow/slow-body.bin").GetAsync();
+    AssertStatusHeader(hit, CachingProxyStatus.HIT);
+    Assert.Equal(UpstreamTestServer.SlowBodyChunkSize * 8, (await hit.Content.ReadAsByteArrayAsync()).Length);
   }
 
   private async Task AssertGetResponse(string url, HttpStatusCode expectedCode,

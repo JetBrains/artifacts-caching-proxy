@@ -93,12 +93,31 @@ public class CachingProxyConfig
   public string LocalCachePath { get; init; } = Path.Combine(Path.GetTempPath(), "artifacts-caching-proxy");
   public string? BlacklistUrlRegex { get; init; }
   public long MinimumFreeDiskSpaceMb { get; init; } = 2048;
+
+  // How long to wait for an upstream's response head. Becomes HttpClient.Timeout, which - because every
+  // upstream fetch uses HttpCompletionOption.ResponseHeadersRead - stops counting once the head arrives
+  // and so does NOT bound the body transfer. IdleReadTimeoutSec covers the body instead. Pinned by
+  // CachingProxyTest.Request_Budget_Does_Not_Bound_The_Body_Transfer, because the whole-request reading of
+  // this value is the intuitive one and sizing it for a large download would be wrong.
   public long RequestTimeoutSec { get; init; } = 20;
 
-  // Upper bound on the TCP connect phase alone, separate from the whole-request RequestTimeoutSec.
-  // Without it a connect that never completes (an upstream silently dropping SYNs while
-  // rate-limiting, say) consumes the entire request budget and is reported as a timeout rather than
-  // a connect failure.
+  // Upper bound on the gap between two successive reads of an upstream response body, reset by any byte
+  // that arrives. Nothing else bounds a transfer that has begun: RequestTimeoutSec is already spent by
+  // then and RequestAborted only fires when our own client leaves, so without this an upstream that sends
+  // a head and then goes silent holds a request, a temp file and a connection until the socket dies.
+  //
+  // An idle bound rather than a total one because only the former can tell a slow transfer from a dead
+  // one - the distinction that matters for OCI layers, where a single blob runs to gigabytes and any total
+  // budget generous enough for it is useless as a hang detector. SocketsHttpHandler has no equivalent
+  // setting, so it is applied around the copy loop (see CachingProxy.CopyToTwoStreamsAsync).
+  //
+  // Sized for total silence, not slowness: a progressing transfer resets it on every read, so this only
+  // trips on a genuinely stalled connection.
+  public long IdleReadTimeoutSec { get; init; } = 60;
+
+  // Upper bound on the TCP connect phase alone, separate from RequestTimeoutSec. Without it a connect
+  // that never completes (an upstream silently dropping SYNs while rate-limiting, say) consumes the
+  // entire head budget and is reported as a timeout rather than a connect failure.
   public long ConnectTimeoutSec { get; init; } = 10;
 
   // Cap on simultaneous upstream connections per origin (.NET's default is unlimited). Intended as

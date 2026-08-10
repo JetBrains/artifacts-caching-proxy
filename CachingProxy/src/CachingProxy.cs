@@ -25,6 +25,7 @@ public class CachingProxy
   private readonly ResponseCache myResponseCache;
   private readonly TimeProvider myTimeProvider;
   private readonly string myLocalCachePath;
+  private readonly TimeSpan myIdleReadTimeout;
 
   private const int BUFFER_SIZE = 81920;
 
@@ -52,6 +53,9 @@ public class CachingProxy
     myRemoteProxy = remoteProxy;
     myResponseCache = responseCache;
     myTimeProvider = timeProvider;
+    myIdleReadTimeout = config.IdleReadTimeoutSec > 0
+      ? TimeSpan.FromSeconds(config.IdleReadTimeoutSec)
+      : Timeout.InfiniteTimeSpan;
   }
 
   public async Task InvokeAsync(HttpContext context)
@@ -217,7 +221,8 @@ public class CachingProxy
 
   // Streams the upstream body to the client while persisting it to the local cache via an atomic
   // temp-file + move, validating Content-Length. Returns the final cache file path, or null when the
-  // download was aborted (content-length mismatch or cancellation). Leaves no orphaned temp file.
+  // download was aborted (content-length mismatch, a stalled upstream, or cancellation). Leaves no
+  // orphaned temp file.
   private async Task<string?> DownloadToDiskAsync(HttpContext context, HttpResponseMessage response, Uri upstreamUri, string? variant)
   {
     var contentEncoding = response.Content.Headers.ContentEncoding.FirstOrDefault();
@@ -275,6 +280,18 @@ public class CachingProxy
       // Normalized so callers can compare it against a FileInfo.FullName (see the encoding-changed
       // cleanup in RevalidateAndServeAsync) without a raw-vs-normalized path-string mismatch.
       return Path.GetFullPath(cachedFile);
+    }
+    catch (TimeoutException e)
+    {
+      // The upstream went silent mid-body (see CopyToTwoStreamsAsync). Handled exactly like a
+      // Content-Length mismatch, and for the same reason: the head - status and all - was written and
+      // partially drained long ago, so there is no error response left to send, and the only honest signal
+      // is to abort so the client sees a truncated transfer instead of a body short of its Content-Length.
+      // Returning null keeps the partial temp file out of the cache (the finally below deletes it), and
+      // unlike a head-phase timeout nothing is negative-cached: the next request must retry, not 404.
+      myLogger.LogWarning(Event.Timeout, "Aborting {RequestPath}: {Reason}", context.Request.Path, e.Message);
+      context.Abort();
+      return null;
     }
     finally
     {
@@ -368,14 +385,40 @@ public class CachingProxy
   }
 
   // Returns the number of bytes copied, so the caller can validate Content-Length without stat'ing.
-  private static async Task<long> CopyToTwoStreamsAsync(Stream source, Stream dest1, FileStream dest2, CancellationToken cancellationToken)
+  //
+  // Enforces CachingProxyConfig.IdleReadTimeoutSec on the upstream reads: the timer is armed for each read
+  // and disarmed once bytes arrive, so it measures silence rather than total duration and a gigabyte-scale
+  // layer transfers for as long as it keeps making progress. This is the only bound on a body transfer -
+  // see the config comment for why HttpClient.Timeout is not one.
+  //
+  // Throws TimeoutException on a stall, so the caller can tell it from the OperationCanceledException a
+  // departing client raises. The writes stay on the caller's token: a client too slow to drain is Kestrel's
+  // to time out (MinResponseDataRate), and counting that as an upstream stall would blame the wrong side.
+  private async Task<long> CopyToTwoStreamsAsync(Stream source, Stream dest1, FileStream dest2, CancellationToken cancellationToken)
   {
     using var buffer = MemoryPool<byte>.Shared.Rent(BUFFER_SIZE);
     var memory = buffer.Memory;
+    using var idleCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
     long total = 0;
     while (true)
     {
-      var length = await source.ReadAsync(memory, cancellationToken).ConfigureAwait(false);
+      int length;
+      idleCts.CancelAfter(myIdleReadTimeout);
+      try
+      {
+        length = await source.ReadAsync(memory, idleCts.Token).ConfigureAwait(false);
+      }
+      catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+      {
+        // Our own token fired while the caller's did not, so this is the idle timer and not a disconnect.
+        throw new TimeoutException(
+          $"Upstream sent no data for {myIdleReadTimeout.TotalSeconds:0}s after {total} bytes");
+      }
+      finally
+      {
+        idleCts.CancelAfter(Timeout.InfiniteTimeSpan);
+      }
+
       if (length == 0)
         break;
 
