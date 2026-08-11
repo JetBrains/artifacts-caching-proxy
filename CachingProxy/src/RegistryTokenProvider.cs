@@ -17,6 +17,9 @@ namespace JetBrains.CachingProxy;
 /// <see cref="Realm"/> and <see cref="Service"/> say where a token comes from; <see cref="Scope"/> says
 /// what it is for, and only the registry knows how far it reaches. Remembered whole, per repository, so
 /// later requests for the same image can mint a token without being challenged first.
+/// <para><see cref="Scope"/> is empty for a token that asks for nothing in particular, which is what the
+/// <c>/v2/</c> ping needs: both Docker Hub and Space challenge it and both then issue an unscoped token
+/// that satisfies it.</para>
 /// </summary>
 public sealed record RegistryChallenge(Uri Realm, string? Service, string Scope);
 
@@ -73,8 +76,7 @@ public sealed class RegistryTokenProvider(
 
   /// <summary>
   /// The challenge to use without having been challenged: the one this repository issued last time, in
-  /// full. Null until it has challenged us once, and for a path that names no repository (the <c>/v2/</c>
-  /// ping, <c>/v2/_catalog</c>), which then simply pays the 401 and reads the scope off it.
+  /// full. Null until it has challenged us once.
   /// <para>Remembered per repository rather than per host because the scope is the registry's to define
   /// and cannot be computed from the path: the segments between the API root and the verb may be a
   /// repository name in full (Docker Hub answers <c>/v2/library/ubuntu/manifests/latest</c> with
@@ -83,19 +85,12 @@ public sealed class RegistryTokenProvider(
   /// <c>repository:p/ij/docker-hub:pull</c>). Nothing in the URL says which, so we ask. Every request for
   /// one image shares the key, manifest and blobs alike, so a whole pull pays that single 401 once.</para>
   /// </summary>
-  public async ValueTask<RegistryChallenge?> GetRememberedChallengeAsync(Uri upstreamUri, CancellationToken ct)
-  {
-    if (RepositoryKey(upstreamUri) is not { } key)
-      return null;
-
-    return await cache.GetOrDefaultAsync<RegistryChallenge>(key, options: MemoryOnly(), token: ct);
-  }
+  public async ValueTask<RegistryChallenge?> GetRememberedChallengeAsync(Uri upstreamUri, CancellationToken ct) =>
+    await cache.GetOrDefaultAsync<RegistryChallenge>(ChallengeKey(upstreamUri), options: MemoryOnly(), token: ct);
 
   /// <summary>Remembers a repository's challenge so later requests for it skip the 401 round-trip.</summary>
   public ValueTask RememberChallengeAsync(Uri upstreamUri, RegistryChallenge challenge, CancellationToken ct) =>
-    RepositoryKey(upstreamUri) is { } key ?
-      cache.SetAsync(key, challenge, MemoryOnly().SetDuration(ourChallengeMemory), token: ct) :
-      ValueTask.CompletedTask;
+    cache.SetAsync(ChallengeKey(upstreamUri), challenge, MemoryOnly().SetDuration(ourChallengeMemory), token: ct);
 
   /// <summary>
   /// The token for <paramref name="challenge"/>, minted on demand and cached until shortly before it
@@ -139,7 +134,9 @@ public sealed class RegistryTokenProvider(
 
   /// <summary>
   /// Parses the <c>Bearer</c> challenge off a registry's 401. The scope is taken from the challenge when
-  /// present and otherwise derived from the request path, since some registries challenge without one.
+  /// present, since some registries challenge without one; failing that it is derived from the request
+  /// path, and failing that the token is asked for unscoped — which is exactly right for the <c>/v2/</c>
+  /// ping, and for anything else costs one token request to arrive at the same 401.
   /// Returns null when there is no usable Bearer challenge, or when its realm is not an absolute HTTPS
   /// URL (loopback excepted, for tests): a token request carries credentials and must not go out in the
   /// clear or to a relative/opaque target.
@@ -157,10 +154,7 @@ public sealed class RegistryTokenProvider(
           !realmUri.IsSecureOrLoopback())
         continue;
 
-      var scope = parameters.GetValueOrDefault("scope") ?? TryDeriveScope(upstreamUri);
-      if (scope == null)
-        continue;
-
+      var scope = parameters.GetValueOrDefault("scope") ?? TryDeriveScope(upstreamUri) ?? "";
       return new RegistryChallenge(realmUri, parameters.GetValueOrDefault("service"), scope);
     }
 
@@ -211,10 +205,14 @@ public sealed class RegistryTokenProvider(
   {
     var builder = new UriBuilder(challenge.Realm);
     var query = builder.Query.TrimStart('?');
-    var parameters = $"scope={Uri.EscapeDataString(challenge.Scope)}";
+    // An empty scope is omitted rather than sent empty: the ping wants a token for nothing in particular,
+    // and "scope=" is not the same request.
+    var parameters = new List<string>();
+    if (!string.IsNullOrEmpty(challenge.Scope))
+      parameters.Add($"scope={Uri.EscapeDataString(challenge.Scope)}");
     if (!string.IsNullOrEmpty(challenge.Service))
-      parameters += $"&service={Uri.EscapeDataString(challenge.Service)}";
-    builder.Query = query.Length > 0 ? $"{query}&{parameters}" : parameters;
+      parameters.Add($"service={Uri.EscapeDataString(challenge.Service)}");
+    builder.Query = string.Join('&', query.Length > 0 ? parameters.Prepend(query) : parameters);
 
     using var http = httpClientFactory.CreateClient();
     using var request = new HttpRequestMessage(HttpMethod.Get, builder.Uri) { Headers = { Authorization = credentials } };
@@ -236,16 +234,17 @@ public sealed class RegistryTokenProvider(
     return (token, expiresIn);
   }
 
-  // What identifies the repository being pulled: the authority plus the path down to the API verb, so a
-  // manifest and every blob of one image agree. Null when the path names no repository at all, which is
-  // also what keeps the /v2/ ping off the preemptive path.
-  private static string? RepositoryKey(Uri upstreamUri)
+  // What the remembered challenge belongs to: the authority plus the path down to the API verb, so a
+  // manifest and every blob of one image agree on it. A path with no verb - the /v2/ ping above all - is
+  // its own key rather than no key, because it is challenged too and its (unscoped) token is just as
+  // worth remembering.
+  private static string ChallengeKey(Uri upstreamUri)
   {
     var segments = upstreamUri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
     var verb = Array.FindLastIndex(segments, segment => ourApiVerbs.Contains(segment));
-    if (verb <= 0) return null;
+    var repository = string.Join('/', segments, 0, verb > 0 ? verb : segments.Length);
 
-    return $"registry-challenge::{upstreamUri.Authority}::{string.Join('/', segments, 0, verb)}";
+    return $"registry-challenge::{upstreamUri.Authority}::{repository}";
   }
 
   /// <summary>

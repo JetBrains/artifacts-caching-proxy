@@ -48,6 +48,7 @@ public class RegistryServiceAccountTest : IAsyncLifetime
   private int myTokenRequests;
   private string myTokenAuthHeader = "";
   private string myTokenScope = "";
+  private string myTokenQuery = "";
 
   public RegistryServiceAccountTest()
   {
@@ -62,11 +63,12 @@ public class RegistryServiceAccountTest : IAsyncLifetime
         // What every mainstream registry answers, anonymous pull or not. The realm is on another host, so
         // whether the account travels there is UpstreamAuth.TokenRealms' decision.
         //
-        // The two routes differ in one respect on purpose: this one names a scope, and names a group
-        // rather than the image, the way Space does; the /other/ one below names none. Nothing in a URL
-        // says which a registry will do, which is the whole reason the scope is learned and not computed.
+        // Which routes name a scope is the point of the exercise. This one does, and names a group rather
+        // than the image, the way Space does; /other/ names none, as some registries do; the ping cannot
+        // name one at all. Nothing in a URL says which a registry will do, which is why the scope is
+        // learned and not computed.
         res.StatusCode = (int)HttpStatusCode.Unauthorized;
-        var scope = path.StartsWith("v2/other/") ? "" : $",scope=\"{GroupScope}\"";
+        var scope = path.StartsWith("v2/library/") ? $",scope=\"{GroupScope}\"" : "";
         res.Headers["WWW-Authenticate"] =
           $"Bearer realm=\"{UrlOf(myTokenServer!)}token\",service=\"registry.test\"{scope}";
         return Task.CompletedTask;
@@ -81,6 +83,7 @@ public class RegistryServiceAccountTest : IAsyncLifetime
       Interlocked.Increment(ref myTokenRequests);
       myTokenAuthHeader = req.Headers.Authorization.ToString();
       myTokenScope = req.Query["scope"].ToString();
+      myTokenQuery = req.QueryString.Value ?? "";
 
       res.ContentType = "application/json";
       return res.WriteAsync(JsonSerializer.Serialize(new { token = IssuedToken, expires_in = 300 }));
@@ -134,6 +137,23 @@ public class RegistryServiceAccountTest : IAsyncLifetime
     Assert.Equal("", myTokenAuthHeader);
     // This route challenges without a scope, so the path supplies one - the fallback, end to end.
     Assert.Equal("repository:other/library/foreign:pull", myTokenScope);
+  }
+
+  [Fact]
+  public async Task The_Upstream_Ping_Is_Satisfied_By_An_Unscoped_Token()
+  {
+    using var client = myProxyHost!.GetTestServer().CreateClient();
+
+    // The registry's own /v2/ - the base of the mirror, not this proxy's root ping. It names no
+    // repository, so there is no scope to state or to derive, and a registry answers it with a token
+    // minted for nothing in particular. Refusing to mint one relays the 401 and the mirror looks dead.
+    var response = await client.GetAsync("/v2/allowlisted/");
+
+    Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    Assert.Equal(1, myTokenRequests);
+    // Omitted, not sent empty: "scope=" is a different request from no scope at all.
+    Assert.DoesNotContain("scope", myTokenQuery);
+    Assert.Equal(["", $"Bearer {IssuedToken}"], AuthSeenAt("v2/"));
   }
 
   private string[] AuthSeenAt(string path) => [.. myRegistryAuthByPath[path]];

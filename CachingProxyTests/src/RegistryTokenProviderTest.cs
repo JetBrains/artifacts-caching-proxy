@@ -58,6 +58,19 @@ public class RegistryTokenProviderTest
     Assert.Equal("repository:p/ij/docker-hub:pull", challenge.Scope);
   }
 
+  [Fact]
+  public void The_Ping_Is_Challenged_Too_And_Takes_An_Unscoped_Token()
+  {
+    // GET /v2/ names no repository, and both Hub and Space challenge it and then issue a token for no
+    // scope in particular that satisfies it. Treating "no scope to derive" as "no token to mint" would
+    // leave the ping 401 and the mirror unusable.
+    var challenge = Parse("Bearer realm=\"https://auth.docker.io/token\",service=\"registry.docker.io\"",
+      "https://registry-1.docker.io/v2/");
+
+    Assert.NotNull(challenge);
+    Assert.Equal("", challenge.Scope);
+  }
+
   [Theory]
   // Not a Bearer challenge: nothing to mint, so the 401 is the upstream's answer to relay.
   [InlineData("Basic realm=\"registry\"")]
