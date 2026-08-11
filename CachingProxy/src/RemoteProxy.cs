@@ -182,7 +182,7 @@ public partial class RemoteProxy(
 
     logger.LogDebug("Downloading from {UpstreamUri}", upstreamUri);
 
-    var request = new HttpRequestMessage(isHead ? HttpMethod.Head : HttpMethod.Get, upstreamUri);
+    using var request = new HttpRequestMessage(isHead ? HttpMethod.Head : HttpMethod.Get, upstreamUri);
     ForwardAccept(context, request, rule);
 
     HttpResponseMessage response;
@@ -298,7 +298,7 @@ public partial class RemoteProxy(
   {
     logger.LogDebug("Revalidating {UpstreamUri}", upstreamUri);
 
-    var request = new HttpRequestMessage(HttpMethod.Get, upstreamUri);
+    using var request = new HttpRequestMessage(HttpMethod.Get, upstreamUri);
     if (!string.IsNullOrEmpty(etag) && EntityTagHeaderValue.TryParse(etag, out var parsedEtag))
       request.Headers.IfNoneMatch.Add(parsedEtag);
     if (lastModified.HasValue)
@@ -415,15 +415,16 @@ public partial class RemoteProxy(
     if (token == null)
       return response;
 
-    // Only remembered once a token was actually obtained, so a bogus challenge cannot poison the
-    // preemptive path for this repository.
-    await registryTokenProvider.RememberChallengeAsync(upstreamUri, challenge, cancellationToken);
+    using (response)
+    {
+      // Only remembered once a token was actually obtained, so a bogus challenge cannot poison the
+      // preemptive path for this repository.
+      await registryTokenProvider.RememberChallengeAsync(upstreamUri, challenge, cancellationToken);
 
-    var retry = CloneForRetry(request);
-    retry.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-    var retried = await httpClient.Client.SendAsync(retry, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
-    response.Dispose();
-    return retried;
+      using var retry = CloneForRetry(request);
+      retry.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+      return await httpClient.Client.SendAsync(retry, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+    }
   }
 
   // An HttpRequestMessage cannot be re-sent, so a retry needs a copy. Carries over the conditional
