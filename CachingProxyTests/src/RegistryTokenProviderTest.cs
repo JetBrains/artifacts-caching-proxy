@@ -44,6 +44,20 @@ public class RegistryTokenProviderTest
     Assert.Equal("registry.example.com", challenge.Service);
   }
 
+  [Fact]
+  public void A_Stated_Scope_Beats_The_One_The_Path_Suggests()
+  {
+    // Where a mirror is served under a prefix, the registry may scope to the prefix and not to the image
+    // inside it - Space does exactly this - and the URL gives no way to tell. So the challenge decides,
+    // even when the path would have derived something perfectly plausible.
+    var challenge = Parse(
+      "Bearer realm=\"https://registry.jetbrains.team/token\",scope=\"repository:p/ij/docker-hub:pull\"",
+      "https://registry.jetbrains.team/v2/p/ij/docker-hub/library/ubuntu/manifests/latest");
+
+    Assert.NotNull(challenge);
+    Assert.Equal("repository:p/ij/docker-hub:pull", challenge.Scope);
+  }
+
   [Theory]
   // Not a Bearer challenge: nothing to mint, so the 401 is the upstream's answer to relay.
   [InlineData("Basic realm=\"registry\"")]
@@ -69,12 +83,13 @@ public class RegistryTokenProviderTest
   [InlineData("https://registry-1.docker.io/v2/library/ubuntu/manifests/24.04", "repository:library/ubuntu:pull")]
   [InlineData("https://registry-1.docker.io/v2/library/ubuntu/blobs/sha256:abcdef0123456789abcdef0123456789", "repository:library/ubuntu:pull")]
   [InlineData("https://registry-1.docker.io/v2/library/ubuntu/tags/list", "repository:library/ubuntu:pull")]
-  // A registry serving mirrors under a project path: /v2 is still at the root, and the project path is
-  // just part of the repository name.
+  // A registry serving mirrors under a project path. Taking the whole path as the name is a guess, and one
+  // that registry happens to disagree with - but it only ever applies where the challenge named no scope,
+  // and there is nothing better to guess from.
   [InlineData("https://registry.jetbrains.team/v2/p/ij/containers/team/img/manifests/1.0", "repository:p/ij/containers/team/img:pull")]
   // A repository named after an API verb: the verb that delimits the name is the last one.
   [InlineData("https://registry.example.com/v2/manifests/manifests/latest", "repository:manifests:pull")]
-  public void Scope_Is_The_Repository_Between_v2_And_The_Api_Verb(string upstream, string expected) =>
+  public void Fallback_Scope_Is_The_Repository_Between_v2_And_The_Api_Verb(string upstream, string expected) =>
     Assert.Equal(expected, RegistryTokenProvider.TryDeriveScope(new Uri(upstream)));
 
   [Theory]

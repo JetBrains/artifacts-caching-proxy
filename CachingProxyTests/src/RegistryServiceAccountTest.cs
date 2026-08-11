@@ -33,6 +33,10 @@ public class RegistryServiceAccountTest : IAsyncLifetime
   private const string Pat = "dckr_pat_do_not_log_me";
   private const string IssuedToken = "issued-registry-token";
 
+  // Deliberately shorter than the path being pulled (library/allowed): a registry may scope to a group of
+  // repositories, and its answer is the only way to know it does.
+  private const string GroupScope = "repository:library:pull";
+
   private readonly WebApplication myRegistryServer;
   private readonly WebApplication myTokenServer;
   private string myTempDirectory = "";
@@ -57,9 +61,14 @@ public class RegistryServiceAccountTest : IAsyncLifetime
       {
         // What every mainstream registry answers, anonymous pull or not. The realm is on another host, so
         // whether the account travels there is UpstreamAuth.TokenRealms' decision.
+        //
+        // The two routes differ in one respect on purpose: this one names a scope, and names a group
+        // rather than the image, the way Space does; the /other/ one below names none. Nothing in a URL
+        // says which a registry will do, which is the whole reason the scope is learned and not computed.
         res.StatusCode = (int)HttpStatusCode.Unauthorized;
+        var scope = path.StartsWith("v2/other/") ? "" : $",scope=\"{GroupScope}\"";
         res.Headers["WWW-Authenticate"] =
-          $"Bearer realm=\"{UrlOf(myTokenServer!)}token\",service=\"registry.test\"";
+          $"Bearer realm=\"{UrlOf(myTokenServer!)}token\",service=\"registry.test\"{scope}";
         return Task.CompletedTask;
       }
 
@@ -90,12 +99,13 @@ public class RegistryServiceAccountTest : IAsyncLifetime
     Assert.Equal(HttpStatusCode.OK, first.StatusCode);
     Assert.Equal(HttpStatusCode.OK, second.StatusCode);
 
-    // The account is presented at the token endpoint, as Basic, and the scope is the repository being
-    // pulled - not the alias the client used.
+    // The account is presented at the token endpoint, as Basic, and the token is asked for exactly the
+    // scope the registry named - not the wider one the path suggests, and not the alias the client used.
     Assert.Equal("Basic " + Convert.ToBase64String(Encoding.UTF8.GetBytes($"{Account}:{Pat}")), myTokenAuthHeader);
-    Assert.Equal("repository:library/allowed:pull", myTokenScope);
+    Assert.Equal(GroupScope, myTokenScope);
 
-    // One token for both tags: same scope, same account, so it is minted once and reused.
+    // One token for both tags: the challenge is remembered whole, scope included, so the second pull mints
+    // nothing. Deriving the scope again instead would ask for a different one and pay for a second token.
     Assert.Equal(1, myTokenRequests);
 
     // The first pull goes out unauthenticated, pays the 401 and retries with the minted token. The PAT is
@@ -105,7 +115,7 @@ public class RegistryServiceAccountTest : IAsyncLifetime
     // Scheme-level, so it holds however the credential is encoded.
     Assert.DoesNotContain("Basic", string.Join(" ", myRegistryAuthByPath.Values.SelectMany(queue => queue)));
 
-    // The second pull pays no 401: the realm learned from the first is reused to mint up front.
+    // The second pull pays no 401: the challenge learned from the first is reused to mint up front.
     Assert.Equal([$"Bearer {IssuedToken}"], AuthSeenAt("v2/library/allowed/manifests/2.0"));
   }
 
@@ -122,6 +132,7 @@ public class RegistryServiceAccountTest : IAsyncLifetime
     Assert.Equal(HttpStatusCode.OK, response.StatusCode);
     Assert.Equal(1, myTokenRequests);
     Assert.Equal("", myTokenAuthHeader);
+    // This route challenges without a scope, so the path supplies one - the fallback, end to end.
     Assert.Equal("repository:other/library/foreign:pull", myTokenScope);
   }
 

@@ -386,11 +386,11 @@ public partial class RemoteProxy(
   /// <see cref="RegistryTokenProvider.MayForwardCredentials"/>) and the only thing this request ever
   /// carries is a minted token. Offering the account to the registry as well would hand a long-lived
   /// credential to an endpoint that has no use for it.</para>
-  /// <para>Two paths. Steady state: this host's realm is already known, so a token is attached up front
-  /// and no 401 is paid. First contact: the request goes out unauthenticated, the registry's 401 carries
-  /// the challenge, we mint a token for it, remember the realm for next time and retry — <b>once</b>, so a
-  /// registry that keeps answering 401 (genuinely unauthorized, wrong service account) has that answer
-  /// relayed instead of being retried in a loop.</para>
+  /// <para>Two paths. Steady state: this repository's challenge is already known, so a token is attached
+  /// up front and no 401 is paid. First contact: the request goes out unauthenticated, the registry's 401
+  /// carries the challenge, we mint a token for it, remember the challenge for next time and retry —
+  /// <b>once</b>, so a registry that keeps answering 401 (genuinely unauthorized, wrong service account)
+  /// has that answer relayed instead of being retried in a loop.</para>
   /// </summary>
   private async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, Uri upstreamUri,
     UpstreamAuth? auth, CachingProfile? profile, AuthenticationHeaderValue? credentials,
@@ -416,7 +416,7 @@ public partial class RemoteProxy(
       return response;
 
     // Only remembered once a token was actually obtained, so a bogus challenge cannot poison the
-    // preemptive path for the whole host.
+    // preemptive path for this repository.
     await registryTokenProvider.RememberChallengeAsync(upstreamUri, challenge, cancellationToken);
 
     var retry = CloneForRetry(request);

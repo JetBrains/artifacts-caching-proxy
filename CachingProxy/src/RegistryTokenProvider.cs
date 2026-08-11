@@ -14,9 +14,9 @@ namespace JetBrains.CachingProxy;
 
 /// <summary>
 /// One parsed <c>WWW-Authenticate: Bearer realm=…,service=…,scope=…</c> challenge from an OCI registry.
-/// <see cref="Scope"/> is what the token is requested for and is the part that varies per repository;
-/// <see cref="Realm"/> and <see cref="Service"/> are properties of the registry and are remembered per
-/// host so later requests can mint a token without being challenged first.
+/// <see cref="Realm"/> and <see cref="Service"/> say where a token comes from; <see cref="Scope"/> says
+/// what it is for, and only the registry knows how far it reaches. Remembered whole, per repository, so
+/// later requests for the same image can mint a token without being challenged first.
 /// </summary>
 public sealed record RegistryChallenge(Uri Realm, string? Service, string Scope);
 
@@ -56,13 +56,13 @@ public sealed class RegistryTokenProvider(
   // Per the distribution spec, an omitted expires_in means 60 seconds.
   private static readonly TimeSpan ourDefaultDuration = TimeSpan.FromSeconds(60);
 
-  // How long a host's realm/service is remembered so subsequent requests can mint a token proactively
+  // How long a repository's challenge is remembered so subsequent requests can mint a token proactively
   // instead of being challenged again. It is not a secret and it never changes in practice, so this is
   // only a bound on how long a genuine registry-side change goes unnoticed.
   private static readonly TimeSpan ourChallengeMemory = TimeSpan.FromHours(1);
 
-  // The path segments the OCI distribution API defines after the repository name. Used to split
-  // "/v2/<name>/<verb>/<reference>" into the repository name a token scope needs.
+  // The path segments the OCI distribution API defines after the repository name. Used to cut
+  // "/v2/<name>/<verb>/<reference>" back to the part that identifies what is being pulled.
   private static readonly string[] ourApiVerbs = ["manifests", "blobs", "tags", "referrers"];
 
   // Registry tokens, and the realms they came from, stay in memory: the tokens are short-lived secrets
@@ -72,25 +72,30 @@ public sealed class RegistryTokenProvider(
     new FusionCacheEntryOptions().SetSkipDistributedCache(true, true);
 
   /// <summary>
-  /// The challenge to use without having been challenged, from the realm/service remembered for this
-  /// upstream's host plus the scope derived from its path. Null until the host has challenged us once,
-  /// or when the path is not a recognisable distribution-API path (then the challenge itself supplies
-  /// the scope — see <see cref="TryParseChallenge"/>).
+  /// The challenge to use without having been challenged: the one this repository issued last time, in
+  /// full. Null until it has challenged us once, and for a path that names no repository (the <c>/v2/</c>
+  /// ping, <c>/v2/_catalog</c>), which then simply pays the 401 and reads the scope off it.
+  /// <para>Remembered per repository rather than per host because the scope is the registry's to define
+  /// and cannot be computed from the path: the segments between the API root and the verb may be a
+  /// repository name in full (Docker Hub answers <c>/v2/library/ubuntu/manifests/latest</c> with
+  /// <c>repository:library/ubuntu:pull</c>) or a mirror prefix with an image inside it, where the scope
+  /// names only the prefix (Space answers <c>/v2/p/ij/docker-hub/library/ubuntu/manifests/latest</c> with
+  /// <c>repository:p/ij/docker-hub:pull</c>). Nothing in the URL says which, so we ask. Every request for
+  /// one image shares the key, manifest and blobs alike, so a whole pull pays that single 401 once.</para>
   /// </summary>
   public async ValueTask<RegistryChallenge?> GetRememberedChallengeAsync(Uri upstreamUri, CancellationToken ct)
   {
-    if (TryDeriveScope(upstreamUri) is not { } scope)
+    if (RepositoryKey(upstreamUri) is not { } key)
       return null;
 
-    var remembered = await cache.GetOrDefaultAsync<RegistryRealm>(
-      ChallengeKey(upstreamUri), options: MemoryOnly(), token: ct);
-    return remembered == null ? null : new RegistryChallenge(remembered.Realm, remembered.Service, scope);
+    return await cache.GetOrDefaultAsync<RegistryChallenge>(key, options: MemoryOnly(), token: ct);
   }
 
-  /// <summary>Remembers a host's realm/service so later requests skip the 401 round-trip.</summary>
+  /// <summary>Remembers a repository's challenge so later requests for it skip the 401 round-trip.</summary>
   public ValueTask RememberChallengeAsync(Uri upstreamUri, RegistryChallenge challenge, CancellationToken ct) =>
-    cache.SetAsync(ChallengeKey(upstreamUri), new RegistryRealm(challenge.Realm, challenge.Service),
-      MemoryOnly().SetDuration(ourChallengeMemory), token: ct);
+    RepositoryKey(upstreamUri) is { } key ?
+      cache.SetAsync(key, challenge, MemoryOnly().SetDuration(ourChallengeMemory), token: ct) :
+      ValueTask.CompletedTask;
 
   /// <summary>
   /// The token for <paramref name="challenge"/>, minted on demand and cached until shortly before it
@@ -163,17 +168,17 @@ public sealed class RegistryTokenProvider(
   }
 
   /// <summary>
-  /// The pull scope for an upstream URL, i.e. <c>repository:&lt;name&gt;:pull</c>. The distribution API
-  /// fixes the shape <c>/v2/&lt;name&gt;/&lt;verb&gt;/&lt;reference&gt;</c>: <c>/v2</c> is the API root and
-  /// sits directly under the registry host — a client has no way to address it anywhere else — and the
-  /// repository name is everything between it and the verb, slashes included. So a registry serving
-  /// mirrors under a project path simply has longer names, e.g.
-  /// <c>repository:p/ij/docker-hub/library/ubuntu:pull</c>. Null for anything not of that shape, including
-  /// <c>/v2/_catalog</c> (whose scope is <c>registry:catalog:*</c>, and which the docker profile redirects
-  /// rather than proxies).
-  /// <para>Only a fallback: a challenge that names its own scope wins, and some registries scope by
-  /// repository group rather than by image (Space answers the image path above with
-  /// <c>repository:p/ij/docker-hub:pull</c>).</para>
+  /// The pull scope to fall back on when a challenge states none: <c>repository:&lt;name&gt;:pull</c>, with
+  /// the name taken to be everything between the API root and the verb, after the shape the distribution
+  /// API fixes — <c>/v2/&lt;name&gt;/&lt;verb&gt;/&lt;reference&gt;</c>, <c>/v2</c> sitting directly under
+  /// the registry host because a client has no way to address it anywhere else. Null for anything not of
+  /// that shape, including <c>/v2/_catalog</c> (whose scope is <c>registry:catalog:*</c>, and which the
+  /// docker profile redirects rather than proxies).
+  /// <para>A guess, and used only where there is nothing better: where a mirror is served under a prefix
+  /// the registry may draw the repository boundary inside that path — Space answers
+  /// <c>/v2/p/ij/docker-hub/library/ubuntu/manifests/latest</c> with <c>repository:p/ij/docker-hub:pull</c>
+  /// — and the URL does not say where. A stated scope always wins, and the preemptive path uses the
+  /// remembered challenge instead of this (see <see cref="GetRememberedChallengeAsync"/>).</para>
   /// </summary>
   public static string? TryDeriveScope(Uri upstreamUri)
   {
@@ -231,9 +236,17 @@ public sealed class RegistryTokenProvider(
     return (token, expiresIn);
   }
 
-  // Keyed by host, not by prefix: realm and service are properties of the registry, while the
-  // per-repository part (the scope) is derived per request.
-  private static string ChallengeKey(Uri upstreamUri) => $"registry-challenge::{upstreamUri.Host}";
+  // What identifies the repository being pulled: the authority plus the path down to the API verb, so a
+  // manifest and every blob of one image agree. Null when the path names no repository at all, which is
+  // also what keeps the /v2/ ping off the preemptive path.
+  private static string? RepositoryKey(Uri upstreamUri)
+  {
+    var segments = upstreamUri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+    var verb = Array.FindLastIndex(segments, segment => ourApiVerbs.Contains(segment));
+    if (verb <= 0) return null;
+
+    return $"registry-challenge::{upstreamUri.Authority}::{string.Join('/', segments, 0, verb)}";
+  }
 
   /// <summary>
   /// The auth-params of a <c>Bearer</c> challenge, e.g.
@@ -283,10 +296,6 @@ public sealed class RegistryTokenProvider(
     var value = part[(separator + 1)..].Trim().Trim('"');
     if (name.Length > 0 && value.Length > 0) into[name.ToString()] = value.ToString();
   }
-
-  // The remembered half of a challenge (see GetRememberedChallengeAsync). Memory-only, so it needs no
-  // serializer support.
-  private sealed record RegistryRealm(Uri Realm, string? Service);
 
   private sealed class TokenResponse
   {
