@@ -85,8 +85,8 @@ public sealed class RegistryTokenProvider(
   /// <c>repository:p/ij/docker-hub:pull</c>). Nothing in the URL says which, so we ask. Every request for
   /// one image shares the key, manifest and blobs alike, so a whole pull pays that single 401 once.</para>
   /// </summary>
-  public async ValueTask<RegistryChallenge?> GetRememberedChallengeAsync(Uri upstreamUri, CancellationToken ct) =>
-    await cache.GetOrDefaultAsync<RegistryChallenge>(ChallengeKey(upstreamUri), options: MemoryOnly(), token: ct);
+  public ValueTask<RegistryChallenge?> GetRememberedChallengeAsync(Uri upstreamUri, CancellationToken ct) =>
+    cache.GetOrDefaultAsync<RegistryChallenge>(ChallengeKey(upstreamUri), options: MemoryOnly(), token: ct);
 
   /// <summary>Remembers a repository's challenge so later requests for it skip the 401 round-trip.</summary>
   public ValueTask RememberChallengeAsync(Uri upstreamUri, RegistryChallenge challenge, CancellationToken ct) =>

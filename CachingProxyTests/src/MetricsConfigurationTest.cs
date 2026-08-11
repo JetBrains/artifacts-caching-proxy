@@ -20,7 +20,13 @@ namespace JetBrains.CachingProxy.Tests;
 /// they are properties of the exposition as a whole -- so these tests scrape the real
 /// <c>/metrics</c> endpoint through <see cref="MetricsConfiguration.ConfigureOurMetrics"/> and count what
 /// Prometheus would actually count, rather than reasoning about views and boundaries.
+/// <para>Run alone: a MeterProvider subscribes to meters by name, process-wide, so any other test host up
+/// at the same time contributes its own series to this scrape - most visibly the runtime's own
+/// <c>Microsoft.AspNetCore.Authentication</c> meter, which every proxy test host creates. Counting samples
+/// is only meaningful when nothing else is emitting them.</para>
 /// </summary>
+[Collection(nameof(MetricsConfigurationTest))]
+[CollectionDefinition(nameof(MetricsConfigurationTest), DisableParallelization = true)]
 public class MetricsConfigurationTest(ITestOutputHelper output)
 {
   // Target labels Prometheus merges into every sample from the kubernetes-pods job (app, pod index,
