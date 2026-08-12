@@ -1,5 +1,7 @@
-﻿using System.Collections.Generic;
+﻿using System;
+using System.Collections.Generic;
 using System.Diagnostics.Metrics;
+using System.IO;
 
 namespace JetBrains.CachingProxy;
 
@@ -10,11 +12,52 @@ public class CachingProxyMetrics
   private readonly Counter<long> myRequestsCounter;
   private readonly Counter<long> myRedirectSignatureCounter;
 
-  public CachingProxyMetrics(IMeterFactory meterFactory)
+  public CachingProxyMetrics(IMeterFactory meterFactory, CachingProxyConfig config)
   {
     Meter = meterFactory.Create(MeterName);
     myRequestsCounter = Meter.CreateCounter<long>("caching_requests");
     myRedirectSignatureCounter = Meter.CreateCounter<long>("caching_redirect_signature_verifications");
+
+    // Headroom on the volume the cache writes to. This is what actually runs out: in disk mode the cache
+    // is a host path shared with whatever else the node runs, and eviction is driven by
+    // CachingProxy.HealthCheck taking the process out of service, not by a quota. Three series, no tags.
+    //
+    // Free is the number that moves. Total is published so a dashboard can show a ratio without pinning
+    // node size into the query, and it re-reads per scrape rather than being captured once because a
+    // resized volume must not keep reporting the old size. The minimum is the health check's own trip
+    // point, so an alert reads `free < minimum` and keeps agreeing with the health check after the knob
+    // moves.
+    Meter.CreateObservableGauge("local_cache_disk_free_bytes",
+      () => ObserveVolume(config.LocalCachePath, static drive => drive.AvailableFreeSpace),
+      "bytes", "Free bytes on the volume holding the local cache");
+
+    Meter.CreateObservableGauge("local_cache_disk_total_bytes",
+      () => ObserveVolume(config.LocalCachePath, static drive => drive.TotalSize),
+      "bytes", "Size of the volume holding the local cache");
+
+    Meter.CreateObservableGauge("local_cache_disk_minimum_free_bytes",
+      () => config.MinimumFreeDiskSpaceMb * 1024 * 1024,
+      "bytes", "Free bytes below which the health check reports unhealthy");
+  }
+
+  /// <summary>
+  /// Reads one field of the cache volume, publishing nothing if the read fails. Nothing rather than zero:
+  /// zero free bytes is a real and alarming value, so a failed statfs must not be able to forge it. An
+  /// unreadable cache path is already a health-check failure, which is the signal that belongs to it.
+  /// </summary>
+  private static IEnumerable<Measurement<long>> ObserveVolume(string path, Func<DriveInfo, long> read)
+  {
+    long value;
+    try
+    {
+      value = read(new DriveInfo(path));
+    }
+    catch (Exception)
+    {
+      yield break;
+    }
+
+    yield return new Measurement<long>(value);
   }
 
   public Meter Meter { get; }
