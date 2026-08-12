@@ -779,8 +779,8 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     AssertStatusHeader(response, CachingProxyStatus.REVALIDATED);
     Assert.Equal("\"upstream-v1\"", upstreamServer.RevalidateIfNoneMatch);
     Assert.Equal("\"upstream-v1\"", myS3.UpstreamETags[key]); // and the touch keeps it
-    // The client still sees the bucket's tag: a large object is fetched from the bucket itself, which
-    // reports that one, so the two paths must not disagree.
+    // The client still sees the bucket's tag - unlike the date, which is served as the upstream's. The
+    // tag is never the upstream's to hand out: a 307'd client is answered by S3 matching its own.
     Assert.Equal("\"s3-body-md5\"", response.Headers.ETag?.ToString());
   }
 
@@ -862,6 +862,42 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   }
 
   [Fact]
+  public async Task Served_Object_Reports_The_Upstream_Last_Modified()
+  {
+    // What a MISS advertised, a HIT advertises too. S3's store time would differ from it for the same
+    // bytes, and the metadata-only touch moves that time on every 304, so a client watching the date
+    // would see the entity change without its content changing.
+    var server = CreateServer(signedLinks: false);
+    var key = GetPathKey("/real/revalidate.txt");
+    var upstreamDate = new DateTimeOffset(2025, 4, 27, 15, 7, 12, TimeSpan.Zero);
+    myS3.Objects[key] = ([.. "v1"u8], "text/plain", "\"s3-body-md5\"");
+    myS3.UpstreamLastModified[key] = upstreamDate;
+
+    using var response = await server.CreateRequest("/real/revalidate.txt").SendAsync(HttpMethod.Get.Method);
+
+    AssertStatusHeader(response, CachingProxyStatus.MISS); // served from the bucket, upstream not consulted
+    Assert.Equal(upstreamDate, response.Content.Headers.LastModified);
+  }
+
+  [Fact]
+  public async Task Served_Object_Falls_Back_To_The_Bucket_Date_When_No_Upstream_Date_Was_Recorded()
+  {
+    // An object stored before the date was recorded still gets a Last-Modified, S3's own. It is later than
+    // the entity's, which costs a client nothing here: this path answers no conditional request, and one
+    // sent to the bucket by a 307 is judged against that same S3 date.
+    var server = CreateServer(signedLinks: false);
+    var key = GetPathKey("/real/revalidate.txt");
+    myS3.Objects[key] = ([.. "v1"u8], "text/plain", "\"s3-body-md5\"");
+    Assert.DoesNotContain(key, myS3.UpstreamLastModified.Keys);
+
+    using var response = await server.CreateRequest("/real/revalidate.txt").SendAsync(HttpMethod.Get.Method);
+
+    AssertStatusHeader(response, CachingProxyStatus.MISS);
+    var served = Assert.IsType<DateTimeOffset>(response.Content.Headers.LastModified);
+    Assert.True(DateTimeOffset.UtcNow - served < TimeSpan.FromMinutes(1), $"expected the bucket's store time, got {served:O}");
+  }
+
+  [Fact]
   public async Task Revalidation_Is_Conditional_On_The_Upstream_Date_Not_Our_Store_Date()
   {
     // Our store date would work most of the time, but it is later than the upstream's: a change made
@@ -881,9 +917,8 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     AssertStatusHeader(response, CachingProxyStatus.REVALIDATED);
     Assert.Equal(upstreamDate.ToString("R"), upstreamServer.RevalidateIfModifiedSince);
     Assert.Equal(upstreamDate, myS3.UpstreamLastModified[key]); // and the touch keeps it
-    // The client still sees the bucket's date, as it does the bucket's ETag: a large object is fetched
-    // from the bucket itself, which reports that one, so the two paths must not disagree.
-    Assert.NotEqual(upstreamDate, response.Content.Headers.LastModified);
+    // The kept object is served under the same date, not the one the touch just moved.
+    Assert.Equal(upstreamDate, response.Content.Headers.LastModified);
   }
 
   [Fact]

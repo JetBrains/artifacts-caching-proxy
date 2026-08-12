@@ -33,12 +33,6 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
   // also tags by body MD5 (Maven Central does, which is why this went unnoticed).
   private const string UpstreamETagMetadataKey = "upstream-etag";
 
-  // User-metadata key holding the upstream's Last-Modified for the stored bytes, absent for an upstream
-  // that sends none. Carried separately because the object's native LastModified is when S3 took the
-  // bytes, and the metadata-only touch moves it again on every 304 - a date that drifts forward while
-  // the entity stands still. Stored as a round-trippable DateTimeOffset ("O"), like "created-at".
-  private const string UpstreamLastModifiedMetadataKey = "upstream-last-modified";
-
   // The bucket endpoint URL (assumed to end with '/', as AWS virtual-hosted-style endpoints do, so it
   // joins to an "aa/bb/<hash>" key with a single separator). Used both to build the redirect Location
   // and to recognise our own bucket redirects when signing them on the fly.
@@ -161,8 +155,14 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
           var probeStatus = CachingProxyStatus.MISS;
           if (rule?.RefreshAfter is { } refreshAfter && IsPastRefreshWindow(s3Object, refreshAfter, out var createdAt))
           {
+            // The upstream's own date in preference to ours, which is sound but has a window: a change
+            // made while we were downloading precedes the date we then stamp, so revalidating on that
+            // draws a 304 for the version we missed and the touch pushes the date forward again - stale
+            // for good. Only decides anything where the date is the sole validator, an upstream sending
+            // an ETag being revalidated on that instead, and that is a real case:
+            // redirector.kotlinlang.org sends Last-Modified and no ETag.
             var result = await remoteProxy.RevalidateAsync(context, upstreamUri, UpstreamETag(s3Object),
-              UpstreamLastModified(s3Object) ?? createdAt,
+              CachedResponse.UpstreamLastModified(s3Object) ?? createdAt,
               remoteServer.Auth, rule, remoteServer.Profile, context.RequestAborted);
             switch (result.Outcome)
             {
@@ -341,21 +341,6 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
     s3Object.Metadata[UpstreamETagMetadataKey] is { Length: > 0 } etag ? etag : null;
 
   /// <summary>
-  /// The upstream's own Last-Modified for a probed object's bytes, or null when none was recorded - an
-  /// upstream that sends none, or an object stored before this was recorded. Preferred over our stored
-  /// date, which is sound but has a window: a change made while we were downloading is older than the
-  /// date we then stamp, so revalidating on that date draws a 304 for the version we missed, and the
-  /// touch pushes the date forward again - stale for good. Only decides anything where the date is the
-  /// sole validator, an upstream sending an ETag being revalidated on that instead, which is a real case:
-  /// redirector.kotlinlang.org sends Last-Modified and no ETag.
-  /// </summary>
-  private static DateTimeOffset? UpstreamLastModified(GetObjectResponse s3Object) =>
-    DateTimeOffset.TryParse(s3Object.Metadata[UpstreamLastModifiedMetadataKey], CultureInfo.InvariantCulture,
-      DateTimeStyles.RoundtripKind, out var lastModified)
-      ? lastModified
-      : null;
-
-  /// <summary>
   /// Whether a probed object has outlived <paramref name="refreshAfter"/>, reporting its stored date for
   /// the conditional request. A missing or unparsable "created-at" counts as past any window rather than
   /// eternally fresh: the key is younger than the bucket, so objects predating it carry none, and a
@@ -458,13 +443,13 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
         put.Metadata[CachedResponse.DockerContentDigestMetadataKey] = digest;
 
       // The upstream's validators for these bytes, for the next revalidation to be conditional on (see
-      // UpstreamETag and UpstreamLastModified). Neither is served to clients: a large object is fetched
-      // from the bucket directly, where the ETag and the date are S3's own.
+      // UpstreamETag and CachedResponse.UpstreamLastModified). The date is also what a HIT then serves;
+      // the ETag is not, S3 answering a 307'd client by matching its own.
       if (response.Headers.ETag?.ToString() is { Length: > 0 } upstreamETag)
         put.Metadata[UpstreamETagMetadataKey] = upstreamETag;
 
       if (response.Content.Headers.LastModified is { } upstreamLastModified)
-        put.Metadata[UpstreamLastModifiedMetadataKey] =
+        put.Metadata[CachedResponse.UpstreamLastModifiedMetadataKey] =
           upstreamLastModified.ToString("O", CultureInfo.InvariantCulture);
 
       await amazonS3.PutObjectAsync(put, cancellationToken);

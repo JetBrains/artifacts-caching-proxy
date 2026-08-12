@@ -1,4 +1,5 @@
 using System;
+using System.Globalization;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
@@ -28,6 +29,25 @@ public sealed record CachedResponse(HttpStatusCode StatusCode, IHeaderDictionary
   /// <summary>S3 user-metadata key carrying <see cref="DockerContentDigestHeader"/> through the bucket.</summary>
   public const string DockerContentDigestMetadataKey = "docker-content-digest";
 
+  /// <summary>
+  /// S3 user-metadata key carrying the upstream's Last-Modified for the stored bytes (round-trippable "O"
+  /// format), absent for an upstream that sends none. Written by <c>S3CachingMiddleware</c>, which also
+  /// revalidates against it. Needed because the object's native LastModified is when S3 took the bytes,
+  /// and the metadata-only freshness touch moves it again on every 304 - a date that drifts forward while
+  /// the entity stands still.
+  /// </summary>
+  public const string UpstreamLastModifiedMetadataKey = "upstream-last-modified";
+
+  /// <summary>
+  /// The upstream's recorded date for a stored object's bytes, or null when none was recorded - an
+  /// upstream that sends none, or an object stored before this was recorded.
+  /// </summary>
+  public static DateTimeOffset? UpstreamLastModified(GetObjectResponse response) =>
+    DateTimeOffset.TryParse(response.Metadata[UpstreamLastModifiedMetadataKey], CultureInfo.InvariantCulture,
+      DateTimeStyles.RoundtripKind, out var lastModified)
+      ? lastModified
+      : null;
+
   // Copied through verbatim. Besides the digest, Docker-Distribution-API-Version is how a client confirms
   // it is talking to a v2 registry.
   private static readonly string[] ourRegistryHeaders =
@@ -49,7 +69,11 @@ public sealed record CachedResponse(HttpStatusCode StatusCode, IHeaderDictionary
 
   public CachedResponse(GetObjectResponse response) : this(response.HttpStatusCode, new HeaderDictionary())
   {
-    Headers.LastModified = response.LastModified?.ToString("R");
+    // The entity's own date when the bucket carries it, so a HIT describes the object the way the MISS
+    // that stored it did; S3's store time only stands in when nothing was recorded. Note the ETag above
+    // stays the bucket's: it is not the upstream's to begin with, and a client sent to the bucket by a
+    // 307 is answered by S3 matching that one.
+    Headers.LastModified = UpstreamLastModified(response)?.ToString("R") ?? response.LastModified?.ToString("R");
     Headers.ContentLength = response.ContentLength;
     Headers.ContentType = response.Headers.ContentType;
     Headers.ContentEncoding = response.Headers.ContentEncoding;
