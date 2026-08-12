@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -843,6 +844,92 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   }
 
   [Fact]
+  public async Task Stored_Object_Records_The_Upstream_Last_Modified()
+  {
+    // A MISS records the upstream's date as user metadata, for the same reason as its ETag: the object's
+    // own LastModified is when S3 took the bytes, which says nothing about when the entity changed.
+    var server = CreateServer(signedLinks: false);
+    var key = GetPathKey("/real/revalidate.txt");
+    var upstreamDate = new DateTimeOffset(2025, 4, 27, 15, 7, 12, TimeSpan.Zero);
+    upstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.Ok;
+    upstreamServer.RevalidateLastModified = upstreamDate.ToString("R");
+
+    using var response = await server.CreateRequest("/real/revalidate.txt").SendAsync(HttpMethod.Get.Method);
+
+    AssertStatusHeader(response, CachingProxyStatus.MISS);
+    Assert.Equal(1, myS3.PutObjectCalls);
+    Assert.Equal(upstreamDate, myS3.UpstreamLastModified[key]);
+  }
+
+  [Fact]
+  public async Task Revalidation_Is_Conditional_On_The_Upstream_Date_Not_Our_Store_Date()
+  {
+    // Our store date would work most of the time, but it is later than the upstream's: a change made
+    // while we were downloading precedes it, so the origin would answer 304 for the version we missed and
+    // the touch would push the date forward again, freezing the object. The upstream's own date has no
+    // such window.
+    var server = CreateServer(signedLinks: false, refreshAfter: TimeSpan.FromMinutes(1));
+    var key = GetPathKey("/real/revalidate.txt");
+    var upstreamDate = new DateTimeOffset(2025, 4, 27, 15, 7, 12, TimeSpan.Zero);
+    myS3.Objects[key] = ([.. "v1"u8], "text/plain", "\"s3-body-md5\"");
+    myS3.UpstreamLastModified[key] = upstreamDate;
+    myS3.CreatedAt[key] = DateTimeOffset.UtcNow - TimeSpan.FromHours(1); // stale
+    upstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.NotModified;
+
+    using var response = await server.CreateRequest("/real/revalidate.txt").SendAsync(HttpMethod.Get.Method);
+
+    AssertStatusHeader(response, CachingProxyStatus.REVALIDATED);
+    Assert.Equal(upstreamDate.ToString("R"), upstreamServer.RevalidateIfModifiedSince);
+    Assert.Equal(upstreamDate, myS3.UpstreamLastModified[key]); // and the touch keeps it
+    // The client still sees the bucket's date, as it does the bucket's ETag: a large object is fetched
+    // from the bucket itself, which reports that one, so the two paths must not disagree.
+    Assert.NotEqual(upstreamDate, response.Content.Headers.LastModified);
+  }
+
+  [Fact]
+  public async Task Revalidation_Falls_Back_To_The_Stored_Date_When_No_Upstream_Date_Was_Recorded()
+  {
+    // Nothing recorded - an upstream that sends no Last-Modified, or an object stored before this was
+    // recorded - so the request is conditional on our own store date. That is sound, being never earlier
+    // than the upstream's: an unchanged object still 304s and a changed one still gets a full body.
+    var server = CreateServer(signedLinks: false, refreshAfter: TimeSpan.FromMinutes(1));
+    var key = GetPathKey("/real/revalidate.txt");
+    var storedAt = new DateTimeOffset(2026, 1, 2, 3, 4, 5, TimeSpan.Zero);
+    myS3.Objects[key] = ([.. "v1"u8], "text/plain", "\"s3-body-md5\"");
+    myS3.CreatedAt[key] = storedAt;
+    Assert.DoesNotContain(key, myS3.UpstreamLastModified.Keys);
+    upstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.NotModified;
+
+    using var response = await server.CreateRequest("/real/revalidate.txt").SendAsync(HttpMethod.Get.Method);
+
+    AssertStatusHeader(response, CachingProxyStatus.REVALIDATED);
+    Assert.Equal(storedAt.ToString("R"), upstreamServer.RevalidateIfModifiedSince);
+  }
+
+  [Fact]
+  public async Task Revalidation_That_Re_Stores_Records_The_Fresh_Upstream_Date()
+  {
+    // The upstream answers 200 (changed), so the re-store replaces the recorded date with the new bytes'
+    // - otherwise the next revalidation would ask about the previous body's date and be told 304.
+    var server = CreateServer(signedLinks: false, refreshAfter: TimeSpan.FromMinutes(1));
+    var key = GetPathKey("/real/revalidate.txt");
+    var oldDate = new DateTimeOffset(2025, 4, 27, 15, 7, 12, TimeSpan.Zero);
+    var newDate = new DateTimeOffset(2026, 8, 3, 10, 0, 0, TimeSpan.Zero);
+    myS3.Objects[key] = ([.. "old"u8], "text/plain", "\"s3-body-md5\"");
+    myS3.UpstreamLastModified[key] = oldDate;
+    myS3.CreatedAt[key] = DateTimeOffset.UtcNow - TimeSpan.FromHours(1);
+    upstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.Ok;
+    upstreamServer.RevalidateContent = "new-content";
+    upstreamServer.RevalidateLastModified = newDate.ToString("R");
+
+    using var response = await server.CreateRequest("/real/revalidate.txt").SendAsync(HttpMethod.Get.Method);
+
+    AssertStatusHeader(response, CachingProxyStatus.REVALIDATED);
+    Assert.Equal(oldDate.ToString("R"), upstreamServer.RevalidateIfModifiedSince); // asked about the old body
+    Assert.Equal(newDate, myS3.UpstreamLastModified[key]);                         // recorded the new one
+  }
+
+  [Fact]
   public async Task Dateless_Object_Is_Revalidated_And_Gains_A_Stored_Date()
   {
     // An object stored before "created-at" existed: with no stored date the freshness window cannot be
@@ -935,9 +1022,11 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   Task IAsyncLifetime.InitializeAsync()
   {
     Environment.SetEnvironmentVariable("SENTRY_RELEASE", "release@1.0.0");
-    // The upstream is a class fixture, so its ETag knobs would otherwise carry into the next test.
+    // The upstream is a class fixture, so its validator knobs would otherwise carry into the next test.
     upstreamServer.RevalidateETag = null;
     upstreamServer.RevalidateIfNoneMatch = null;
+    upstreamServer.RevalidateLastModified = null;
+    upstreamServer.RevalidateIfModifiedSince = null;
     return Task.CompletedTask;
   }
 
@@ -968,6 +1057,9 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     // The "upstream-etag" user-metadata (the upstream's validator for the stored bytes), keyed by object
     // key. Distinct from the object's own ETag in Objects, which is S3's - that difference is the point.
     public readonly Dictionary<string, string?> UpstreamETags = new();
+    // The "upstream-last-modified" user-metadata (the upstream's date for the stored bytes), keyed by
+    // object key. Distinct from the response's LastModified below, which is S3's own store time.
+    public readonly Dictionary<string, DateTimeOffset?> UpstreamLastModified = new();
     // S3 existence probes via the ranged GetObject prefetch.
     public int GetObjectCalls;
     public int PutObjectCalls;
@@ -1038,6 +1130,8 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
         response.Metadata[CachedResponse.DockerContentDigestMetadataKey] = digest;
       if (UpstreamETags.GetValueOrDefault(request.Key) is { } upstreamETag)
         response.Metadata["upstream-etag"] = upstreamETag;
+      if (UpstreamLastModified.GetValueOrDefault(request.Key) is { } upstreamLastModified)
+        response.Metadata["upstream-last-modified"] = upstreamLastModified.ToString("O");
       return response;
     }
 
@@ -1050,6 +1144,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
       PutObjectUris[request.Key] = request.Metadata["uri"];
       Digests[request.Key] = request.Metadata[CachedResponse.DockerContentDigestMetadataKey];
       UpstreamETags[request.Key] = request.Metadata["upstream-etag"];
+      UpstreamLastModified[request.Key] = ParseMetadataDate(request.Metadata["upstream-last-modified"]);
       if (request.Metadata["created-at"] is { } createdAt)
         CreatedAt[request.Key] = DateTimeOffset.Parse(createdAt);
       return new PutObjectResponse { HttpStatusCode = HttpStatusCode.OK };
@@ -1062,10 +1157,14 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
       // Assigned unconditionally: the copy re-applies the whole metadata set, so a key it drops must
       // read back as dropped rather than as its stale value.
       UpstreamETags[request.DestinationKey] = request.Metadata["upstream-etag"];
+      UpstreamLastModified[request.DestinationKey] = ParseMetadataDate(request.Metadata["upstream-last-modified"]);
       if (request.Metadata["created-at"] is { } createdAt)
         CreatedAt[request.DestinationKey] = DateTimeOffset.Parse(createdAt);
       return Task.FromResult(new CopyObjectResponse { HttpStatusCode = HttpStatusCode.OK });
     }
+
+    private static DateTimeOffset? ParseMetadataDate(string? value) =>
+      value is { Length: > 0 } ? DateTimeOffset.Parse(value, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind) : null;
 
     public override Task<DeleteObjectResponse> DeleteObjectAsync(DeleteObjectRequest request, CancellationToken cancellationToken = default)
     {
@@ -1073,6 +1172,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
       Objects.Remove(request.Key);
       CreatedAt.Remove(request.Key);
       UpstreamETags.Remove(request.Key);
+      UpstreamLastModified.Remove(request.Key);
       return Task.FromResult(new DeleteObjectResponse { HttpStatusCode = HttpStatusCode.OK });
     }
 

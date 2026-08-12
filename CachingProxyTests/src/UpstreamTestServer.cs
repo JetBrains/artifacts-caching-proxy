@@ -48,7 +48,8 @@ public class UpstreamTestServer : IAsyncLifetime
 
   // Raw Last-Modified header (RFC-1123) the revalidate route reports, or null to send none. Kept as a
   // string so it can be volatile like the knobs above. Tests set it to a date far in the past to check
-  // that the proxy's freshness window is anchored to its own stored date rather than the upstream's.
+  // that the proxy's freshness window is anchored to its own stored date rather than the upstream's -
+  // while the conditional request that window opens is anchored to this one, the entity's own date.
   public volatile string? RevalidateLastModified;
 
   // The ETag the revalidate route reports, or null to send none, and the conditional headers of the last
