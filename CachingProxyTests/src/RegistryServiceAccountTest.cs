@@ -1,9 +1,13 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IdentityModel.Tokens.Jwt;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -18,6 +22,7 @@ using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.IdentityModel.Tokens;
 using Xunit;
 
 namespace JetBrains.CachingProxy.Tests;
@@ -25,8 +30,10 @@ namespace JetBrains.CachingProxy.Tests;
 // End-to-end coverage for a service account on an OCI upstream (a Docker Hub PAT is the real case): a
 // registry that challenges every pull, a token endpoint on a *different* host - as Hub's auth.docker.io
 // is - and both recording the Authorization they receive. Asserts the PAT reaches the token endpoint only
-// when the entry declares that realm, that the minted token is what goes upstream, and that a rate-limit
-// account leaves the prefix open to anonymous clients.
+// when the entry declares that realm, and that the minted token is what goes upstream.
+//
+// The account also gates these prefixes (see RemoteServers), so every pull below carries an inbound client
+// JWT, validated against the JWKS the token server publishes alongside its token endpoint.
 public class RegistryServiceAccountTest : IAsyncLifetime
 {
   private const string Account = "jetbrains-mirror";
@@ -36,6 +43,13 @@ public class RegistryServiceAccountTest : IAsyncLifetime
   // Deliberately shorter than the path being pulled (library/allowed): a registry may scope to a group of
   // repositories, and its answer is the only way to know it does.
   private const string GroupScope = "repository:library:pull";
+
+  private const string Issuer = "https://issuer.example.com";
+  private const string Audience = "artifacts-caching-proxy";
+  private const string Kid = "test-key-1";
+
+  // Signs the inbound client JWTs; its public half is published as the JWKS the proxy validates against.
+  private readonly RSA myRsa = RSA.Create(2048);
 
   private readonly WebApplication myRegistryServer;
   private readonly WebApplication myTokenServer;
@@ -78,23 +92,30 @@ public class RegistryServiceAccountTest : IAsyncLifetime
       return res.WriteAsync("{\"schemaVersion\":2}");
     }));
 
-    myTokenServer = BuildKestrel(router => router.MapGet("token", (req, res, _) =>
+    myTokenServer = BuildKestrel(router =>
     {
-      Interlocked.Increment(ref myTokenRequests);
-      myTokenAuthHeader = req.Headers.Authorization.ToString();
-      myTokenScope = req.Query["scope"].ToString();
-      myTokenQuery = req.QueryString.Value ?? "";
+      router.MapGet("token", (req, res, _) =>
+      {
+        Interlocked.Increment(ref myTokenRequests);
+        myTokenAuthHeader = req.Headers.Authorization.ToString();
+        myTokenScope = req.Query["scope"].ToString();
+        myTokenQuery = req.QueryString.Value ?? "";
 
-      res.ContentType = "application/json";
-      return res.WriteAsync(JsonSerializer.Serialize(new { token = IssuedToken, expires_in = 300 }));
-    }));
+        res.ContentType = "application/json";
+        return res.WriteAsync(JsonSerializer.Serialize(new { token = IssuedToken, expires_in = 300 }));
+      });
+      router.MapGet("jwks.json", (_, res, _) =>
+      {
+        res.ContentType = "application/json";
+        return res.WriteAsync(JwksJson(myRsa));
+      });
+    });
   }
 
   [Fact]
   public async Task A_Declared_Realm_Receives_The_Account_And_Its_Token_Goes_Upstream()
   {
-    // No inbound credentials: the entry is PublicUpstream, so the prefix must stay anonymous.
-    using var client = myProxyHost!.GetTestServer().CreateClient();
+    using var client = CreateAuthenticatedClient();
 
     var first = await client.GetAsync("/v2/allowlisted/library/allowed/manifests/1.0");
     var second = await client.GetAsync("/v2/allowlisted/library/allowed/manifests/2.0");
@@ -125,7 +146,7 @@ public class RegistryServiceAccountTest : IAsyncLifetime
   [Fact]
   public async Task An_Undeclared_Realm_Gets_An_Anonymous_Token_Request()
   {
-    using var client = myProxyHost!.GetTestServer().CreateClient();
+    using var client = CreateAuthenticatedClient();
 
     var response = await client.GetAsync("/v2/foreign/library/foreign/manifests/1.0");
 
@@ -142,7 +163,7 @@ public class RegistryServiceAccountTest : IAsyncLifetime
   [Fact]
   public async Task The_Upstream_Ping_Is_Satisfied_By_An_Unscoped_Token()
   {
-    using var client = myProxyHost!.GetTestServer().CreateClient();
+    using var client = CreateAuthenticatedClient();
 
     // The registry's own /v2/ - the base of the mirror, not this proxy's root ping. It names no
     // repository, so there is no scope to state or to derive, and a registry answers it with a token
@@ -157,6 +178,45 @@ public class RegistryServiceAccountTest : IAsyncLifetime
   }
 
   private string[] AuthSeenAt(string path) => [.. myRegistryAuthByPath[path]];
+
+  // A test client whose every request carries a valid inbound JWT: the account on these upstreams gates
+  // their prefixes, so an anonymous request gets 401 before the registry is ever contacted.
+  private HttpClient CreateAuthenticatedClient()
+  {
+    var client = myProxyHost!.GetTestServer().CreateClient();
+    var token = new JwtSecurityToken(
+      issuer: Issuer,
+      audience: Audience,
+      claims: null,
+      notBefore: null,
+      expires: DateTime.UtcNow.AddMinutes(5),
+      signingCredentials: new SigningCredentials(
+        new RsaSecurityKey(myRsa) { KeyId = Kid }, SecurityAlgorithms.RsaSha256));
+    client.DefaultRequestHeaders.Authorization =
+      new AuthenticationHeaderValue("Bearer", new JwtSecurityTokenHandler().WriteToken(token));
+    return client;
+  }
+
+  // Minimal JWKS document publishing the RSA public key under our Kid.
+  private static string JwksJson(RSA rsa)
+  {
+    var p = rsa.ExportParameters(includePrivateParameters: false);
+    return JsonSerializer.Serialize(new
+    {
+      keys = new[]
+      {
+        new
+        {
+          kty = "RSA",
+          use = "sig",
+          kid = Kid,
+          alg = "RS256",
+          n = Base64UrlEncoder.Encode(p.Modulus),
+          e = Base64UrlEncoder.Encode(p.Exponent),
+        },
+      },
+    });
+  }
 
   public async Task InitializeAsync()
   {
@@ -191,7 +251,6 @@ public class RegistryServiceAccountTest : IAsyncLifetime
           UrlPrefixes = [new Uri(registryUrl, "v2/").GetHostPortPath()],
           Username = Account,
           Password = Pat,
-          PublicUpstream = true,
           TokenRealms = [UrlOf(myTokenServer).AbsoluteUri],
         },
         ["foreign"] = new UpstreamAuth
@@ -199,8 +258,13 @@ public class RegistryServiceAccountTest : IAsyncLifetime
           UrlPrefixes = [new Uri(registryUrl, "v2/other/").GetHostPortPath()],
           Username = Account,
           Password = Pat,
-          PublicUpstream = true,
         },
+      },
+      InboundAuth = new CachingProxyConfig.InboundAuthConfig
+      {
+        Issuer = Issuer,
+        Audiences = [Audience],
+        JwksUrl = new Uri(UrlOf(myTokenServer), "jwks.json"),
       },
     };
 
@@ -222,6 +286,7 @@ public class RegistryServiceAccountTest : IAsyncLifetime
     myProxyHost?.Dispose();
     await myTokenServer.StopAsync();
     await myRegistryServer.StopAsync();
+    myRsa.Dispose();
     try { Directory.Delete(myTempDirectory, recursive: true); } catch { /* best effort */ }
   }
 

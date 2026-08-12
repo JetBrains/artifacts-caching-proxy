@@ -33,8 +33,12 @@ namespace JetBrains.CachingProxy;
 /// Hub personal access token is the password, the account name the username - and note where it lands: a
 /// registry accepts an account at the token endpoint its challenge names, not on <c>/v2/…</c>, so for an
 /// OCI upstream this credential goes only there, subject to <see cref="TokenRealms"/>, and the registry
-/// itself sees just the minted token. Set <see cref="PublicUpstream"/> when the account only buys rate
-/// limit on a public registry.</para>
+/// itself sees just the minted token.</para>
+///
+/// <para>Whichever mode, an entry gates the prefixes it matches behind a validated inbound client JWT
+/// (see <see cref="RemoteServers"/>) - including an account that only buys rate limit on an otherwise
+/// public registry. Nothing here can tell the two apart, and the expensive mistake is serving private
+/// artifacts to anyone, so a credential counts as an access grant.</para>
 /// </summary>
 public record UpstreamAuth
 {
@@ -53,17 +57,6 @@ public record UpstreamAuth
   // with no token exchange of its own. A Docker Hub PAT goes in Password, its account name in Username.
   public string? Username { get; init; }
   public string? Password { get; init; }
-
-  /// <summary>
-  /// Whether this upstream is public, i.e. the credential buys rate limit or throughput rather than
-  /// access. The prefixes matching this entry then stay open to anonymous clients, instead of requiring
-  /// the validated inbound client JWT that a private upstream's prefixes require (see
-  /// <see cref="RemoteServers"/>) - a service account on Docker Hub must not turn a public mirror into a
-  /// gated one.
-  /// <para>Off by default, so a credential counts as an access grant until an entry says otherwise: the
-  /// expensive mistake is serving private artifacts to anyone, not making a public pull authenticate.</para>
-  /// </summary>
-  public bool PublicUpstream { get; init; }
 
   // GitHub App mode (used instead of TokenEndpoint/ClientSecret). Supply the App's RSA private key inline
   // as PEM text (PrivateKey); ClientId is reused as the JWT issuer. InstallationId is optional — when

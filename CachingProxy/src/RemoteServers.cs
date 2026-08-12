@@ -41,13 +41,13 @@ public class RemoteServers : EndpointDataSource
 
       logger.LogInformation("RemoteServer: {Prefix} -> {RemoteUri}, Auth: {Auth}, Profile: {Profile}",
         remoteServer.Prefix, remoteServer.RemoteUri, remoteServer.Auth, prefix.Profile);
-      // A prefix with a matched UpstreamAuth serves proxy-fetched private artifacts, so its inbound route
-      // must require a validated client JWT too: attach an AuthorizeAttribute (enforced by
-      // UseAuthentication/UseAuthorization). A prefix with no matched auth has no upstream credentials and
-      // is left public/un-gated. The exception is an entry declaring UpstreamAuth.PublicUpstream: there
-      // the credential buys rate limit on a public registry rather than access, and gating the prefix
-      // would break the anonymous `docker pull` it exists to speed up.
-      var metadata = remoteServer.Auth is { PublicUpstream: false } ?
+      // A prefix with a matched UpstreamAuth fetches with a credential of ours, so its inbound route must
+      // require a validated client JWT too: attach an AuthorizeAttribute (enforced by
+      // UseAuthentication/UseAuthorization). No exception for a credential that only buys rate limit on a
+      // public registry - what an upstream grants for it is not visible from here, and the expensive
+      // mistake is serving private artifacts to anyone. A prefix with no matched auth is fetched
+      // anonymously and stays un-gated.
+      var metadata = remoteServer.Auth != null ?
         new EndpointMetadataCollection(remoteServer, new AuthorizeAttribute()) :
         new EndpointMetadataCollection(remoteServer);
 

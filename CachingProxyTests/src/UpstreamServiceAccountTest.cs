@@ -53,8 +53,8 @@ public class UpstreamServiceAccountTest
   [Fact]
   public void No_Credential_At_All_Is_Fine()
   {
-    // An anonymous OCI upstream still needs an entry when it declares TokenRealms or PublicUpstream.
-    Configure(("PublicUpstream", "true"));
+    // An anonymous OCI upstream still needs an entry when it declares TokenRealms.
+    Configure(("TokenRealms:0", "https://auth.docker.io/"));
   }
 
   [Fact]
@@ -62,7 +62,7 @@ public class UpstreamServiceAccountTest
   {
     var auth = new UpstreamAuth
     {
-      UrlPrefixes = ["registry-1.docker.io/v2/"], Username = "svc", Password = "pat", PublicUpstream = true,
+      UrlPrefixes = ["registry-1.docker.io/v2/"], Username = "svc", Password = "pat",
     };
 
     // null dependencies: service-account mode resolves neither the GitHub App provider nor the Duende

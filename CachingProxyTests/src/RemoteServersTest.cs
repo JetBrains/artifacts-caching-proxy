@@ -80,23 +80,23 @@ public class RemoteServersTest
   }
 
   [Fact]
-  public void Only_A_Private_Upstreams_Prefix_Requires_An_Inbound_Client_Jwt()
+  public void An_Authenticated_Upstreams_Prefix_Requires_An_Inbound_Client_Jwt()
   {
     var privateRepo = new UpstreamAuth
     {
       UrlPrefixes = ["private.example.com/"], TokenEndpoint = new Uri("https://private.example.com/"), ClientId = "c",
     };
-    // A service account on a public registry buys rate limit, not access: gating the prefix would break
-    // the anonymous pull it exists to speed up.
-    var rateLimitOnly = new UpstreamAuth
+    // A registry account bought for rate limit is gated the same way: what it grants upstream is not
+    // visible from here, so a credential counts as an access grant.
+    var registryAccount = new UpstreamAuth
     {
-      UrlPrefixes = ["registry-1.docker.io/"], Username = "svc", Password = "pat", PublicUpstream = true,
+      UrlPrefixes = ["registry-1.docker.io/"], Username = "svc", Password = "pat",
     };
 
     var config = new CachingProxyConfig
     {
       Prefixes = ["/a=private.example.com/maven", "/v2/docker-hub=registry-1.docker.io/v2", "/c=open.example.com"],
-      UpstreamAuth = { [nameof(privateRepo)] = privateRepo, [nameof(rateLimitOnly)] = rateLimitOnly },
+      UpstreamAuth = { [nameof(privateRepo)] = privateRepo, [nameof(registryAccount)] = registryAccount },
     };
 
     var gated = new RemoteServers(config, new NullLogger<RemoteServers>()).Endpoints
@@ -105,7 +105,7 @@ public class RemoteServersTest
         e => e.Metadata.GetMetadata<IAuthorizeData>() != null);
 
     Assert.True(gated["/a"]);
-    Assert.False(gated["/v2/docker-hub"]);
-    Assert.False(gated["/c"]); // no credentials to protect
+    Assert.True(gated["/v2/docker-hub"]);
+    Assert.False(gated["/c"]); // fetched anonymously, nothing to protect
   }
 }
