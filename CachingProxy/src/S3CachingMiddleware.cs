@@ -26,6 +26,13 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
   // LastModified, which is not under our control. Stored as a round-trippable DateTimeOffset ("O").
   private const string CreatedAtMetadataKey = "created-at";
 
+  // User-metadata key holding the upstream's ETag for the stored bytes, quoted exactly as it arrived (so
+  // a weak "W/" tag survives too), and absent for an upstream that issues none. The object's native ETag
+  // is S3's own - the body's MD5 - which is not a validator any upstream knows, so the real one has to be
+  // carried separately to make a conditional revalidation land. The two coincide only where the upstream
+  // also tags by body MD5 (Maven Central does, which is why this went unnoticed).
+  private const string UpstreamETagMetadataKey = "upstream-etag";
+
   // The bucket endpoint URL (assumed to end with '/', as AWS virtual-hosted-style endpoints do, so it
   // joins to an "aa/bb/<hash>" key with a single separator). Used both to build the redirect Location
   // and to recognise our own bucket redirects when signing them on the fly.
@@ -146,7 +153,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
           var probeStatus = CachingProxyStatus.MISS;
           if (rule?.RefreshAfter is { } refreshAfter && IsPastRefreshWindow(s3Object, refreshAfter, out var createdAt))
           {
-            var result = await remoteProxy.RevalidateAsync(context, upstreamUri, s3Object.ETag, createdAt,
+            var result = await remoteProxy.RevalidateAsync(context, upstreamUri, UpstreamETag(s3Object), createdAt,
               remoteServer.Auth, rule, remoteServer.Profile, context.RequestAborted);
             switch (result.Outcome)
             {
@@ -313,6 +320,18 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
   }
 
   /// <summary>
+  /// The upstream's own ETag for a probed object's bytes, or null when none was recorded - an upstream
+  /// that issues none, or an object stored before this was recorded. Null rather than the object's own S3
+  /// ETag: that is a checksum of the bytes, not a tag any upstream handed out, and an If-None-Match the
+  /// origin cannot match makes it skip If-Modified-Since and answer 200 (RFC 9110 13.2.2). So a
+  /// fabricated tag does not merely fail to help, it suppresses the date-based 304 that would have
+  /// landed. Revalidating on the stored date alone is what those objects get; a 200 then records the
+  /// real tag, if there is one, for the next round.
+  /// </summary>
+  private static string? UpstreamETag(GetObjectResponse s3Object) =>
+    s3Object.Metadata[UpstreamETagMetadataKey] is { Length: > 0 } etag ? etag : null;
+
+  /// <summary>
   /// Whether a probed object has outlived <paramref name="refreshAfter"/>, reporting its stored date for
   /// the conditional request. A missing or unparsable "created-at" counts as past any window rather than
   /// eternally fresh: the key is younger than the bucket, so objects predating it carry none, and a
@@ -411,6 +430,12 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
       if (response.Headers.TryGetValues(CachedResponse.DockerContentDigestHeader, out var digests) &&
           digests.FirstOrDefault() is { Length: > 0 } digest)
         put.Metadata[CachedResponse.DockerContentDigestMetadataKey] = digest;
+
+      // The upstream's validator for these bytes, for the next revalidation to be conditional on (see
+      // UpstreamETag). Not served to clients: a large object is fetched from the bucket directly, and its
+      // ETag there is S3's.
+      if (response.Headers.ETag?.ToString() is { Length: > 0 } upstreamETag)
+        put.Metadata[UpstreamETagMetadataKey] = upstreamETag;
 
       await amazonS3.PutObjectAsync(put, cancellationToken);
     }

@@ -745,6 +745,104 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   }
 
   [Fact]
+  public async Task Stored_Object_Records_The_Upstream_ETag()
+  {
+    // A MISS records the upstream's validator as user metadata. S3 assigns the object its own ETag (a
+    // checksum of the bytes), so the upstream's has to travel alongside it to be usable later.
+    var server = CreateServer(signedLinks: false);
+    var key = GetPathKey("/real/revalidate.txt");
+    upstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.Ok;
+    upstreamServer.RevalidateETag = "\"upstream-v1\"";
+
+    using var response = await server.CreateRequest("/real/revalidate.txt").SendAsync(HttpMethod.Get.Method);
+
+    AssertStatusHeader(response, CachingProxyStatus.MISS);
+    Assert.Equal(1, myS3.PutObjectCalls);
+    Assert.Equal("\"upstream-v1\"", myS3.UpstreamETags[key]);
+  }
+
+  [Fact]
+  public async Task Revalidation_Is_Conditional_On_The_Upstream_ETag_Not_The_Bucket_One()
+  {
+    // The stored object carries both tags: S3's own (meaningless to the upstream) and the upstream's. The
+    // conditional request must carry the latter, or the upstream can never answer 304.
+    var server = CreateServer(signedLinks: false, refreshAfter: TimeSpan.FromMinutes(1));
+    var key = GetPathKey("/real/revalidate.txt");
+    myS3.Objects[key] = ([.. "v1"u8], "text/plain", "\"s3-body-md5\"");
+    myS3.UpstreamETags[key] = "\"upstream-v1\"";
+    myS3.CreatedAt[key] = DateTimeOffset.UtcNow - TimeSpan.FromHours(1); // stale
+    upstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.NotModified;
+
+    using var response = await server.CreateRequest("/real/revalidate.txt").SendAsync(HttpMethod.Get.Method);
+
+    AssertStatusHeader(response, CachingProxyStatus.REVALIDATED);
+    Assert.Equal("\"upstream-v1\"", upstreamServer.RevalidateIfNoneMatch);
+    Assert.Equal("\"upstream-v1\"", myS3.UpstreamETags[key]); // and the touch keeps it
+    // The client still sees the bucket's tag: a large object is fetched from the bucket itself, which
+    // reports that one, so the two paths must not disagree.
+    Assert.Equal("\"s3-body-md5\"", response.Headers.ETag?.ToString());
+  }
+
+  [Fact]
+  public async Task Revalidation_Sends_No_ETag_When_None_Was_Recorded()
+  {
+    // Nothing recorded - an upstream that issues no ETag, or an object stored before this was recorded -
+    // so the request is conditional on the stored date alone. Sending the bucket's own tag instead would
+    // make the origin skip the date it can actually evaluate.
+    var server = CreateServer(signedLinks: false, refreshAfter: TimeSpan.FromMinutes(1));
+    var key = GetPathKey("/real/revalidate.txt");
+    myS3.Objects[key] = ([.. "v1"u8], "text/plain", "\"s3-body-md5\"");
+    myS3.CreatedAt[key] = DateTimeOffset.UtcNow - TimeSpan.FromHours(1);
+    Assert.DoesNotContain(key, myS3.UpstreamETags.Keys);
+    upstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.NotModified;
+
+    using var response = await server.CreateRequest("/real/revalidate.txt").SendAsync(HttpMethod.Get.Method);
+
+    AssertStatusHeader(response, CachingProxyStatus.REVALIDATED);
+    Assert.Null(upstreamServer.RevalidateIfNoneMatch);
+    Assert.NotNull(upstreamServer.RevalidateIfModifiedSince); // the date still is a precondition
+  }
+
+  [Fact]
+  public async Task Stored_Object_From_An_ETagless_Upstream_Records_No_ETag()
+  {
+    // An upstream that issues no ETag (nginx origins behind redirector.kotlinlang.org, for one) must
+    // leave the key unset rather than have S3's checksum stand in for it - what such an object then
+    // revalidates on is Revalidation_Sends_No_ETag_When_None_Was_Recorded.
+    var server = CreateServer(signedLinks: false);
+    var key = GetPathKey("/real/revalidate.txt");
+    upstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.Ok;
+    upstreamServer.RevalidateETag = null;
+
+    using var response = await server.CreateRequest("/real/revalidate.txt").SendAsync(HttpMethod.Get.Method);
+
+    AssertStatusHeader(response, CachingProxyStatus.MISS);
+    Assert.Equal(1, myS3.PutObjectCalls);
+    Assert.Null(myS3.UpstreamETags[key]);
+  }
+
+  [Fact]
+  public async Task Revalidation_That_Re_Stores_Records_The_Fresh_Upstream_ETag()
+  {
+    // The upstream answers 200 (changed), so the re-store replaces the recorded validator with the one
+    // the new bytes came under - otherwise the next revalidation would ask about the previous body.
+    var server = CreateServer(signedLinks: false, refreshAfter: TimeSpan.FromMinutes(1));
+    var key = GetPathKey("/real/revalidate.txt");
+    myS3.Objects[key] = ([.. "old"u8], "text/plain", "\"s3-body-md5\"");
+    myS3.UpstreamETags[key] = "\"upstream-v1\"";
+    myS3.CreatedAt[key] = DateTimeOffset.UtcNow - TimeSpan.FromHours(1);
+    upstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.Ok;
+    upstreamServer.RevalidateContent = "new-content";
+    upstreamServer.RevalidateETag = "\"upstream-v2\"";
+
+    using var response = await server.CreateRequest("/real/revalidate.txt").SendAsync(HttpMethod.Get.Method);
+
+    AssertStatusHeader(response, CachingProxyStatus.REVALIDATED);
+    Assert.Equal("\"upstream-v1\"", upstreamServer.RevalidateIfNoneMatch); // asked about the old body
+    Assert.Equal("\"upstream-v2\"", myS3.UpstreamETags[key]);              // recorded the new one
+  }
+
+  [Fact]
   public async Task Dateless_Object_Is_Revalidated_And_Gains_A_Stored_Date()
   {
     // An object stored before "created-at" existed: with no stored date the freshness window cannot be
@@ -837,6 +935,9 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   Task IAsyncLifetime.InitializeAsync()
   {
     Environment.SetEnvironmentVariable("SENTRY_RELEASE", "release@1.0.0");
+    // The upstream is a class fixture, so its ETag knobs would otherwise carry into the next test.
+    upstreamServer.RevalidateETag = null;
+    upstreamServer.RevalidateIfNoneMatch = null;
     return Task.CompletedTask;
   }
 
@@ -864,6 +965,9 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     // unless written by a PutObject/CopyObject or seeded by a test; revalidation tests backdate it
     // to make the object appear stale.
     public readonly Dictionary<string, DateTimeOffset> CreatedAt = new();
+    // The "upstream-etag" user-metadata (the upstream's validator for the stored bytes), keyed by object
+    // key. Distinct from the object's own ETag in Objects, which is S3's - that difference is the point.
+    public readonly Dictionary<string, string?> UpstreamETags = new();
     // S3 existence probes via the ranged GetObject prefetch.
     public int GetObjectCalls;
     public int PutObjectCalls;
@@ -932,6 +1036,8 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
         response.Metadata["created-at"] = createdAt.ToString("O");
       if (Digests.GetValueOrDefault(request.Key) is { } digest)
         response.Metadata[CachedResponse.DockerContentDigestMetadataKey] = digest;
+      if (UpstreamETags.GetValueOrDefault(request.Key) is { } upstreamETag)
+        response.Metadata["upstream-etag"] = upstreamETag;
       return response;
     }
 
@@ -943,6 +1049,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
       Objects[request.Key] = (ms.ToArray(), request.Headers.ContentType, null);
       PutObjectUris[request.Key] = request.Metadata["uri"];
       Digests[request.Key] = request.Metadata[CachedResponse.DockerContentDigestMetadataKey];
+      UpstreamETags[request.Key] = request.Metadata["upstream-etag"];
       if (request.Metadata["created-at"] is { } createdAt)
         CreatedAt[request.Key] = DateTimeOffset.Parse(createdAt);
       return new PutObjectResponse { HttpStatusCode = HttpStatusCode.OK };
@@ -952,6 +1059,9 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     public override Task<CopyObjectResponse> CopyObjectAsync(CopyObjectRequest request, CancellationToken cancellationToken = default)
     {
       Interlocked.Increment(ref CopyObjectCalls);
+      // Assigned unconditionally: the copy re-applies the whole metadata set, so a key it drops must
+      // read back as dropped rather than as its stale value.
+      UpstreamETags[request.DestinationKey] = request.Metadata["upstream-etag"];
       if (request.Metadata["created-at"] is { } createdAt)
         CreatedAt[request.DestinationKey] = DateTimeOffset.Parse(createdAt);
       return Task.FromResult(new CopyObjectResponse { HttpStatusCode = HttpStatusCode.OK });
@@ -962,6 +1072,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
       Interlocked.Increment(ref DeleteObjectCalls);
       Objects.Remove(request.Key);
       CreatedAt.Remove(request.Key);
+      UpstreamETags.Remove(request.Key);
       return Task.FromResult(new DeleteObjectResponse { HttpStatusCode = HttpStatusCode.OK });
     }
 

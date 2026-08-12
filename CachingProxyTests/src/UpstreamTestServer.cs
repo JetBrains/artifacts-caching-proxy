@@ -51,6 +51,15 @@ public class UpstreamTestServer : IAsyncLifetime
   // that the proxy's freshness window is anchored to its own stored date rather than the upstream's.
   public volatile string? RevalidateLastModified;
 
+  // The ETag the revalidate route reports, or null to send none, and the conditional headers of the last
+  // request to it. Together they check that the tag a cache entry was stored under is the one the next
+  // revalidation is conditional on - a cache that sends its storage layer's tag instead never gets a 304,
+  // and an origin that cannot match an If-None-Match ignores If-Modified-Since too (RFC 9110 13.2.2), so
+  // a fabricated tag is worse than none.
+  public volatile string? RevalidateETag;
+  public volatile string? RevalidateIfNoneMatch;
+  public volatile string? RevalidateIfModifiedSince;
+
   // Counts hits on the maven metadata / snapshot routes used by the caching-profile tests. The
   // maven-metadata route is conditional-aware (a request carrying If-Modified-Since / If-None-Match
   // gets a 304), so a revalidation after the freshness window is served as REVALIDATED (kept).
@@ -274,8 +283,12 @@ public class UpstreamTestServer : IAsyncLifetime
       .MapGet("revalidate.txt", (req, res, data) =>
       {
         Interlocked.Increment(ref RevalidateRequestCount);
+        RevalidateIfNoneMatch = req.Headers.IfNoneMatch.ToString() is { Length: > 0 } ifNoneMatch ? ifNoneMatch : null;
+        RevalidateIfModifiedSince = req.Headers.IfModifiedSince.ToString() is { Length: > 0 } since ? since : null;
         if (RevalidateLastModified is { } lastModified)
           res.Headers.LastModified = lastModified;
+        if (RevalidateETag is { } etag)
+          res.Headers.ETag = etag;
         switch (Revalidate)
         {
           case RevalidateBehavior.NotModified:
