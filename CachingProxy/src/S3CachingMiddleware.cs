@@ -338,7 +338,9 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
   /// mutable one (maven-metadata.xml, a manifest by tag) would otherwise never leave a window it cannot
   /// be measured against. Revalidating heals it - both outcomes that keep the object write the key, a
   /// 304 via <see cref="TouchStoredDateAsync"/> and a 200 via <see cref="StoreInBucketAsync"/> - so this
-  /// costs one conditional request per such object, once, on an ETag-only precondition.
+  /// costs one revalidation per such object, once. Unconditional, at that: an object old enough to lack
+  /// the date lacks the recorded upstream ETag too, so there is no precondition to send and the answer is
+  /// a full body.
   /// </summary>
   private bool IsPastRefreshWindow(GetObjectResponse s3Object, TimeSpan refreshAfter, out DateTimeOffset? createdAt)
   {
