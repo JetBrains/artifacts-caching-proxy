@@ -745,6 +745,47 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   }
 
   [Fact]
+  public async Task Dateless_Object_Is_Revalidated_And_Gains_A_Stored_Date()
+  {
+    // An object stored before "created-at" existed: with no stored date the freshness window cannot be
+    // measured, so the object counts as stale instead of fresh forever. The 304 touch writes the key,
+    // so it is measurable from then on.
+    var server = CreateServer(signedLinks: false, refreshAfter: TimeSpan.FromMinutes(1));
+    var key = GetPathKey("/real/revalidate.txt");
+    myS3.Objects[key] = ([.. "v1"u8], "text/plain", "\"v1\"");
+    Assert.DoesNotContain(key, myS3.CreatedAt.Keys); // no freshness clock at all
+    upstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.NotModified;
+
+    using var response = await server.CreateRequest("/real/revalidate.txt").SendAsync(HttpMethod.Get.Method);
+
+    Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    AssertStatusHeader(response, CachingProxyStatus.REVALIDATED);
+    Assert.Equal("v1", await response.Content.ReadAsStringAsync());
+    Assert.Equal(1, myS3.CopyObjectCalls);           // touched
+    Assert.Equal(0, myS3.PutObjectCalls);            // not re-uploaded
+    Assert.Contains(key, myS3.CreatedAt.Keys);       // healed: the clock exists now
+  }
+
+  [Fact]
+  public async Task Dateless_Object_Under_An_Immutable_Rule_Is_Served_As_Is()
+  {
+    // Without a freshness window there is nothing to measure and nothing to heal, so a dateless object
+    // is served untouched - the upstream is not consulted at all.
+    var server = CreateServer(signedLinks: false);
+    var key = GetPathKey("/real/revalidate.txt");
+    myS3.Objects[key] = ([.. "v1"u8], "text/plain", "\"v1\"");
+    var upstreamHits = upstreamServer.RevalidateRequestCount; // shared fixture, so count the delta
+
+    using var response = await server.CreateRequest("/real/revalidate.txt").SendAsync(HttpMethod.Get.Method);
+
+    Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    AssertStatusHeader(response, CachingProxyStatus.MISS); // fresh from the bucket, no upstream call
+    Assert.Equal(upstreamHits, upstreamServer.RevalidateRequestCount);
+    Assert.Equal(0, myS3.CopyObjectCalls);
+    Assert.Equal(0, myS3.PutObjectCalls);
+  }
+
+  [Fact]
   public async Task Stale_Object_Upstream_Error_Serves_Stale_Copy()
   {
     // Upstream is unreachable/5xx during revalidation: the stale object must still be served (STALE)

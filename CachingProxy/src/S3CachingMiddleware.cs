@@ -144,9 +144,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
           // verdict so the serve-from-probe paths below report REVALIDATED (kept after a 304) or STALE
           // (upstream unreachable) instead of MISS. A 200 re-stores and serves fresh; a 404 deletes it.
           var probeStatus = CachingProxyStatus.MISS;
-          if (rule?.RefreshAfter is { } refreshAfter &&
-              DateTimeOffset.TryParse(s3Object.Metadata[CreatedAtMetadataKey], CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var createdAt) &&
-              timeProvider.GetUtcNow() - createdAt > refreshAfter)
+          if (rule?.RefreshAfter is { } refreshAfter && IsPastRefreshWindow(s3Object, refreshAfter, out var createdAt))
           {
             var result = await remoteProxy.RevalidateAsync(context, upstreamUri, s3Object.ETag, createdAt,
               remoteServer.Auth, rule, remoteServer.Profile, context.RequestAborted);
@@ -312,6 +310,28 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
       await remoteProxy.SetStatusAsync(context, status,
         await responseCache.PutStatusCode(verbKey, cachingResponse, remoteServer.CacheDuration, context.RequestAborted));
     }
+  }
+
+  /// <summary>
+  /// Whether a probed object has outlived <paramref name="refreshAfter"/>, reporting its stored date for
+  /// the conditional request. A missing or unparsable "created-at" counts as past any window rather than
+  /// eternally fresh: the key is younger than the bucket, so objects predating it carry none, and a
+  /// mutable one (maven-metadata.xml, a manifest by tag) would otherwise never leave a window it cannot
+  /// be measured against. Revalidating heals it - both outcomes that keep the object write the key, a
+  /// 304 via <see cref="TouchStoredDateAsync"/> and a 200 via <see cref="StoreInBucketAsync"/> - so this
+  /// costs one conditional request per such object, once, on an ETag-only precondition.
+  /// </summary>
+  private bool IsPastRefreshWindow(GetObjectResponse s3Object, TimeSpan refreshAfter, out DateTimeOffset? createdAt)
+  {
+    if (!DateTimeOffset.TryParse(s3Object.Metadata[CreatedAtMetadataKey], CultureInfo.InvariantCulture,
+          DateTimeStyles.RoundtripKind, out var storedAt))
+    {
+      createdAt = null;
+      return true;
+    }
+
+    createdAt = storedAt;
+    return timeProvider.GetUtcNow() - storedAt > refreshAfter;
   }
 
   /// <summary>
