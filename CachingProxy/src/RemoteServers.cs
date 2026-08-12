@@ -17,6 +17,7 @@ public class RemoteServers : EndpointDataSource
   public RemoteServers(CachingProxyConfig config, ILogger<RemoteServers> logger)
   {
     var endpoints = new Endpoint[config.Prefixes.Length];
+    var hasGatedOciPrefix = false;
     logger.LogInformation("Creating {Count} endpoints", config.Prefixes.Length);
     for (var i = 0; i < config.Prefixes.Length; i++)
     {
@@ -50,6 +51,7 @@ public class RemoteServers : EndpointDataSource
       var metadata = remoteServer.Auth != null ?
         new EndpointMetadataCollection(remoteServer, new AuthorizeAttribute()) :
         new EndpointMetadataCollection(remoteServer);
+      hasGatedOciPrefix |= remoteServer.Auth != null && remoteServer.Profile?.Oci == true;
 
       // Overlapping prefixes (e.g. "/aprefix" and "/aprefix/too") both match via their {**path}
       // catch-all, and routing breaks such ties by Endpoint.Order, NOT by specificity. So order by
@@ -65,7 +67,15 @@ public class RemoteServers : EndpointDataSource
     }
 
     Endpoints = endpoints;
+    HasGatedOciPrefix = hasGatedOciPrefix;
   }
+
+  /// <summary>
+  /// True when at least one OCI prefix carries an AuthorizeAttribute. A registry client picks its auth
+  /// strategy for the whole host from the <c>GET /v2/</c> probe, so that probe has to challenge for such a
+  /// deployment - see UseOciPing. Deployments whose OCI prefixes are all public keep an unchallenged probe.
+  /// </summary>
+  public bool HasGatedOciPrefix { get; }
 
   private const string PathParameterName = "path";
 

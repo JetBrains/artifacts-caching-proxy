@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IdentityModel.Tokens.Jwt;
 using System.IO;
 using System.Linq;
@@ -313,6 +314,68 @@ public class InboundAuthTest : IAsyncLifetime
     }
   }
 
+  [Fact]
+  public async Task Oci_Probe_Is_Challenged_When_An_Oci_Prefix_Is_Gated()
+  {
+    // A registry client fixes its auth strategy for the whole host from GET /v2/ alone: answer it 200 with
+    // no challenge and the client concludes the registry is anonymous, never sends the `docker login`
+    // credentials, and treats the 401 on the manifest that follows as terminal. So the probe itself has to
+    // challenge once a gated OCI prefix exists.
+    using var host = BuildProxyHost(BuildOciConfig());
+    await host.StartAsync();
+    try
+    {
+      using var client = host.GetTestServer().CreateClient();
+
+      var response = await client.GetAsync("/v2/");
+
+      Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+      var basic = Assert.Single(response.Headers.WwwAuthenticate);
+      Assert.Equal("Basic", basic.Scheme);
+      // The version header travels on the 401 too, as it does from a real registry.
+      Assert.Equal(CachingProxyConstants.DockerApiVersion,
+        response.Headers.GetValues(CachingProxyConstants.DockerApiVersionHeader).Single());
+    }
+    finally
+    {
+      await host.StopAsync();
+    }
+  }
+
+  [Fact]
+  public async Task Oci_Probe_With_Valid_Token_Is_Answered()
+  {
+    using var host = BuildProxyHost(BuildOciConfig());
+    await host.StartAsync();
+    try
+    {
+      using var client = host.GetTestServer().CreateClient();
+      client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", MintToken());
+
+      var response = await client.GetAsync("/v2/");
+
+      Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+      Assert.Equal("{}", await response.Content.ReadAsStringAsync());
+    }
+    finally
+    {
+      await host.StopAsync();
+    }
+  }
+
+  [Fact]
+  public async Task Oci_Probe_Stays_Public_Without_A_Gated_Oci_Prefix()
+  {
+    // The shared host gates /private, but that is not an OCI prefix, so nothing about the registry probe
+    // changes: a deployment whose OCI prefixes are all public keeps serving anonymous pulls.
+    using var client = myProxyHost!.GetTestServer().CreateClient();
+
+    var response = await client.GetAsync("/v2/");
+
+    Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    Assert.Equal("{}", await response.Content.ReadAsStringAsync());
+  }
+
   private string MintToken(RSA? rsa = null, bool withExpiration = true)
   {
     var key = new RsaSecurityKey(rsa ?? myRsa) { KeyId = Kid };
@@ -388,6 +451,36 @@ public class InboundAuthTest : IAsyncLifetime
         Audiences = [Audience],
         JwksUrl = new Uri(UrlOf(myAuthServer), "jwks.json"),
         RequireExpiration = requireExpiration,
+      },
+    };
+  }
+
+  // A gated OCI prefix: an Oci profile on a prefix whose upstream matches an UpstreamAuth entry, so the
+  // prefix carries [Authorize] and the registry probe has to challenge.
+  private CachingProxyConfig BuildOciConfig()
+  {
+    var upstreamUrl = UrlOf(myUpstreamServer);
+    return new CachingProxyConfig
+    {
+      LocalCachePath = myTempDirectory,
+      MinimumFreeDiskSpaceMb = 2,
+      CachingProfiles = new Dictionary<string, CachingProfile> { ["docker"] = new() { Oci = true } },
+      Prefixes = [new CachingProxyPrefix($"/v2/private-hub={upstreamUrl}secure/v2", Profile: "docker")],
+      UpstreamAuth =
+      {
+        ["test"] = new UpstreamAuth
+        {
+          UrlPrefixes = [new Uri(upstreamUrl, "secure/").GetHostPortPath()],
+          TokenEndpoint = new Uri(UrlOf(myAuthServer), "token"),
+          ClientId = ClientId,
+          ClientSecret = ClientSecret,
+        },
+      },
+      InboundAuth = new CachingProxyConfig.InboundAuthConfig
+      {
+        Issuer = Issuer,
+        Audiences = [Audience],
+        JwksUrl = new Uri(UrlOf(myAuthServer), "jwks.json"),
       },
     };
   }

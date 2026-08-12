@@ -9,6 +9,7 @@ using Amazon.Extensions.NETCore.Setup;
 using Amazon.Runtime;
 using Amazon.S3;
 using DotNetEnv.Configuration;
+using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
@@ -241,11 +242,12 @@ public static class Program
 
   public static void ConfigureOurApp(this IApplicationBuilder app, IConfiguration configuration)
   {
+    var config = configuration.Get<CachingProxyConfig>()!;
     app.UseRouting();
     app.UseHealthChecks("/health");
-    app.UseOciPing();
     app.UseInboundAuth();
-    if (!string.IsNullOrEmpty(configuration.Get<CachingProxyConfig>()!.S3?.BucketName))
+    app.UseOciPing(config.InboundAuth != null);
+    if (!string.IsNullOrEmpty(config.S3?.BucketName))
     {
       app.UseMiddleware<S3CachingMiddleware>();
     }
@@ -261,37 +263,59 @@ public static class Program
 
   /// <summary>
   /// The OCI distribution base endpoint. Every registry client probes <c>GET /v2/</c> before it fetches
-  /// anything and gives up on the pull unless that answers 2xx; the configured prefixes are
+  /// anything and gives up on the pull unless that answers 2xx or 401; the configured prefixes are
   /// <c>/v2/&lt;alias&gt;</c>, so the bare probe would otherwise fall through to a 404.
   /// <para>An exact path match, not <c>app.Map("/v2")</c>, which would swallow every
-  /// <c>/v2/&lt;alias&gt;</c> request with it. Registered before the inbound auth so a public anonymous
-  /// pull is not challenged at the probe; a private alias is still challenged on the resource request that
-  /// follows it.</para>
+  /// <c>/v2/&lt;alias&gt;</c> request with it.</para>
+  /// <para>Registered after the inbound auth, because a registry client fixes its auth strategy for the
+  /// whole host from this probe alone: a 200 with no WWW-Authenticate means "anonymous registry", and the
+  /// client then never sends the <c>docker login</c> credentials - the 401 on the manifest that follows is
+  /// terminal rather than a prompt (and <c>docker login</c> itself stores the credentials unvalidated). So
+  /// an unauthenticated probe has to be challenged whenever a gated OCI prefix exists. It routes no request
+  /// of its own, so <c>UseAuthorization</c> has no endpoint metadata to enforce here and the challenge is
+  /// issued explicitly.</para>
   /// </summary>
-  private static void UseOciPing(this IApplicationBuilder app) => app.Use(async (context, next) =>
+  private static void UseOciPing(this IApplicationBuilder app, bool inboundAuthConfigured)
   {
-    var path = context.Request.Path;
-    var isBare = path.Equals("/v2", StringComparison.OrdinalIgnoreCase);
-    if (!isBare && !path.Equals("/v2/", StringComparison.OrdinalIgnoreCase) ||
-        !HttpMethods.IsGet(context.Request.Method) && !HttpMethods.IsHead(context.Request.Method))
-    {
-      await next(context);
-      return;
-    }
+    // Both halves are fixed at startup, so resolve them once instead of per request. Without InboundAuth
+    // there is nothing a client could present, and challenging would only make the registry unusable.
+    var challengeTheProbe = inboundAuthConfigured &&
+                            app.ApplicationServices.GetRequiredService<RemoteServers>().HasGatedOciPrefix;
 
-    // A real registry answers the bare /v2 with a redirect to /v2/, and clients follow it. 307 rather than
-    // 302 to keep the method, matching the redirector's own `location = /v2`.
-    if (isBare)
+    app.Use(async (context, next) =>
     {
-      context.Response.StatusCode = StatusCodes.Status307TemporaryRedirect;
-      context.Response.Headers.Location = "/v2/";
-      return;
-    }
+      var path = context.Request.Path;
+      var isBare = path.Equals("/v2", StringComparison.OrdinalIgnoreCase);
+      if (!isBare && !path.Equals("/v2/", StringComparison.OrdinalIgnoreCase) ||
+          !HttpMethods.IsGet(context.Request.Method) && !HttpMethods.IsHead(context.Request.Method))
+      {
+        await next(context);
+        return;
+      }
 
-    context.Response.Headers[CachingProxyConstants.DockerApiVersionHeader] = CachingProxyConstants.DockerApiVersion;
-    context.Response.ContentType = MediaTypeNames.Application.Json;
-    // An empty JSON object is what the spec's "2xx with no meaningful body" amounts to in practice, and
-    // what every registry returns.
-    await context.Response.WriteAsync("{}", context.RequestAborted);
-  });
+      // A real registry answers the bare /v2 with a redirect to /v2/, and clients follow it. 307 rather than
+      // 302 to keep the method, matching the redirector's own `location = /v2`.
+      if (isBare)
+      {
+        context.Response.StatusCode = StatusCodes.Status307TemporaryRedirect;
+        context.Response.Headers.Location = "/v2/";
+        return;
+      }
+
+      // On the 401 too: a client reads the version header off whichever response the probe returns.
+      context.Response.Headers[CachingProxyConstants.DockerApiVersionHeader] = CachingProxyConstants.DockerApiVersion;
+
+      if (challengeTheProbe && context.User.Identity?.IsAuthenticated != true)
+      {
+        // The default scheme's challenge, so the probe advertises the same Basic realm as every other 401.
+        await context.ChallengeAsync();
+        return;
+      }
+
+      context.Response.ContentType = MediaTypeNames.Application.Json;
+      // An empty JSON object is what the spec's "2xx with no meaningful body" amounts to in practice, and
+      // what every registry returns.
+      await context.Response.WriteAsync("{}", context.RequestAborted);
+    });
+  }
 }
