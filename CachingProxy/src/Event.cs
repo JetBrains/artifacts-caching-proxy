@@ -15,6 +15,7 @@ public static class Event
   public static readonly EventId FailedToCacheInS3 = new(7, nameof(FailedToCacheInS3));
   public static readonly EventId RemoteProxy = new(8, nameof(RemoteProxy));
   public static readonly EventId ConcurrentCacheStore = new(9, nameof(ConcurrentCacheStore));
+  public static readonly EventId IncompleteUpstreamBody = new(10, nameof(IncompleteUpstreamBody));
 
   private static readonly ConcurrentDictionary<HttpStatusCode, EventId> ourNegativeHitEventIDs = new();
   public static EventId NegativeMiss(HttpStatusCode httpStatusCode) =>

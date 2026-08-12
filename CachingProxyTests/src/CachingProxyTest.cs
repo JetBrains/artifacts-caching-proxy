@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
@@ -17,6 +18,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Time.Testing;
 using Xunit;
 using Xunit.Abstractions;
@@ -1425,10 +1427,12 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
 
   // A proxy host with the two upstream time bounds under test, over its own cache directory: these tests
   // share one upstream path and would otherwise HIT each other's stored copy instead of the upstream.
-  // No profile, so the path is cached forever and no revalidation muddies the timing.
-  private sealed record TimeoutProxy(TestServer Server, string CachePath);
+  // No profile, so the path is cached forever and no revalidation muddies the timing. Warnings carries what
+  // the proxy logged, which is how a test tells a failure the proxy handled from one that escaped it: an
+  // abandoned transfer looks the same to the client either way, but only the handled one is logged.
+  private sealed record TimeoutProxy(TestServer Server, string CachePath, WarningCollector Warnings);
 
-  private TimeoutProxy CreateTimeoutProxy(long requestTimeoutSec, long idleReadTimeoutSec)
+  private TimeoutProxy CreateTimeoutProxy(long requestTimeoutSec, long idleReadTimeoutSec, Uri? upstreamUrl = null)
   {
     var cachePath = Path.Combine(myTempDirectory, Path.GetRandomFileName());
     Directory.CreateDirectory(cachePath);
@@ -1436,12 +1440,13 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
     var config = new CachingProxyConfig
     {
       LocalCachePath = cachePath,
-      Prefixes = [$"/slow={myUpstreamServer.Url}"],
+      Prefixes = [$"/slow={upstreamUrl ?? myUpstreamServer.Url}"],
       MinimumFreeDiskSpaceMb = 2,
       RequestTimeoutSec = requestTimeoutSec,
       IdleReadTimeoutSec = idleReadTimeoutSec,
     };
 
+    var warnings = new WarningCollector();
     var host = new HostBuilder()
       .ConfigureWebHost(webHostBuilder => webHostBuilder
         .UseTestServer()
@@ -1450,13 +1455,42 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
         .ConfigureOurServices()
         .ConfigureServices(services => services
           .AddSingleton(config)
+          .AddSingleton<ILoggerProvider>(warnings)
           .Replace(ServiceDescriptor.Singleton<TimeProvider>(myTimeProvider)))
         .Configure((context, builder) => builder.ConfigureOurApp(context.Configuration)))
       .Build();
 
     myExtraHosts.Add(host);
     host.Start();
-    return new TimeoutProxy(host.GetTestServer(), cachePath);
+    return new TimeoutProxy(host.GetTestServer(), cachePath, warnings);
+  }
+
+  // Collects the event IDs the proxy logged at Warning or above.
+  private sealed class WarningCollector : ILoggerProvider
+  {
+    private readonly ConcurrentQueue<EventId> myEvents = new();
+
+    public bool Logged(EventId eventId) => myEvents.Contains(eventId);
+    public ILogger CreateLogger(string categoryName) => new Sink(myEvents);
+    public void Dispose() {}
+
+    private sealed class Sink(ConcurrentQueue<EventId> events) : ILogger
+    {
+      public bool IsEnabled(LogLevel logLevel) => logLevel >= LogLevel.Warning;
+      public IDisposable BeginScope<TState>(TState state) where TState : notnull => NullScope.Instance;
+
+      public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+        Func<TState, Exception?, string> formatter)
+      {
+        if (IsEnabled(logLevel)) events.Enqueue(eventId);
+      }
+    }
+
+    private sealed class NullScope : IDisposable
+    {
+      public static readonly NullScope Instance = new();
+      public void Dispose() {}
+    }
   }
 
   private IEnumerable<string> StoredFiles(string cachePath) =>
@@ -1539,6 +1573,9 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
     Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(4),
       $"expected to give up ~1s into the stall, but took {stopwatch.ElapsedMilliseconds}ms");
 
+    // Handled by the proxy rather than thrown out of it, which the client cannot tell apart.
+    Assert.True(proxy.Warnings.Logged(Event.IncompleteUpstreamBody), "the abandoned transfer was not logged");
+
     // A partial body must never become a cache entry, and the temp file it was written to must be gone.
     Assert.Empty(StoredFiles(proxy.CachePath));
   }
@@ -1568,6 +1605,33 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
     using var hit = await proxy.Server.CreateRequest("/slow/slow-body.bin").GetAsync();
     AssertStatusHeader(hit, CachingProxyStatus.HIT);
     Assert.Equal(UpstreamTestServer.SlowBodyChunkSize * 8, (await hit.Content.ReadAsByteArrayAsync()).Length);
+  }
+
+  [Fact]
+  public async Task An_Upstream_That_Ends_The_Body_Early_Is_Abandoned()
+  {
+    // The sibling of the stall above, and the one production actually sees: the upstream sends a head, part
+    // of the body, then ends the transfer. The read fails instead of hanging, so no timer is involved - only
+    // whether the failure is handled where the stall is.
+    using var upstream = new TruncatingUpstream();
+    var proxy = CreateTimeoutProxy(requestTimeoutSec: 20, idleReadTimeoutSec: 60, upstreamUrl: upstream.Url);
+
+    using var client = proxy.Server.CreateClient();
+    using var response = await client.GetAsync("/slow/truncated-body.bin", HttpCompletionOption.ResponseHeadersRead);
+
+    // Same shape as the stall: the head went out before the failure, so it carries the upstream's declared
+    // Content-Length, which the body will never reach, and aborting is the only signal left.
+    Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    Assert.Equal(TruncatingUpstream.DeclaredLength, GetContentLength(response));
+
+    Assert.NotNull(await Record.ExceptionAsync(() => response.Content.ReadAsByteArrayAsync()));
+
+    // The client cannot distinguish an abandoned transfer from one whose exception escaped the proxy - both
+    // arrive as a short body - so the log is what says this was handled and not reported as a crash.
+    Assert.True(proxy.Warnings.Logged(Event.IncompleteUpstreamBody), "the abandoned transfer was not logged");
+
+    // A partial body must never become a cache entry, and its temp file must be gone.
+    Assert.Empty(StoredFiles(proxy.CachePath));
   }
 
   private async Task AssertGetResponse(string url, HttpStatusCode expectedCode,

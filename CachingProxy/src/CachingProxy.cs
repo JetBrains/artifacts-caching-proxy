@@ -281,15 +281,15 @@ public class CachingProxy
       // cleanup in RevalidateAndServeAsync) without a raw-vs-normalized path-string mismatch.
       return Path.GetFullPath(cachedFile);
     }
-    catch (TimeoutException e)
+    catch (IncompleteUpstreamBodyException e)
     {
-      // The upstream went silent mid-body (see CopyToTwoStreamsAsync). Handled exactly like a
+      // The upstream went silent or died mid-body (see CopyToTwoStreamsAsync). Handled exactly like a
       // Content-Length mismatch, and for the same reason: the head - status and all - was written and
       // partially drained long ago, so there is no error response left to send, and the only honest signal
       // is to abort so the client sees a truncated transfer instead of a body short of its Content-Length.
       // Returning null keeps the partial temp file out of the cache (the finally below deletes it), and
       // unlike a head-phase timeout nothing is negative-cached: the next request must retry, not 404.
-      myLogger.LogWarning(Event.Timeout, "Aborting {RequestPath}: {Reason}", context.Request.Path, e.Message);
+      myLogger.LogWarning(Event.IncompleteUpstreamBody, "Aborting {RequestPath}: {Reason}", context.Request.Path, e.Message);
       context.Abort();
       return null;
     }
@@ -391,9 +391,11 @@ public class CachingProxy
   // layer transfers for as long as it keeps making progress. This is the only bound on a body transfer -
   // see the config comment for why HttpClient.Timeout is not one.
   //
-  // Throws TimeoutException on a stall, so the caller can tell it from the OperationCanceledException a
-  // departing client raises. The writes stay on the caller's token: a client too slow to drain is Kestrel's
-  // to time out (MinResponseDataRate), and counting that as an upstream stall would blame the wrong side.
+  // Both ways the upstream can fail to deliver the body - going silent, or ending it early - surface as
+  // IncompleteUpstreamBodyException, so the caller can tell them from the OperationCanceledException a
+  // departing client raises and from an IOException its own disk writes raise. The writes stay on the
+  // caller's token: a client too slow to drain is Kestrel's to time out (MinResponseDataRate), and counting
+  // that as an upstream stall would blame the wrong side.
   private async Task<long> CopyToTwoStreamsAsync(Stream source, Stream dest1, FileStream dest2, CancellationToken cancellationToken)
   {
     using var buffer = MemoryPool<byte>.Shared.Rent(BUFFER_SIZE);
@@ -411,8 +413,15 @@ public class CachingProxy
       catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
       {
         // Our own token fired while the caller's did not, so this is the idle timer and not a disconnect.
-        throw new TimeoutException(
+        throw new IncompleteUpstreamBodyException(
           $"Upstream sent no data for {myIdleReadTimeout.TotalSeconds:0}s after {total} bytes");
+      }
+      catch (IOException e)
+      {
+        // The upstream ended the body short of its Content-Length, or its connection died. No timer catches
+        // this - the read fails rather than hangs - so it gets the stall's treatment. Caught around the read
+        // alone: the same type comes out of our own cache-file writes, where it means a bad disk and must surface.
+        throw new IncompleteUpstreamBodyException($"Upstream ended the body after {total} bytes: {e.Message}", e);
       }
       finally
       {
@@ -429,6 +438,11 @@ public class CachingProxy
 
     return total;
   }
+
+  // The upstream did not deliver the body it promised: it went silent, or it ended early. One type because
+  // the two get one treatment, and its own type so the caller can tell them from a disk failure.
+  private sealed class IncompleteUpstreamBodyException(string message, Exception? innerException = null)
+    : Exception(message, innerException);
 
   public class HealthCheck(CachingProxyConfig config) : IHealthCheck
   {
