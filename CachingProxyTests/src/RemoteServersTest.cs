@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
@@ -107,5 +109,53 @@ public class RemoteServersTest
     Assert.True(gated["/a"]);
     Assert.True(gated["/v2/docker-hub"]);
     Assert.False(gated["/c"]); // fetched anonymously, nothing to protect
+  }
+
+  [Fact]
+  public void A_Matched_Entry_With_No_Credential_Is_Warned_About()
+  {
+    // The shape a half-configured secret takes: the entry gates its prefix inbound, so it looks
+    // configured, while nothing is sent upstream. An OCI upstream then mints its registry token
+    // anonymously, which a private repository answers with a 403 that names no missing account.
+    var halfConfigured = new UpstreamAuth { UrlPrefixes = ["registry.example.com/v2/private"] };
+    var account = new UpstreamAuth
+    {
+      UrlPrefixes = ["registry.example.com/v2/mirror"], Username = "svc", Password = "pat",
+    };
+
+    var config = new CachingProxyConfig
+    {
+      Prefixes = ["/v2/private=registry.example.com/v2/private", "/v2/mirror=registry.example.com/v2/mirror"],
+      UpstreamAuth = { [nameof(halfConfigured)] = halfConfigured, [nameof(account)] = account },
+    };
+
+    var logger = new WarningLogger();
+    _ = new RemoteServers(config, logger);
+
+    var warning = Assert.Single(logger.Warnings);
+    Assert.Equal(Event.IncompleteUpstreamAuth, warning.Event);
+    Assert.Contains(nameof(halfConfigured), warning.Message);
+    Assert.Contains("/v2/private", warning.Message);
+  }
+
+  // Collects what RemoteServers logged at Warning or above, so a startup misconfiguration can be asserted
+  // on. The per-prefix Information lines are dropped, since IsEnabled gates them out.
+  private sealed class WarningLogger : ILogger<RemoteServers>
+  {
+    public List<(EventId Event, string Message)> Warnings { get; } = [];
+
+    public bool IsEnabled(LogLevel logLevel) => logLevel >= LogLevel.Warning;
+    public IDisposable BeginScope<TState>(TState state) where TState : notnull => new Scope();
+
+    public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+      Func<TState, Exception?, string> formatter)
+    {
+      if (IsEnabled(logLevel)) Warnings.Add((eventId, formatter(state, exception)));
+    }
+
+    private sealed class Scope : IDisposable
+    {
+      public void Dispose() {}
+    }
   }
 }

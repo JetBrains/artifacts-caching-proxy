@@ -32,7 +32,8 @@ public class RemoteServers : EndpointDataSource
       target = target.TrimEnd('/') + '/';
       var remoteUri = Uri.TryCreate(target, UriKind.Absolute, out var targetUri) ? targetUri :
         new Uri(Uri.UriSchemeHttps + Uri.SchemeDelimiter + target, UriKind.Absolute);
-      var matchedAuth = MatchAuth(remoteUri, config.UpstreamAuth.Values);
+      var matched = MatchAuth(remoteUri, config.UpstreamAuth);
+      var matchedAuth = matched?.Value;
       if (matchedAuth != null && !remoteUri.IsSecureOrLoopback())
         throw new ArgumentException(
           $"Authenticated upstream '{remoteUri}' must use HTTPS except on loopback.");
@@ -42,6 +43,13 @@ public class RemoteServers : EndpointDataSource
 
       logger.LogInformation("RemoteServer: {Prefix} -> {RemoteUri}, Auth: {Auth}, Profile: {Profile}",
         remoteServer.Prefix, remoteServer.RemoteUri, remoteServer.Auth, prefix.Profile);
+      // A matched entry with no credential is what a half-configured secret looks like: the prefix is gated
+      // inbound, so it looks configured, while the upstream is reached anonymously - and an OCI upstream
+      // mints its registry token anonymously too, which a private repository answers with a bare 403.
+      if (matchedAuth is { HasCredential: false })
+        logger.LogWarning(Event.IncompleteUpstreamAuth,
+          "UpstreamAuth '{Name}' matched {Prefix} but has no credential to send, so {RemoteUri} is reached anonymously",
+          matched!.Value.Key, remoteServer.Prefix, remoteServer.RemoteUri);
       // A prefix with a matched UpstreamAuth fetches with a credential of ours, so its inbound route must
       // require a validated client JWT too: attach an AuthorizeAttribute (enforced by
       // UseAuthentication/UseAuthorization). No exception for a credential that only buys rate limit on a
@@ -92,15 +100,17 @@ public class RemoteServers : EndpointDataSource
 
   // Among the auth entries whose UrlPrefixes contain a prefix of the upstream URL, the longest (most
   // specific) one wins, so a host-wide block and a path-scoped block can coexist. Returns null when
-  // nothing matches, leaving the upstream unauthenticated.
-  private static UpstreamAuth? MatchAuth(Uri remoteUri, IReadOnlyCollection<UpstreamAuth> auths)
+  // nothing matches, leaving the upstream unauthenticated. The entry keeps its configuration name, which
+  // is what the credential-less warning has to point at (UpstreamAuth__<name>__…) to be actionable.
+  private static KeyValuePair<string, UpstreamAuth>? MatchAuth(
+    Uri remoteUri, IReadOnlyDictionary<string, UpstreamAuth> auths)
   {
     var remotePrefix = remoteUri.GetHostPortPath();
     return auths.
-      SelectMany(auth => auth.UrlPrefixes.Select(prefix => KeyValuePair.Create(prefix, auth)))
-      .Where(kv => remotePrefix.StartsWith(kv.Key, StringComparison.OrdinalIgnoreCase))
-      .OrderByDescending(kv => kv.Key.Length)
-      .Select(kv => kv.Value)
+      SelectMany(entry => entry.Value.UrlPrefixes.Select(prefix => (UrlPrefix: prefix, Entry: entry)))
+      .Where(match => remotePrefix.StartsWith(match.UrlPrefix, StringComparison.OrdinalIgnoreCase))
+      .OrderByDescending(match => match.UrlPrefix.Length)
+      .Select(match => (KeyValuePair<string, UpstreamAuth>?)match.Entry)
       .FirstOrDefault();
   }
 

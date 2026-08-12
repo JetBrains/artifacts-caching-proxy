@@ -83,6 +83,10 @@ public record UpstreamAuth
   // True when this entry is a fixed Basic credential rather than something exchanged for a token.
   public bool IsServiceAccount => !string.IsNullOrEmpty(Username);
 
+  // True when the entry has a credential to send at all. Mirrors the dispatch in
+  // IUpstreamAuthorizationProvider, where an entry with neither resolves to no Authorization header.
+  public bool HasCredential => IsServiceAccount || !string.IsNullOrEmpty(ClientId);
+
   public override string ToString() => new StringBuilder()
     .Append(ClientId != null ? $"{nameof(ClientId)}: {ClientId} " : "")
     // The password is never rendered; the username identifies the account well enough to debug with.
