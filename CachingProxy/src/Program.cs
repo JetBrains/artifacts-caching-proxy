@@ -158,7 +158,7 @@ public static class Program
       .AddOptions<MemoryCacheOptions>()
       .Configure<TimeProvider>((options, tp) => options.Clock = new TimeProviderClock(tp));
 
-    if (!string.IsNullOrEmpty(context.Configuration.Get<CachingProxyConfig>()?.S3?.BucketName))
+    if (context.Configuration.Get<CachingProxyConfig>()?.IsS3Mode is true)
     {
       services
         .AddSingleton<AWSOptions>(static provider =>
@@ -247,7 +247,7 @@ public static class Program
     app.UseHealthChecks("/health");
     app.UseInboundAuth();
     app.UseOciPing(config.InboundAuth != null);
-    if (!string.IsNullOrEmpty(config.S3?.BucketName))
+    if (config.IsS3Mode)
     {
       app.UseMiddleware<S3CachingMiddleware>();
     }

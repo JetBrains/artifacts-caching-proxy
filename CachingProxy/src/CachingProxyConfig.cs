@@ -89,6 +89,12 @@ public class CachingProxyConfig
   public InboundAuthConfig? InboundAuth { get; init; }
 
   public S3Config? S3 { get; init; }
+
+  // Whether responses live in a bucket rather than on a local volume. Every disk-only piece - cleanup, the
+  // disk health check, the volume gauges - branches on this one predicate, so none of them can drift into
+  // describing a disk the deployment does not have.
+  public bool IsS3Mode => !string.IsNullOrEmpty(S3?.BucketName);
+
   public RedisConfig? Redis { get; init; }
   public string LocalCachePath { get; init; } = Path.Combine(Path.GetTempPath(), "artifacts-caching-proxy");
   public string? BlacklistUrlRegex { get; init; }

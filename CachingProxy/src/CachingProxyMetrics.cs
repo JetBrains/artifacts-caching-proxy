@@ -27,17 +27,24 @@ public class CachingProxyMetrics
     // resized volume must not keep reporting the old size. The minimum is the health check's own trip
     // point, so an alert reads `free < minimum` and keeps agreeing with the health check after the knob
     // moves.
-    Meter.CreateObservableGauge("local_cache_disk_free_bytes",
-      () => ObserveVolume(config.LocalCachePath, static drive => drive.AvailableFreeSpace),
-      "bytes", "Free bytes on the volume holding the local cache");
+    //
+    // Disk mode only, matching where Program registers CleanupService and that health check. A bucket-mode
+    // deployment has no volume to read, so free and total would fall silent there anyway - but the minimum
+    // is a plain config read that cannot fail, and alone it would assert a trip point nothing enforces.
+    if (!config.IsS3Mode)
+    {
+      Meter.CreateObservableGauge("local_cache_disk_free_bytes",
+        () => ObserveVolume(config.LocalCachePath, static drive => drive.AvailableFreeSpace),
+        "bytes", "Free bytes on the volume holding the local cache");
 
-    Meter.CreateObservableGauge("local_cache_disk_total_bytes",
-      () => ObserveVolume(config.LocalCachePath, static drive => drive.TotalSize),
-      "bytes", "Size of the volume holding the local cache");
+      Meter.CreateObservableGauge("local_cache_disk_total_bytes",
+        () => ObserveVolume(config.LocalCachePath, static drive => drive.TotalSize),
+        "bytes", "Size of the volume holding the local cache");
 
-    Meter.CreateObservableGauge("local_cache_disk_minimum_free_bytes",
-      () => config.MinimumFreeDiskSpaceMb * 1024 * 1024,
-      "bytes", "Free bytes below which the health check reports unhealthy");
+      Meter.CreateObservableGauge("local_cache_disk_minimum_free_bytes",
+        () => config.MinimumFreeDiskSpaceMb * 1024 * 1024,
+        "bytes", "Free bytes below which the health check reports unhealthy");
+    }
   }
 
   /// <summary>

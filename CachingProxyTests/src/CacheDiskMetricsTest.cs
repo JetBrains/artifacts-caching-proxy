@@ -154,6 +154,41 @@ public class CacheDiskMetricsTest(ITestOutputHelper output) : IAsyncLifetime
   }
 
   /// <summary>
+  /// A bucket-mode deployment has no cache volume, and no disk health check registered either, so the three
+  /// volume gauges must not exist there at all. Absence has to be checked at declaration rather than at
+  /// measurement: free and total fall silent on an unreadable path anyway, but the minimum is a plain config
+  /// read that always succeeds, so left registered it would publish a trip point nothing enforces.
+  /// </summary>
+  [Fact]
+  public void VolumeGauges_AreNotDeclaredInS3Mode()
+  {
+    // A readable cache path on purpose. What has to keep the gauges away is the mode, not a failing read -
+    // with an unreadable path the interesting instrument would be missing for the uninteresting reason.
+    var metrics = NewMetrics(new CachingProxyConfig
+    {
+      LocalCachePath = NewTempDirectory(),
+      S3 = new CachingProxyConfig.S3Config("test-bucket")
+    });
+
+    // Start() replays the instruments this meter has already published, which is all of them: everything
+    // CachingProxyMetrics declares, it declares in its constructor.
+    var declared = new List<string>();
+    using var listener = new MeterListener
+    {
+      InstrumentPublished = (instrument, _) =>
+      {
+        if (ReferenceEquals(instrument.Meter, metrics.Meter)) declared.Add(instrument.Name);
+      }
+    };
+    listener.Start();
+
+    foreach (var name in declared) output.WriteLine(name);
+    Assert.DoesNotContain(declared, static n => n.StartsWith("local_cache", StringComparison.Ordinal));
+    // And the guard reaches no further than the disk: the request counters are mode-independent.
+    Assert.Contains("caching_requests", declared);
+  }
+
+  /// <summary>
   /// The footprint counts what survived the walk, not what the walk deleted - and before the first walk it
   /// measures nothing rather than zero, since an empty cache is what a fresh node really reports and the two
   /// would otherwise be indistinguishable.
