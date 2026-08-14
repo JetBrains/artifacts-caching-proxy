@@ -40,7 +40,7 @@ public class RemoteServersTest
     // regardless of which prefix was used to reach it.
     var servers = Build("/a", "/b=a", "/c/d=a/");
     Assert.Equal(new[] { "/a", "/b", "/c/d" }, servers.Select(s => s.Prefix.Value!).ToArray());
-    var keys = servers.Select(s => s.GetUpstreamUri("a.jar").ManglePath()).Distinct();
+    var keys = servers.Select(s => s.GetUpstreamUri("a.jar")!.ManglePath()).Distinct();
     Assert.Equal("d9/6d/d96d0bd13935d4ab082c410dea64c70bf2f926b75f3b487ac18c0e290ee8ac3a", Assert.Single(keys));
   }
 
@@ -50,6 +50,113 @@ public class RemoteServersTest
     var server = Assert.Single(Build("/p=http://example.org/sub"));
     Assert.Equal("http://example.org/sub/", server.RemoteUri.ToString());
   }
+
+  // The shape MRI-4842 was reported against, reduced to its essentials: one host, a public subtree and a
+  // private one. A remainder that climbs out of the public base lands on the private one's upstream path,
+  // and therefore on its cache key - so the containment tests below are all asked of the public prefix.
+  private static readonly RemoteServers.RemoteServer ourPublicPrefix =
+    Build("/public=packages.example.com/maven/open", "/private=packages.example.com/maven/secure")
+      .Single(s => s.Prefix == "/public");
+
+  [Theory]
+  // An absolute-path reference replaces the configured path but keeps the host - the MRI-4842 shape.
+  [InlineData("/maven/secure/a.jar")]
+  [InlineData("/maven/open2/a.jar")] // a sibling of the base, not a child of it
+  [InlineData("/")]
+  // A network-path reference replaces the authority - the MRI-4844 shape.
+  [InlineData("//evil.example.com/maven/open/a.jar")]
+  [InlineData("//packages.example.com@evil.example.com/x")] // the real host is the one after the '@'
+  [InlineData("//user:pass@packages.example.com/maven/open/x")] // userinfo travels on, but keys nothing
+  [InlineData("//packages.example.com:8443/maven/open/a.jar")] // another port is another service
+  [InlineData("///a.jar")] // empty authority: does not resolve at all
+  [InlineData("////a.jar")]
+  // An absolute reference replaces everything, scheme included.
+  [InlineData("https://evil.example.com/maven/open/a.jar")]
+  [InlineData("http://packages.example.com/maven/open/a.jar")] // cleartext downgrade of the same target
+  [InlineData("file://packages.example.com/maven/open/a.jar")] // same host+path form, not an HTTP fetch
+  [InlineData("sha256:abcdef")] // a colon in the first segment reads as a scheme
+  // Dot segments climb out - including percent-encoded ones, which System.Uri unescapes and collapses after
+  // the request path was already checked for "..". A client reaches that shape by double-encoding
+  // ("%252e%252e"): Kestrel decodes it once, leaving a remainder System.Uri then decodes again.
+  [InlineData("a/../../secure/a.jar")]
+  [InlineData("%2e%2e/secure/a.jar")]
+  [InlineData(".%2e/secure/a.jar")]
+  [InlineData("\r\n//evil.example.com/x")] // System.Uri strips CR/LF, exposing the reference beneath
+  public void A_Remainder_That_Leaves_The_Configured_Base_Has_No_Upstream(string remainingPath) =>
+    Assert.Null(ourPublicPrefix.GetUpstreamUri(remainingPath));
+
+  [Theory]
+  // A bare prefix request has no remainder at all: that is how an OCI client asks for "/v2/<alias>".
+  [InlineData(null, "https://packages.example.com/maven/open/")]
+  [InlineData("", "https://packages.example.com/maven/open/")]
+  [InlineData("a.jar", "https://packages.example.com/maven/open/a.jar")]
+  [InlineData("g/a/1.0/a-1.0.jar", "https://packages.example.com/maven/open/g/a/1.0/a-1.0.jar")]
+  // ':' stays legal for OCI digest references, and %2f stays encoded for npm scoped packages.
+  [InlineData("v2/img/manifests/sha256:abcdef", "https://packages.example.com/maven/open/v2/img/manifests/sha256:abcdef")]
+  [InlineData("@scope%2fpackage", "https://packages.example.com/maven/open/@scope%2fpackage")]
+  [InlineData("name with spaces.jar", "https://packages.example.com/maven/open/name%20with%20spaces.jar")]
+  [InlineData("a//b.jar", "https://packages.example.com/maven/open/a//b.jar")] // an inner empty segment is the upstream's business
+  [InlineData("sub/../a.jar", "https://packages.example.com/maven/open/a.jar")] // dot segments that stay inside
+  // %2f is a character of the segment, not a separator, so this cannot climb out: it keys as the literal
+  // escaped path. ValidateRequestAsync rejects the shape anyway, on the ".." in the request path.
+  [InlineData("..%2f..%2fsecure%2fa.jar", "https://packages.example.com/maven/open/..%2f..%2fsecure%2fa.jar")]
+  public void A_Remainder_Inside_The_Configured_Base_Resolves(string? remainingPath, string expected) =>
+    Assert.Equal(expected, ourPublicPrefix.GetUpstreamUri(remainingPath)?.AbsoluteUri, ignoreCase: true);
+
+  [Fact]
+  public void A_Public_Prefix_Cannot_Resolve_To_A_Gated_Prefixs_Upstream()
+  {
+    // MRI-4842 end to end at this layer: /private carries a credential (and therefore [Authorize]) while
+    // /public is anonymous, yet the cache key follows the resolved upstream. Spell out the resolution the
+    // attack relied on, so this test cannot rot into asserting nothing.
+    var auth = new UpstreamAuth
+    {
+      UrlPrefixes = ["packages.example.com/maven/secure"],
+      TokenEndpoint = new Uri("https://packages.example.com/"),
+      ClientId = "c",
+    };
+    var config = new CachingProxyConfig
+    {
+      Prefixes = ["/public=packages.example.com/maven/open", "/private=packages.example.com/maven/secure"],
+      UpstreamAuth = { ["test"] = auth },
+    };
+    var servers = new RemoteServers(config, new NullLogger<RemoteServers>()).Endpoints
+      .Select(e => e.Metadata.GetMetadata<RemoteServers.RemoteServer>()!)
+      .ToDictionary(s => s.Prefix.Value!);
+
+    Assert.Same(auth, servers["/private"].Auth);
+    Assert.Null(servers["/public"].Auth);
+
+    var privateArtifact = servers["/private"].GetUpstreamUri("a.jar")!;
+    Assert.Equal(privateArtifact.AbsoluteUri, new Uri(servers["/public"].RemoteUri, "/maven/secure/a.jar").AbsoluteUri);
+    Assert.Null(servers["/public"].GetUpstreamUri("/maven/secure/a.jar"));
+  }
+
+  [Fact]
+  public void A_Host_Root_Base_Contains_Every_Path_On_Its_Own_Host()
+  {
+    // Containment is scoped to the configured base, so a prefix configured for a whole host really does
+    // reach every path on it - which is why a leading slash is harmless there (see
+    // CacheFileProviderTest.ManglePath_LeadingSlashIsIgnored). Another host still is not reachable.
+    var server = Assert.Single(Build("/h=packages.example.com"));
+    Assert.Equal("https://packages.example.com/a.jar", server.GetUpstreamUri("/a.jar")?.AbsoluteUri);
+    Assert.Null(server.GetUpstreamUri("//evil.example.com/a.jar"));
+  }
+
+  [Fact]
+  public void A_Configured_Target_Always_Ends_In_A_Slash() =>
+    // The invariant the sibling rejection above rests on: without the trailing slash, "/open2/a.jar" would
+    // read as a child of "/open".
+    Assert.All(Build("/a=h.example.com/open", "/b=h.example.com/open/", "/c=h.example.com"),
+      server => Assert.EndsWith("/", server.RemoteUri.AbsolutePath, StringComparison.Ordinal));
+
+  [Theory]
+  [InlineData("/a=h.example.com/p?x=1")]
+  [InlineData("/a=h.example.com/p#f")]
+  public void A_Target_With_A_Query_Or_Fragment_Is_Rejected_At_Startup(string prefix) =>
+    // Such a target has no trailing-slash path to resolve against, so every request to it would resolve
+    // outside the base and be rejected. Better to never start than to 400 in production.
+    Assert.Throws<ArgumentException>(() => Build(prefix));
 
   [Fact]
   public void Upstream_Auth_Matches_By_Longest_Url_Prefix()

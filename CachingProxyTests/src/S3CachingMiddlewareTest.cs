@@ -157,7 +157,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
 
     var key = GetPathKey("/real/a.jar");
     Assert.True(myS3.PutObjectUris.TryGetValue(key, out var storedUri));
-    Assert.Equal(myRemoteServer.GetUpstreamUri("a.jar").ToString(), storedUri);
+    Assert.Equal(myRemoteServer.GetUpstreamUri("a.jar")!.ToString(), storedUri);
   }
 
   [Fact]
@@ -197,11 +197,27 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   [Fact]
   public async Task Path_With_Multiple_Slashes_Is_Bad_Request()
   {
-    // A degenerate URL such as "/maven-central////-.jar" resolves the "///-.jar" remainder to an
-    // empty authority (invalid for http(s)). The shared request validation must reject it as 400
-    // BAD_REQUEST before any S3 work, so the bucket is never probed or written.
+    // A degenerate URL such as "/maven-central////-.jar" leaves a "///-.jar" remainder whose authority is
+    // empty, so it does not resolve against the base at all. The shared request validation must reject it as
+    // 400 BAD_REQUEST before any S3 work, so the bucket is never probed or written.
     var server = CreateServer(signedLinks: true);
     using var response = await server.CreateRequest("/real////-.jar").SendAsync(HttpMethod.Get.Method);
+
+    Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    AssertStatusHeader(response, CachingProxyStatus.BAD_REQUEST);
+    Assert.Equal("Invalid request path", await response.Content.ReadAsStringAsync());
+    Assert.Equal(0, myS3.GetObjectCalls);
+    Assert.Equal(0, myS3.PutObjectCalls);
+  }
+
+  [Fact]
+  public async Task Foreign_Authority_Is_Bad_Request()
+  {
+    // MRI-4844 on the S3 backend: a remainder starting with "//" replaces the authority, so the fetch would
+    // go to a host the caller named and be stored under a key derived from it. Rejected before any S3 work,
+    // so nothing a caller aimed elsewhere can enter the bucket. Documentation-range address on purpose.
+    var server = CreateServer(signedLinks: true);
+    using var response = await server.CreateRequest("/real///198.51.100.9/x.jar").SendAsync(HttpMethod.Get.Method);
 
     Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
     AssertStatusHeader(response, CachingProxyStatus.BAD_REQUEST);
@@ -1048,7 +1064,9 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   private string GetPathKey(string path)
   {
     Assert.StartsWith(myRemoteServer.Prefix, path);
-    return myRemoteServer.GetUpstreamUri(path[myRemoteServer.Prefix.Value!.Length..]).ManglePath();
+    var upstream = myRemoteServer.GetUpstreamUri(path[myRemoteServer.Prefix.Value!.Length..]);
+    Assert.NotNull(upstream); // asking for the key of a path that has no upstream is a test bug
+    return upstream.ManglePath();
   }
 
   private static void AssertStatusHeader(HttpResponseMessage response, CachingProxyStatus status) =>

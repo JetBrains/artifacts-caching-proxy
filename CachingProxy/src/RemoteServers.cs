@@ -32,6 +32,11 @@ public class RemoteServers : EndpointDataSource
       target = target.TrimEnd('/') + '/';
       var remoteUri = Uri.TryCreate(target, UriKind.Absolute, out var targetUri) ? targetUri :
         new Uri(Uri.UriSchemeHttps + Uri.SchemeDelimiter + target, UriKind.Absolute);
+      // A query or a fragment leaves the base with no trailing-slash path to resolve a request against
+      // ("host/p?x=1" parses as path "/p" plus query), so every request to such a prefix would resolve
+      // outside it and be rejected. Fail at startup rather than on every request.
+      if (remoteUri.Query.Length > 0 || remoteUri.Fragment.Length > 0)
+        throw new ArgumentException($"Prefix target must have no query or fragment: {prefix}");
       var matched = MatchAuth(remoteUri, config.UpstreamAuth);
       var matchedAuth = matched?.Value;
       if (matchedAuth != null && !remoteUri.IsSecureOrLoopback())
@@ -122,8 +127,46 @@ public class RemoteServers : EndpointDataSource
 
   public record RemoteServer(PathString Prefix, Uri RemoteUri, CacheDuration CacheDuration, UpstreamAuth? Auth = null, CachingProfile? Profile = null)
   {
-    public Uri GetUpstreamUri(string? remainingPath) =>
-      string.IsNullOrEmpty(remainingPath) ? RemoteUri : new Uri(RemoteUri, remainingPath);
+    /// <summary>
+    /// The upstream URI for a request's <c>{**path}</c> remainder, or <c>null</c> when that remainder names
+    /// something this prefix is not configured for - which the caller answers with a 400, see
+    /// <see cref="RemoteProxy.ValidateRequestAsync"/>.
+    /// <para>The remainder is an RFC-3986 reference resolved against <see cref="RemoteUri"/>, not a suffix
+    /// appended to it: it can replace the base path ("/other"), the authority ("//host") or everything
+    /// ("https://host/x"), and its dot segments can climb out of the base - including percent-encoded ones,
+    /// which System.Uri unescapes and collapses after the request path was already checked. Everything
+    /// derived from the result follows it out, while the inbound gate and the credential we send upstream
+    /// belong to the prefix and are fixed at startup: an un-gated prefix could resolve onto a gated one's
+    /// upstream path and serve its cache entries to anyone (MRI-4842), and a gated prefix could hand our own
+    /// credential to a host of the caller's choosing (MRI-4844). So only a URI inside the base is returned.</para>
+    /// </summary>
+    public Uri? GetUpstreamUri(string? remainingPath)
+    {
+      if (string.IsNullOrEmpty(remainingPath)) return RemoteUri;
+
+      // TryCreate, not the throwing constructor: a reference that does not resolve at all (the empty
+      // authority of "///x") is one more rejected request, not an exception for the caller to catch.
+      if (!Uri.TryCreate(RemoteUri, remainingPath, out var upstream)) return null;
+
+      // The scheme on its own, because an absolute reference can keep the configured host and path and change
+      // only the scheme: that downgrades a credentialed https upstream to cleartext, and "file://<same
+      // host>/<same path>" has the very same host+path form the containment check below compares.
+      if (!string.Equals(upstream.Scheme, RemoteUri.Scheme, StringComparison.Ordinal)) return null;
+
+      // Contained in the base, compared in the one form both the cache key and the UpstreamAuth match are
+      // derived from (see GetHostPortPath), so "contained" means "cannot reach another prefix's cache entry
+      // and cannot leave this prefix's auth scope". The configured path always ends in '/', so the sibling
+      // "/open2/" cannot pass as a child of "/open/"; Ordinal because the key is case-sensitive too.
+      if (!upstream.GetHostPortPath().StartsWith(RemoteUri.GetHostPortPath(), StringComparison.Ordinal))
+        return null;
+
+      // A query, a fragment or userinfo is excluded from that form yet still travels - upstream, or back to
+      // the client as a redirect Location - so two requests differing only there would share one entry.
+      // Nothing legitimate produces them: the query never enters the path, and '?', '#' and '@'-with-'//'
+      // cannot appear in a remainder that stays a path.
+      return upstream.Query.Length == 0 && upstream.Fragment.Length == 0 && upstream.UserInfo.Length == 0 ?
+        upstream : null;
+    }
 
     public override string ToString() => $"{Prefix}={RemoteUri}";
   }

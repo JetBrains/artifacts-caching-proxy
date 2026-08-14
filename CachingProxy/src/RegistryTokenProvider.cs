@@ -195,6 +195,9 @@ public sealed class RegistryTokenProvider(
   /// well belong to someone else. A registry that really does host its token endpoint elsewhere needs one
   /// <see cref="UpstreamAuth.TokenRealms"/> entry, and until it has one its pulls degrade to anonymous
   /// rather than leaking the account.</para>
+  /// <para>"Its own host" is a guarantee, not an assumption: <see cref="RemoteServers.RemoteServer.GetUpstreamUri"/>
+  /// only yields a URI inside the configured upstream, so this host is the configured one and not one a
+  /// request could have chosen.</para>
   /// </summary>
   public static bool MayForwardCredentials(Uri realm, Uri upstreamUri, UpstreamAuth? auth) =>
     (string.Equals(realm.Host, upstreamUri.Host, StringComparison.OrdinalIgnoreCase) && realm.Port == upstreamUri.Port) ||

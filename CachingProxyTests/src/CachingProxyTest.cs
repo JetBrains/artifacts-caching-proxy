@@ -346,14 +346,89 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
   [Fact]
   public async Task Path_With_Multiple_Slashes_Is_Bad_Request()
   {
-    // A degenerate URL such as "/maven-central////-.jar": the catch-all captures "///-.jar",
-    // whose leading "//" makes new Uri(base, ...) resolve to an empty authority (invalid for
-    // http(s)). The proxy must reject it as 400 BAD_REQUEST, not crash with a 500.
+    // A degenerate URL such as "/maven-central////-.jar": the catch-all captures "///-.jar", a network-path
+    // reference whose authority is empty, so it does not resolve against the base at all - one of the
+    // remainders GetUpstreamUri reports by returning null. 400 BAD_REQUEST, not a 500.
     await AssertGetResponse("/real////-.jar", HttpStatusCode.BadRequest,
       (message, bytes) =>
       {
         AssertStatusHeader(message, CachingProxyStatus.BAD_REQUEST);
         Assert.Equal("Invalid request path", Encoding.UTF8.GetString(bytes));
+      });
+  }
+
+  [Fact]
+  public async Task A_Prefix_Cannot_Reach_Another_Prefixs_Upstream()
+  {
+    // MRI-4842 on the disk backend. /overlap is configured for the upstream's "wrong/" subpath, but the
+    // "/a.jar" remainder of "/overlap//a.jar" replaces that subpath outright - resolving onto exactly the
+    // upstream /overlap/nested caches below, whose entry would then answer through a prefix that has no
+    // claim to it. The same mechanism served private artifacts through a public prefix in production.
+    await AssertGetResponse("/overlap/nested/a.jar", HttpStatusCode.OK,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.MISS);
+        Assert.Equal("a.jar", Encoding.UTF8.GetString(bytes));
+      });
+
+    var lastTarget = myUpstreamServer.LastRawTarget;
+
+    await AssertGetResponse("/overlap//a.jar", HttpStatusCode.BadRequest,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.BAD_REQUEST);
+        Assert.Equal("Invalid request path", Encoding.UTF8.GetString(bytes));
+      });
+
+    // Rejected before any upstream work, so the request never left the proxy either.
+    Assert.Equal(lastTarget, myUpstreamServer.LastRawTarget);
+  }
+
+  [Fact]
+  public async Task Escaping_A_Subpath_Base_Is_Bad_Request()
+  {
+    // The OCI prefix carries the "/v2" on both sides, so its base is a subpath: "//testimage/..." drops that
+    // "v2/" and aims the fetch at a different path of the same registry.
+    var lastTarget = myUpstreamServer.LastRawTarget;
+
+    await AssertGetResponse("/v2/real-docker//testimage/tags/list", HttpStatusCode.BadRequest,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.BAD_REQUEST);
+        Assert.Equal("Invalid request path", Encoding.UTF8.GetString(bytes));
+      });
+
+    Assert.Equal(lastTarget, myUpstreamServer.LastRawTarget);
+  }
+
+  [Fact]
+  public async Task Foreign_Authority_Is_Bad_Request()
+  {
+    // MRI-4844 on the disk backend: a remainder starting with "//" is a network-path reference, so it
+    // replaces the authority and the proxy fetches a host the caller named. The documentation-range address
+    // keeps a regression from reaching anything real.
+    var lastTarget = myUpstreamServer.LastRawTarget;
+
+    await AssertGetResponse("/real///198.51.100.9/x.jar", HttpStatusCode.BadRequest,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.BAD_REQUEST);
+        Assert.Equal("Invalid request path", Encoding.UTF8.GetString(bytes));
+      });
+
+    Assert.Equal(lastTarget, myUpstreamServer.LastRawTarget);
+  }
+
+  [Fact]
+  public async Task Redirect_Rule_Cannot_Be_Aimed_At_A_Foreign_Host()
+  {
+    // An always-redirect rule hands the resolved upstream straight back as Location, so a remainder that
+    // replaces the authority made the proxy an open redirect on top of everything else.
+    await AssertGetResponse("/real-redirect///198.51.100.9/x.jar", HttpStatusCode.BadRequest,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.BAD_REQUEST);
+        Assert.Null(message.Headers.Location);
       });
   }
 
