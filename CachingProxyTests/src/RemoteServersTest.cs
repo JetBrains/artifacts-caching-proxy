@@ -78,6 +78,11 @@ public class RemoteServersTest
   [InlineData("http://packages.example.com/maven/open/a.jar")] // cleartext downgrade of the same target
   [InlineData("file://packages.example.com/maven/open/a.jar")] // same host+path form, not an HTTP fetch
   [InlineData("sha256:abcdef")] // a colon in the first segment reads as a scheme
+  // Both shapes were probed against production. ':' and '/' are allowlisted for OCI digests, so neither is
+  // stopped by the character check, and only the scheme comparison stops the second: an authority-less
+  // file: URI has an empty host, which leaves "/etc/passwd" as its whole host[:port]/path form.
+  [InlineData("http://localhost:5000/health")] // a loopback service of ours, port and all
+  [InlineData("file:///etc/passwd")] // reached SocketsHttpHandler and was refused only by the scheme
   // Dot segments climb out - including percent-encoded ones, which System.Uri unescapes and collapses after
   // the request path was already checked for "..". A client reaches that shape by double-encoding
   // ("%252e%252e"): Kestrel decodes it once, leaving a remainder System.Uri then decodes again.

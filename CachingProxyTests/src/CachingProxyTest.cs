@@ -419,6 +419,32 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
     Assert.Equal(lastTarget, myUpstreamServer.LastRawTarget);
   }
 
+  [Theory]
+  // An absolute reference as the remainder replaces the whole upstream URI, and ':' and '/' are both
+  // allowlisted for OCI digests, so nothing about the path looks wrong. Production was probed with a
+  // loopback service and with file:, the latter reaching the HTTP stack and being refused only because
+  // SocketsHttpHandler does not speak that scheme - luck, not a check of ours.
+  //
+  // The address here is the documentation range rather than the probed "localhost:5000", so that a
+  // regression cannot reach whatever a developer happens to be running locally; the literal payloads are
+  // pinned in RemoteServersTest, where nothing is dialled at all.
+  [InlineData("/real/http://198.51.100.9:5000/health")]
+  [InlineData("/real/file:///etc/passwd")]
+  public async Task An_Absolute_Reference_Is_Bad_Request(string url)
+  {
+    var lastTarget = myUpstreamServer.LastRawTarget;
+
+    await AssertGetResponse(url, HttpStatusCode.BadRequest,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.BAD_REQUEST);
+        Assert.Equal("Invalid request path", Encoding.UTF8.GetString(bytes));
+      });
+
+    // Rejected before any upstream work: nothing was dialled, and no entry was cached under the payload.
+    Assert.Equal(lastTarget, myUpstreamServer.LastRawTarget);
+  }
+
   [Fact]
   public async Task Redirect_Rule_Cannot_Be_Aimed_At_A_Foreign_Host()
   {
