@@ -1,7 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
+using System.Text;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
@@ -149,6 +152,45 @@ public class RemoteServersTest
     // read as a child of "/open".
     Assert.All(Build("/a=h.example.com/open", "/b=h.example.com/open/", "/c=h.example.com"),
       server => Assert.EndsWith("/", server.RemoteUri.AbsolutePath, StringComparison.Ordinal));
+
+  [Fact]
+  public void An_Upstream_Auth_Entry_Without_UrlPrefixes_Is_Rejected_At_Startup()
+  {
+    // Such an entry matches no upstream, so the prefixes it was meant to gate would serve their cached
+    // contents to anyone. The message has to name the entry: that is the only pointer to the setting.
+    var config = new CachingProxyConfig
+    {
+      Prefixes = ["/a=packages.example.com/maven/secure"],
+      UpstreamAuth = { ["half_configured"] = new UpstreamAuth { UrlPrefixes = [], ClientId = "c" } },
+    };
+
+    var error = Assert.Throws<ArgumentException>(() => new RemoteServers(config, new NullLogger<RemoteServers>()));
+
+    Assert.Contains("half_configured", error.Message);
+    Assert.Contains(nameof(UpstreamAuth.UrlPrefixes), error.Message);
+  }
+
+  [Fact]
+  public void A_Bound_Upstream_Auth_Entry_Never_Has_Null_UrlPrefixes()
+  {
+    // `required` is a compile-time rule for object initializers, and configuration binding constructs by
+    // reflection - so a deployment that set the credential half of a block but not UrlPrefixes bound to null
+    // and crashed startup from inside MatchAuth's LINQ. It must bind empty and be reported by name instead.
+    const string json = """
+      {
+        "Prefixes": [ "/a=packages.example.com/maven/secure" ],
+        "UpstreamAuth": { "half_configured": { "ClientId": "c", "ClientSecret": "s" } }
+      }
+      """;
+    var config = new ConfigurationBuilder()
+      .AddJsonStream(new MemoryStream(Encoding.UTF8.GetBytes(json)))
+      .Build()
+      .Get<CachingProxyConfig>()!;
+
+    Assert.Empty(config.UpstreamAuth["half_configured"].UrlPrefixes);
+    var error = Assert.Throws<ArgumentException>(() => new RemoteServers(config, new NullLogger<RemoteServers>()));
+    Assert.Contains("half_configured", error.Message);
+  }
 
   [Theory]
   [InlineData("/a=h.example.com/p?x=1")]

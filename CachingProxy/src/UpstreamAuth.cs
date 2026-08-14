@@ -44,7 +44,11 @@ public record UpstreamAuth
 {
   // Upstream URL prefixes this auth applies to, matched scheme-agnostically against the upstream's
   // host[:port]/path (e.g. "repo.example.com/" or "repo.example.com/secure/"); the longest match wins.
-  public required string[] UrlPrefixes { get; init; }
+  //
+  // Initialized despite being required, because `required` is a compile-time rule for object initializers
+  // and configuration binding constructs by reflection: a block missing this key used to bind to null and
+  // crash startup from deep inside a LINQ frame. RemoteServers rejects the empty case by name instead.
+  public required string[] UrlPrefixes { get; init; } = [];
 
   public Uri? TokenEndpoint { get; init; }
   public string? ClientId { get; init; }

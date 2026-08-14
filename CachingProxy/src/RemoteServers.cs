@@ -16,6 +16,8 @@ public class RemoteServers : EndpointDataSource
 {
   public RemoteServers(CachingProxyConfig config, ILogger<RemoteServers> logger)
   {
+    ValidateUpstreamAuth(config.UpstreamAuth);
+
     var endpoints = new Endpoint[config.Prefixes.Length];
     var hasGatedOciPrefix = false;
     logger.LogInformation("Creating {Count} endpoints", config.Prefixes.Length);
@@ -101,6 +103,18 @@ public class RemoteServers : EndpointDataSource
     if (!profiles.TryGetValue(name, out var profile))
       throw new ArgumentException($"Unknown caching profile '{name}'. Defined profiles: {string.Join(", ", profiles.Keys)}");
     return profile.Compile();
+  }
+
+  // An entry with no UrlPrefixes can never match an upstream, so every prefix it was meant to gate would be
+  // left un-gated and fetched anonymously - and whatever those prefixes already hold in the cache would be
+  // served to anyone. That is a half-configured secret failing open, so refuse to start, naming the entry so
+  // the missing setting (UpstreamAuth__<name>__UrlPrefixes__0) is obvious.
+  private static void ValidateUpstreamAuth(Dictionary<string, UpstreamAuth> auths)
+  {
+    foreach (var (name, auth) in auths)
+      if (auth.UrlPrefixes.Length == 0)
+        throw new ArgumentException(
+          $"UpstreamAuth '{name}' has no UrlPrefixes, so it would gate nothing and leave its upstreams anonymous.");
   }
 
   // Among the auth entries whose UrlPrefixes contain a prefix of the upstream URL, the longest (most
