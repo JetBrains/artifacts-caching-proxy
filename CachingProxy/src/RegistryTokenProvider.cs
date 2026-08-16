@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Headers;
@@ -67,6 +68,10 @@ public sealed class RegistryTokenProvider(
   // The path segments the OCI distribution API defines after the repository name. Used to cut
   // "/v2/<name>/<verb>/<reference>" back to the part that identifies what is being pulled.
   private static readonly string[] ourApiVerbs = ["manifests", "blobs", "tags", "referrers"];
+
+  // How much of a refused token request's body is quoted back in the exception. Enough for the one-line
+  // JSON every registry answers with, short enough that an HTML error page does not become the message.
+  private const int MaxErrorBodyChars = 512;
 
   // Registry tokens, and the realms they came from, stay in memory: the tokens are short-lived secrets
   // that must not reach a shared L2 store, and a realm is cheap enough to re-learn per replica. A fresh
@@ -223,7 +228,8 @@ public sealed class RegistryTokenProvider(
     using var response = await http.SendAsync(request, ct);
     if (!response.IsSuccessStatusCode)
       throw new InvalidOperationException(
-        $"Registry token endpoint {challenge.Realm} answered {(int)response.StatusCode} {response.ReasonPhrase} for scope '{challenge.Scope}'.");
+        $"Registry token endpoint {challenge.Realm} answered {(int)response.StatusCode} {response.ReasonPhrase} " +
+        $"for scope '{challenge.Scope}'.{await DescribeFailureAsync(response, ct)}");
 
     var result = await response.Content.ReadFromJsonAsync<TokenResponse>(ct);
     // Docker Hub returns "token"; the OAuth2-shaped registries return "access_token". The spec allows
@@ -235,6 +241,33 @@ public sealed class RegistryTokenProvider(
     logger.LogDebug("Obtained a registry token from {Realm} for {Scope}, valid {ExpiresIn}",
       challenge.Realm, challenge.Scope, expiresIn);
     return (token, expiresIn);
+  }
+
+  /// <summary>
+  /// What the endpoint objected to, appended to the refusal we throw. The status on its own does not say:
+  /// Docker Hub answers a username it considers malformed and a scope it does not recognise alike with
+  /// 400, and only the body ("malformed HTTP Authorization header") tells them apart - which is the
+  /// difference between a broken secret and a bad request. Bounded, since this is a failure path on a
+  /// response we already distrust, and best-effort: a body we cannot read must not displace the failure it
+  /// was meant to explain.
+  /// </summary>
+  private static async Task<string> DescribeFailureAsync(HttpResponseMessage response, CancellationToken ct)
+  {
+    try
+    {
+      await using var stream = await response.Content.ReadAsStreamAsync(ct);
+      using var reader = new StreamReader(stream);
+      var buffer = new char[MaxErrorBodyChars];
+      var read = await reader.ReadBlockAsync(buffer, ct);
+      // Collapsed onto one line: this becomes an exception message, and a Sentry issue title after that.
+      var body = string.Join(' ',
+        new string(buffer, 0, read).Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+      return body.Length == 0 ? "" : $" Response: {body}";
+    }
+    catch (Exception e) when (e is not OperationCanceledException)
+    {
+      return "";
+    }
   }
 
   // What the remembered challenge belongs to: the authority plus the path down to the API verb, so a

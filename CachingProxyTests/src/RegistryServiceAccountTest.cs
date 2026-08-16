@@ -22,6 +22,7 @@ using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using Microsoft.IdentityModel.Tokens;
 using Xunit;
 
@@ -64,6 +65,11 @@ public class RegistryServiceAccountTest : IAsyncLifetime
   private string myTokenScope = "";
   private string myTokenQuery = "";
 
+  // Set by a test to make the token endpoint refuse, with the body a real one sends along with it.
+  private (HttpStatusCode Status, string Body)? myTokenFailure;
+
+  private readonly WarningCollector myWarnings = new();
+
   public RegistryServiceAccountTest()
   {
     myRegistryServer = BuildKestrel(router => router.MapGet("{*path}", (req, res, data) =>
@@ -102,6 +108,12 @@ public class RegistryServiceAccountTest : IAsyncLifetime
         myTokenQuery = req.QueryString.Value ?? "";
 
         res.ContentType = "application/json";
+        if (myTokenFailure is { } failure)
+        {
+          res.StatusCode = (int)failure.Status;
+          return res.WriteAsync(failure.Body);
+        }
+
         return res.WriteAsync(JsonSerializer.Serialize(new { token = IssuedToken, expires_in = 300 }));
       });
       router.MapGet("jwks.json", (_, res, _) =>
@@ -175,6 +187,24 @@ public class RegistryServiceAccountTest : IAsyncLifetime
     // Omitted, not sent empty: "scope=" is a different request from no scope at all.
     Assert.DoesNotContain("scope", myTokenQuery);
     Assert.Equal(["", $"Bearer {IssuedToken}"], AuthSeenAt("v2/"));
+  }
+
+  [Fact]
+  public async Task A_Refused_Token_Request_Reports_What_The_Endpoint_Objected_To()
+  {
+    // The status on its own is not a diagnosis. Docker Hub answers a username it considers malformed and a
+    // scope it does not recognise alike with 400, and the two are a broken secret and a bad request
+    // respectively - told apart only by the body, which is therefore what has to reach the log.
+    myTokenFailure = (HttpStatusCode.BadRequest, "{\"details\":\"malformed HTTP Authorization header\"}");
+
+    using var client = CreateAuthenticatedClient();
+    var response = await client.GetAsync("/v2/allowlisted/library/allowed/manifests/1.0");
+
+    // No token to retry with, so what the client gets is the registry's own 401 - which says nothing about
+    // the token endpoint at all. All the evidence there is lives in the log.
+    Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    Assert.Contains(myWarnings.Messages(),
+      message => message.Contains("400") && message.Contains("malformed HTTP Authorization header"));
   }
 
   private string[] AuthSeenAt(string path) => [.. myRegistryAuthByPath[path]];
@@ -274,7 +304,9 @@ public class RegistryServiceAccountTest : IAsyncLifetime
         .ConfigureAppConfiguration(cfg =>
           cfg.AddJsonStream(new MemoryStream(JsonSerializer.SerializeToUtf8Bytes(config))))
         .ConfigureOurServices()
-        .ConfigureServices(services => services.AddSingleton(config))
+        .ConfigureServices(services => services
+          .AddSingleton(config)
+          .AddSingleton<ILoggerProvider>(myWarnings))
         .Configure((context, builder) => builder.ConfigureOurApp(context.Configuration)))
       .Build();
     await myProxyHost.StartAsync();
@@ -288,6 +320,35 @@ public class RegistryServiceAccountTest : IAsyncLifetime
     await myRegistryServer.StopAsync();
     myRsa.Dispose();
     try { Directory.Delete(myTempDirectory, recursive: true); } catch { /* best effort */ }
+  }
+
+  // Everything the proxy logged at Warning or above, formatted. A failed mint is handled - the caller
+  // relays the registry's 401 - so the log is the only place its reason is ever stated.
+  private sealed class WarningCollector : ILoggerProvider
+  {
+    private readonly ConcurrentQueue<string> myMessages = new();
+
+    public string[] Messages() => [.. myMessages];
+    public ILogger CreateLogger(string categoryName) => new Sink(myMessages);
+    public void Dispose() {}
+
+    private sealed class Sink(ConcurrentQueue<string> messages) : ILogger
+    {
+      public bool IsEnabled(LogLevel logLevel) => logLevel >= LogLevel.Warning;
+      public IDisposable BeginScope<TState>(TState state) where TState : notnull => NullScope.Instance;
+
+      public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+        Func<TState, Exception?, string> formatter)
+      {
+        if (IsEnabled(logLevel)) messages.Enqueue(formatter(state, exception));
+      }
+    }
+
+    private sealed class NullScope : IDisposable
+    {
+      public static readonly NullScope Instance = new();
+      public void Dispose() {}
+    }
   }
 
   private static WebApplication BuildKestrel(Action<IRouteBuilder> configure)
