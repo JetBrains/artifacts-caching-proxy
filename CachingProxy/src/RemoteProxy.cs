@@ -464,7 +464,17 @@ public partial class RemoteProxy(
   public void SetStatusHeader(HttpContext context, CachingProxyStatus status)
   {
     context.Response.Headers[CachingProxyConstants.StatusHeader] = status.ToString();
-    metrics.IncrementRequests(status);
+    // Both extra dimensions are read off the request here rather than passed in, so the call sites that
+    // report a status stay untouched. Routing runs before either storage middleware, and every path here is
+    // behind a GetRemoteServer gate, so the prefix is present even on the BAD_REQUEST paths above.
+    //
+    // Authenticated from context.User, not from whether the prefix carries an AuthorizeAttribute: an un-gated
+    // prefix still authenticates a request that happens to arrive with a valid credential. This is the same
+    // expression that picks Cache-Control private over public (see ResponseCache.GetCachingHeader), so the
+    // label cannot disagree with the response it counts.
+    metrics.IncrementRequests(status,
+      RemoteServers.GetRemoteServer(context)?.ProfileName,
+      context.User.Identity?.IsAuthenticated == true);
   }
 
   private async Task<HttpResponseMessage?> InternalServerError(HttpContext context, EventId eventId, string message, Exception? exception = null)

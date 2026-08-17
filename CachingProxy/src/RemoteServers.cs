@@ -44,9 +44,14 @@ public class RemoteServers : EndpointDataSource
       if (matchedAuth != null && !remoteUri.IsSecureOrLoopback())
         throw new ArgumentException(
           $"Authenticated upstream '{remoteUri}' must use HTTPS except on loopback.");
+      var profile = ResolveProfile(prefix.Profile, config.CachingProfiles);
       var remoteServer = new RemoteServer(trimmedPrefix, remoteUri,
-        config.CacheDuration.Union(prefix.CacheDuration), matchedAuth,
-        ResolveProfile(prefix.Profile, config.CachingProfiles));
+        config.CacheDuration.Union(prefix.CacheDuration), matchedAuth, profile)
+      {
+        // Non-null exactly when the profile resolved, so a blank name cannot reach the metric as an empty
+        // label - which Prometheus reads as no label at all, forking a series off the "none" bucket.
+        ProfileName = profile == null ? null : prefix.Profile
+      };
 
       logger.LogInformation("RemoteServer: {Prefix} -> {RemoteUri}, Auth: {Auth}, Profile: {Profile}",
         remoteServer.Prefix, remoteServer.RemoteUri, remoteServer.Auth, prefix.Profile);
@@ -133,14 +138,26 @@ public class RemoteServers : EndpointDataSource
       .FirstOrDefault();
   }
 
+  /// <summary>The prefix this request matched, or null when it matched none.</summary>
+  public static RemoteServer? GetRemoteServer(HttpContext context) =>
+    context.GetEndpoint()?.Metadata.GetMetadata<RemoteServer>();
+
   public static RemoteServer? GetRemoteServer(HttpContext context, out string? path)
   {
     path = context.GetRouteValue(PathParameterName)?.ToString();
-    return context.GetEndpoint()?.Metadata.GetMetadata<RemoteServer>();
+    return GetRemoteServer(context);
   }
 
   public record RemoteServer(PathString Prefix, Uri RemoteUri, CacheDuration CacheDuration, UpstreamAuth? Auth = null, CachingProfile? Profile = null)
   {
+    /// <summary>
+    /// The <see cref="CachingProxyConfig.CachingProfiles"/> key naming <see cref="Profile"/>, or null for a
+    /// prefix that declares none. Carried separately because <see cref="CachingProfile"/> has no identity of
+    /// its own and <c>ResolveProfile</c> keeps only the compiled rules - and the name is the only handle a
+    /// metric can slice a request by (see <see cref="CachingProxyMetrics.IncrementRequests"/>).
+    /// </summary>
+    public string? ProfileName { get; init; }
+
     /// <summary>
     /// The upstream URI for a request's <c>{**path}</c> remainder, or <c>null</c> when that remainder names
     /// something this prefix is not configured for - which the caller answers with a 400, see

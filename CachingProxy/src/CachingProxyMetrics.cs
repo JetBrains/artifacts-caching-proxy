@@ -69,9 +69,28 @@ public class CachingProxyMetrics
 
   public Meter Meter { get; }
 
-  public void IncrementRequests(CachingProxyStatus status)
+  /// <summary>
+  /// One served request, sliced by outcome, by the caching profile that decided how it was cached, and by
+  /// whether the caller presented a credential we accepted.
+  /// <para>All three are closed sets fixed at startup - outcomes by the enum, profiles by the configuration -
+  /// so the series count cannot grow with traffic, only with a config change. That is why this counter needs
+  /// no trimming view, unlike the http.client.* streams in <see cref="MetricsConfiguration"/>.</para>
+  /// </summary>
+  /// <param name="status">The outcome the request was served with.</param>
+  /// <param name="profile">The CachingProfiles key, or null for a prefix that declares none.</param>
+  /// <param name="authenticated">Whether the inbound request carried a credential we validated.</param>
+  public void IncrementRequests(CachingProxyStatus status, string? profile, bool authenticated)
   {
-    myRequestsCounter.Add(1, new KeyValuePair<string, object?>(nameof(status), status.ToString()));
+    myRequestsCounter.Add(1,
+      // Literals, not nameof(...): the exported label name is what queries and alerts are written against,
+      // so a parameter rename must not be able to rename it. Pinned in MetricsConfigurationTest.
+      new KeyValuePair<string, object?>("status", status.ToString()),
+      // "none" rather than an absent label, matching IncrementRedirectSignatureVerification below: an empty
+      // value is "no label" to Prometheus, so `sum by (profile)` would lose the profile-less prefixes.
+      new KeyValuePair<string, object?>("profile", profile ?? "none"),
+      // A string, not the bool: boxing allocates on every request, and the exporter renders a tag value via
+      // ToString(), so a bool would export as "True"/"False" instead of the conventional lower case.
+      new KeyValuePair<string, object?>("authenticated", authenticated ? "true" : "false"));
   }
 
   /// <summary>

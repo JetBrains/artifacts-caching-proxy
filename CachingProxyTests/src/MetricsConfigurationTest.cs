@@ -60,6 +60,17 @@ public class MetricsConfigurationTest(ITestOutputHelper output)
   private static readonly string[] ourInboundMethods = ["GET", "HEAD", "POST"];
   private static readonly string[] ourInboundStatusCodes = ["200", "302", "400", "404", "500"];
 
+  // The caching_requests label space at its worst case: every outcome the enum can report, on every shipped
+  // profile plus the null a profile-less prefix reports, authenticated or not. All closed sets fixed at
+  // startup, so this is the ceiling rather than a sample of it.
+  private static readonly string?[] ourProfiles = ["maven", "npm", "docker", null];
+  private static readonly bool[] ourAuthenticated = [true, false];
+
+  // S3 mode, so CachingProxyMetrics leaves the disk gauges unregistered: they are covered by
+  // CacheDiskMetricsTest and would only add samples the tests here say nothing about.
+  private static CachingProxyConfig BucketModeConfig() =>
+    new() { S3 = new CachingProxyConfig.S3Config("test-bucket") };
+
   [Theory]
   // Samples one series costs: one _bucket line per boundary plus +Inf, then _sum and _count. Pinned rather
   // than bounded, because they multiply against a series count we do not control.
@@ -196,6 +207,60 @@ public class MetricsConfigurationTest(ITestOutputHelper output)
   }
 
   /// <summary>
+  /// The exported label names and values of <c>caching_requests_total</c>, pinned. Nothing else declares
+  /// them: the call site passes literals, and alerts and dashboards are written against the sanitized names a
+  /// scrape shows, so a rename there is invisible until a query silently returns nothing. Driven through the
+  /// real <see cref="CachingProxyMetrics.IncrementRequests"/> rather than a counter this test declares, so
+  /// what is asserted is what production emits - instrument name, label names and label values alike.
+  /// </summary>
+  [Fact]
+  public async Task RequestCounter_ExportsTheLabelsQueriesAreWrittenAgainst()
+  {
+    using var scrape = await MetricsScrape.Of(meter =>
+    {
+      var metrics = new CachingProxyMetrics(new PlainMeterFactory(meter), BucketModeConfig());
+      metrics.IncrementRequests(CachingProxyStatus.HIT, "maven", authenticated: true);
+      metrics.IncrementRequests(CachingProxyStatus.MISS, null, authenticated: false);
+    });
+
+    var labels = scrape.LabelsOf("caching_requests_total");
+    Assert.Equal(["authenticated", "otel_scope_name", "profile", "status"],
+      labels.OrderBy(static l => l, StringComparer.Ordinal));
+
+    // Asserted here too because this counter has no view to cap it, so the call site is the only thing
+    // standing between it and label_limit.
+    Assert.True(labels.Count + TargetLabelCount + 1 <= PrometheusLabelLimit,
+      $"{labels.Count} own labels + {TargetLabelCount} target labels + __name__ exceeds label_limit");
+
+    // The values, not just the keys. "none" is what a prefix with no profile reports - a null would export as
+    // an empty label, which Prometheus reads as no label at all - and the flag is a lowercase string rather
+    // than a boxed bool, which the exporter would render "True".
+    Assert.Contains(@"status=""HIT""", SeriesWith(scrape, @"profile=""maven"""));
+    Assert.Contains(@"authenticated=""true""", SeriesWith(scrape, @"profile=""maven"""));
+    Assert.Contains(@"status=""MISS""", SeriesWith(scrape, @"profile=""none"""));
+    Assert.Contains(@"authenticated=""false""", SeriesWith(scrape, @"profile=""none"""));
+
+    static string SeriesWith(MetricsScrape scrape, string discriminator) =>
+      Assert.Single(scrape.SampleLines,
+        l => l.StartsWith("caching_requests_total{", StringComparison.Ordinal)
+             && l.Contains(discriminator, StringComparison.Ordinal));
+  }
+
+  /// <summary>
+  /// Hands <see cref="CachingProxyMetrics"/> a plain <see cref="Meter"/>, which the scrape's provider
+  /// subscribes to by name. A Meter from a real <see cref="IMeterFactory"/> carries that factory as its
+  /// Scope, and a provider built from another DI container may ignore it - the counter would then be absent
+  /// from the exposition and these tests would pin nothing. Disposal stays with the scrape, which tracks
+  /// every Meter it creates.
+  /// </summary>
+  private sealed class PlainMeterFactory(Func<string, Meter> create) : IMeterFactory
+  {
+    public Meter Create(MeterOptions options) => create(options.Name);
+
+    public void Dispose() { }
+  }
+
+  /// <summary>
   /// The regression test for the outage itself. Series never retire while the process lives, so a
   /// long-running pod converges on every combination it can produce: this drives that saturated state and
   /// asserts the exposition still fits one scrape. The same input cost 17 samples per series before this
@@ -205,8 +270,9 @@ public class MetricsConfigurationTest(ITestOutputHelper output)
   public async Task SaturatedExposition_FitsInOneScrape()
   {
     // A self-imposed ceiling, well under any sample_limit a deployment is likely to set. The real cap lives
-    // in someone else's scrape config and is not ours to raise, so this is the one number we control.
-    const int sampleBudget = 1000;
+    // in someone else's scrape config and is not ours to raise, so this is the one number we control. Raised
+    // once, when caching_requests gained its profile and authenticated dimensions: 72 series of one sample.
+    const int sampleBudget = 1100;
 
     using var scrape = await MetricsScrape.Of(meter =>
     {
@@ -220,6 +286,7 @@ public class MetricsConfigurationTest(ITestOutputHelper output)
       var openConnections = http.CreateUpDownCounter<long>("http.client.open_connections");
       var lookup = dns.CreateHistogram<double>("dns.lookup.duration", "s");
       var inbound = hosting.CreateHistogram<double>("http.server.request.duration", "s");
+      var requests = new CachingProxyMetrics(new PlainMeterFactory(meter), BucketModeConfig());
 
       foreach (var upstream in ourUpstreams)
       {
@@ -253,11 +320,23 @@ public class MetricsConfigurationTest(ITestOutputHelper output)
         inbound.Record(0.002,
           new KeyValuePair<string, object?>("http.request.method", method),
           new KeyValuePair<string, object?>("http.response.status_code", status));
+
+      foreach (var status in Enum.GetValues<CachingProxyStatus>())
+      foreach (var profile in ourProfiles)
+      foreach (var authenticated in ourAuthenticated)
+        requests.IncrementRequests(status, profile, authenticated);
     });
 
     output.WriteLine($"total samples: {scrape.TotalSamples}");
     foreach (var (name, count) in scrape.SamplesByMetric.OrderByDescending(static p => p.Value))
       output.WriteLine($"  {count,5}  {name}");
+
+    // Non-vacuous: a counter the provider never subscribed to would simply be absent, lowering the total and
+    // passing. One sample per series for a counter, so this is the cross-product exactly - and it fails if a
+    // view ever starts collapsing one of the dimensions.
+    Assert.Equal(
+      Enum.GetValues<CachingProxyStatus>().Length * ourProfiles.Length * ourAuthenticated.Length,
+      scrape.SamplesOf("caching_requests_total"));
 
     Assert.True(scrape.TotalSamples <= sampleBudget,
       $"exposition would publish {scrape.TotalSamples} samples, over the {sampleBudget} budget");

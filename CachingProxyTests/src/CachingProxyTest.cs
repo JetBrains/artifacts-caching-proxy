@@ -358,6 +358,25 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
   }
 
   [Fact]
+  public async Task Request_Metric_Reports_The_Prefixs_Caching_Profile()
+  {
+    // ResolveProfile drops the configured name, so the label is the only thing that can tell one profile's
+    // traffic from another's. Both prefixes here serve the same upstream file - hence the same cache key, and
+    // the HIT below - so nothing but the prefix differs, proving the label follows the prefix rather than the
+    // path or the upstream.
+    using var metrics = new RequestMetricRecorder(myHost);
+
+    await AssertGetResponse("/real/a.jar", HttpStatusCode.OK,
+      (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.MISS));
+    await AssertGetResponse("/overlap/nested/a.jar", HttpStatusCode.OK,
+      (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.HIT));
+
+    Assert.Equal(["maven", "none"], metrics.TagValues("profile"));
+    // Anonymous throughout: the flag must not fire just because a prefix exists.
+    Assert.Equal(["false", "false"], metrics.TagValues("authenticated"));
+  }
+
+  [Fact]
   public async Task A_Prefix_Cannot_Reach_Another_Prefixs_Upstream()
   {
     // MRI-4842 on the disk backend. /overlap is configured for the upstream's "wrong/" subpath, but the

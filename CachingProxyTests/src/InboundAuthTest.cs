@@ -163,6 +163,27 @@ public class InboundAuthTest : IAsyncLifetime
   }
 
   [Fact]
+  public async Task Request_Metric_Reports_Whether_The_Caller_Was_Authenticated()
+  {
+    // The same predicate that picks Cache-Control private over public, so this pins the pair together: a
+    // response marked private must never be counted as anonymous traffic. Note the 401 cases above produce no
+    // measurement at all - UseAuthorization short-circuits them before either storage middleware runs, so
+    // they never reach SetStatusHeader.
+    using var metrics = new RequestMetricRecorder(myProxyHost!);
+
+    using var authorized = myProxyHost!.GetTestServer().CreateClient();
+    authorized.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", MintToken());
+    Assert.Equal(HttpStatusCode.OK, (await authorized.GetAsync("/private/one.jar")).StatusCode);
+
+    using var anonymous = myProxyHost!.GetTestServer().CreateClient();
+    Assert.Equal(HttpStatusCode.OK, (await anonymous.GetAsync("/public/plain.jar")).StatusCode);
+
+    Assert.Equal(["true", "false"], metrics.TagValues("authenticated"));
+    // This deployment declares no caching profiles, so both fall to the sentinel.
+    Assert.Equal(["none", "none"], metrics.TagValues("profile"));
+  }
+
+  [Fact]
   public async Task Anonymous_Response_Stays_Cache_Control_Public()
   {
     using var client = myProxyHost!.GetTestServer().CreateClient();
