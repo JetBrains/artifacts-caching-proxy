@@ -77,6 +77,20 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
             new CachingRule { Pattern = ".", RefreshAfter = TimeSpan.FromHours(1) },
           ]
         },
+        // The nuget profile, in the shipped order (appsettings.json): package content under
+        // {id}/{version}/ is immutable and cached forever, every index document over the feed grows and
+        // revalidates on an hourly window. Nothing redirects - NuGet's query-carrying endpoints live on
+        // hosts of their own and never reach a prefix here.
+        ["nuget"] = new()
+        {
+          Rules =
+          [
+            new CachingRule { Pattern = @"\.nupkg$" },
+            new CachingRule { Pattern = @"\.snupkg$" },
+            new CachingRule { Pattern = @"\.nuspec$" },
+            new CachingRule { Pattern = ".", RefreshAfter = TimeSpan.FromHours(1) },
+          ]
+        },
         // The docker profile, in the shipped order (appsettings.json): digest-addressed blobs and
         // manifests are content-addressed and cached forever, tag-addressed content revalidates on a
         // short window, _catalog is a dynamic listing. Oci makes the prefix speak the registry token
@@ -111,6 +125,7 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
         new CachingProxyPrefix($"/real={upstreamServer.Url}", Profile: "maven"),
         new CachingProxyPrefix($"/real-redirect={upstreamServer.Url}", Profile: "redirect-all"),
         new CachingProxyPrefix($"/real-npm={upstreamServer.Url}", Profile: "npm"),
+        new CachingProxyPrefix($"/real-nuget={upstreamServer.Url}", Profile: "nuget"),
         // An OCI prefix carries the "/v2" on both sides, exactly as config-gen emits it: the client
         // inserts "/v2/" after the host itself, so the alias is "/v2/<name>" and the origin ends in /v2.
         new CachingProxyPrefix($"/v2/real-docker={upstreamServer.Url}v2", Profile: "docker"),
@@ -757,6 +772,90 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
       {
         AssertStatusHeader(message, CachingProxyStatus.ALWAYS_REDIRECT);
         Assert.Equal($"{myUpstreamServer.Url}-/npm/v1/security/audits/quick", message.Headers.Location?.ToString());
+      });
+  }
+
+  [Fact]
+  public async Task Nuget_Package_Content_Is_Cached_Eternally()
+  {
+    // A .nupkg is a published version, which NuGet does not let anyone replace, so the extension rule
+    // (before the catch-all) caches it forever.
+    const string path = "/real-nuget/v3-flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg";
+    await AssertGetResponse(path, HttpStatusCode.OK,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.MISS);
+        Assert.Equal("public, max-age=31536000", message.Headers.CacheControl?.ToString());
+        Assert.Equal("nupkg-content", Encoding.UTF8.GetString(bytes));
+      });
+
+    await AssertGetResponse(path, HttpStatusCode.OK,
+      (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.HIT));
+
+    // Cached forever means fetched once, whatever else happens upstream.
+    Assert.Equal(1, myUpstreamServer.NugetPackageRequestCount);
+  }
+
+  [Fact]
+  public async Task Nuget_Version_List_Is_Revalidated_And_Served_Stale()
+  {
+    // The flat-container version list gains an entry on every publish, so it falls to the catch-all and
+    // revalidates hourly rather than being cached forever.
+    const string path = "/real-nuget/v3-flatcontainer/newtonsoft.json/index.json";
+    myUpstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.Ok;
+
+    await AssertGetResponse(path, HttpStatusCode.OK,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.MISS);
+        Assert.Equal("public, max-age=3600", message.Headers.CacheControl?.ToString());
+        Assert.Contains("13.0.3", Encoding.UTF8.GetString(bytes));
+      });
+
+    await AssertGetResponse(path, HttpStatusCode.OK,
+      (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.HIT));
+
+    // Past the window it revalidates; a 304 keeps the stored copy.
+    myTimeProvider.Advance(TimeSpan.FromMinutes(61));
+    myUpstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.NotModified;
+    await AssertGetResponse(path, HttpStatusCode.OK,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.REVALIDATED);
+        Assert.Contains("13.0.3", Encoding.UTF8.GetString(bytes));
+      });
+
+    // The offline guarantee this ticket is about: with the upstream unreachable, a restore still
+    // resolves off the stored version list instead of failing or being bounced to nuget.org.
+    myTimeProvider.Advance(TimeSpan.FromMinutes(61));
+    myUpstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.ServerError;
+    await AssertGetResponse(path, HttpStatusCode.OK,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.STALE);
+        Assert.Contains("13.0.3", Encoding.UTF8.GetString(bytes));
+      });
+  }
+
+  [Fact]
+  public async Task Nuget_Gzipped_Document_Keeps_Its_Encoding()
+  {
+    // NuGet serves its registration documents gzip-encoded (the registration5-gz-* resources), and the
+    // proxy stores them encoded rather than decoding. Composition check only - the encoding round-trip
+    // itself is covered by the gzipEncoding.txt tests.
+    await AssertGetResponse("/real-nuget/gzipEncoding.txt", HttpStatusCode.OK,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.MISS);
+        Assert.Equal("gzip", message.Content.Headers.ContentEncoding.SingleOrDefault());
+        Assert.Equal("public, max-age=3600", message.Headers.CacheControl?.ToString());
+      });
+
+    await AssertGetResponse("/real-nuget/gzipEncoding.txt", HttpStatusCode.OK,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.HIT);
+        Assert.Equal("gzip", message.Content.Headers.ContentEncoding.SingleOrDefault());
       });
   }
 

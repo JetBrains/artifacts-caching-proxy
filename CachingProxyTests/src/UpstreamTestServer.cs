@@ -73,6 +73,11 @@ public class UpstreamTestServer : IAsyncLifetime
   public int PackumentRequestCount;
   public int TarballRequestCount;
 
+  // Counts hits on the NuGet v3 flat-container routes. The version list is conditional-aware, like the
+  // npm packument; the .nupkg route is not, because immutable content is never revalidated.
+  public int NugetVersionListRequestCount;
+  public int NugetPackageRequestCount;
+
   // How long the /slow.txt route stalls before answering, so a test can put RequestTimeoutSec on either
   // side of the upstream's own latency. The stall precedes the response head, which is the only phase
   // that budget covers.
@@ -352,6 +357,31 @@ public class UpstreamTestServer : IAsyncLifetime
       {
         Interlocked.Increment(ref TarballRequestCount);
         return res.WriteAsync("npm-tarball-content");
+      })
+      // NuGet v3 flat container. The version list is conditional-aware, like the npm packument, so the
+      // nuget tests can script a 304 (kept) or a 5xx (serve stale) after the freshness window.
+      .MapGet("v3-flatcontainer/newtonsoft.json/index.json", (req, res, data) =>
+      {
+        Interlocked.Increment(ref NugetVersionListRequestCount);
+        if (req.Headers.ContainsKey("If-Modified-Since") || req.Headers.ContainsKey("If-None-Match"))
+        {
+          switch (Revalidate)
+          {
+            case RevalidateBehavior.NotModified:
+              res.StatusCode = StatusCodes.Status304NotModified;
+              return Task.CompletedTask;
+            case RevalidateBehavior.ServerError:
+              res.StatusCode = StatusCodes.Status500InternalServerError;
+              return res.WriteAsync("boom");
+          }
+        }
+        res.ContentType = MediaTypeNames.Application.Json;
+        return res.WriteAsync("{\"versions\":[\"13.0.3\"]}");
+      })
+      .MapGet("v3-flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg", (req, res, data) =>
+      {
+        Interlocked.Increment(ref NugetPackageRequestCount);
+        return res.WriteAsync("nupkg-content");
       })
       .MapGet("a.jar", (req, res, data) => res.WriteAsync("a.jar"))
       .MapGet("chunked.bin", async (req, res, data) =>

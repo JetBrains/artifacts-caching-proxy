@@ -162,6 +162,63 @@ public class CachingProfileTest
     Assert.Equal(TimeSpan.FromMinutes(5), trailing!.RefreshAfter);
   }
 
+  [Fact]
+  public void Nuget_Profile_Rules_Resolve_By_Endpoint_Kind()
+  {
+    // Mirrors the shipped nuget profile ordering (appsettings.json). Package content under
+    // {id}/{version}/ is immutable, every index document over the same feed grows.
+    var profile = NugetProfile();
+
+    // Flat-container package content: a published version cannot be replaced, so eternal.
+    var nupkg = profile.Match("/api.nuget.org/v3-flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg");
+    Assert.NotNull(nupkg);
+    Assert.Null(nupkg!.RefreshAfter);
+    Assert.False(nupkg.Redirect);
+
+    var nuspec = profile.Match("/api.nuget.org/v3-flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.nuspec");
+    Assert.NotNull(nuspec);
+    Assert.Null(nuspec!.RefreshAfter);
+
+    var snupkg = profile.Match("/api.nuget.org/v3-flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.snupkg");
+    Assert.NotNull(snupkg);
+    Assert.Null(snupkg!.RefreshAfter);
+
+    // The flat-container version list gains an entry on every publish.
+    var versions = profile.Match("/api.nuget.org/v3-flatcontainer/newtonsoft.json/index.json");
+    Assert.NotNull(versions);
+    Assert.Equal(TimeSpan.FromHours(1), versions!.RefreshAfter);
+
+    // Registration documents carry deprecation and vulnerability metadata, which changes in place.
+    var registration = profile.Match("/api.nuget.org/v3/registration5-gz-semver2/newtonsoft.json/index.json");
+    Assert.NotNull(registration);
+    Assert.Equal(TimeSpan.FromHours(1), registration!.RefreshAfter);
+
+    var page = profile.Match("/api.nuget.org/v3/registration5-gz-semver2/newtonsoft.json/page/3.0.0/13.0.3.json");
+    Assert.NotNull(page);
+    Assert.Equal(TimeSpan.FromHours(1), page!.RefreshAfter);
+
+    // The vulnerability index is republished as advisories land.
+    var vulnerabilities = profile.Match("/api.nuget.org/v3/vulnerabilities/index.json");
+    Assert.NotNull(vulnerabilities);
+    Assert.Equal(TimeSpan.FromHours(1), vulnerabilities!.RefreshAfter);
+
+    // Nothing here redirects: search and autocomplete live on hosts of their own and are handled by
+    // cache-redirector, so no query-carrying endpoint reaches this prefix.
+    Assert.DoesNotContain(profile.Rules, rule => rule.Redirect);
+  }
+
+  [Fact]
+  public void Nuget_Eternal_Rules_Are_Anchored_At_The_Path_End()
+  {
+    // The extension rules must not swallow a document that merely carries a package extension mid-path:
+    // caching a growing index forever is the one mistake there is no recovering from short of a cache wipe.
+    var profile = NugetProfile();
+
+    var index = profile.Match("/api.nuget.org/v3-flatcontainer/some.nupkg.tool/index.json");
+    Assert.NotNull(index);
+    Assert.Equal(TimeSpan.FromHours(1), index!.RefreshAfter);
+  }
+
   // The shipped docker profile, kept in the same order as CachingProxy/appsettings.json.
   private static CachingProfile DockerProfile() => new()
   {
@@ -175,6 +232,18 @@ public class CachingProfileTest
       new CachingRule { Pattern = "/referrers/", RefreshAfter = TimeSpan.FromMinutes(5) },
       new CachingRule { Pattern = "/_catalog", Redirect = true },
       new CachingRule { Pattern = ".", RefreshAfter = TimeSpan.FromMinutes(5) },
+    ]
+  };
+
+  // The shipped nuget profile, kept in the same order as CachingProxy/appsettings.json.
+  private static CachingProfile NugetProfile() => new()
+  {
+    Rules =
+    [
+      new CachingRule { Pattern = @"\.nupkg$" },
+      new CachingRule { Pattern = @"\.snupkg$" },
+      new CachingRule { Pattern = @"\.nuspec$" },
+      new CachingRule { Pattern = ".", RefreshAfter = TimeSpan.FromHours(1) },
     ]
   };
 }
