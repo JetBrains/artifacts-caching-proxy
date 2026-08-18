@@ -236,11 +236,56 @@ public class RemoteServersTest
   }
 
   [Fact]
+  public void A_Url_Prefix_Covers_Only_Down_To_A_Path_Boundary()
+  {
+    // MRI-4837: `jcp-github` is a private Space repo and `jcp-github-mirror-public` a public one beside it.
+    // A bare StartsWith made the first one's scope claim the second, gating a prefix the redirector sends
+    // clients to unauthenticated, so the public mirror 401'd every request.
+    var privateRepo = new UpstreamAuth
+    {
+      UrlPrefixes = ["packages.example.com/maven/p/ij/jcp-github"], Username = "svc", Password = "pat",
+    };
+
+    var config = new CachingProxyConfig
+    {
+      Prefixes =
+      [
+        "/gated=packages.example.com/maven/p/ij/jcp-github",              // the scope itself
+        "/gated-sub=packages.example.com/maven/p/ij/jcp-github/sub",      // inside its path
+        "/mirror=packages.example.com/maven/p/ij/jcp-github-mirror-public", // same characters, different repo
+      ],
+      UpstreamAuth = { [nameof(privateRepo)] = privateRepo },
+    };
+
+    var servers = new RemoteServers(config, new NullLogger<RemoteServers>()).Endpoints
+      .Select(e => e.Metadata.GetMetadata<RemoteServers.RemoteServer>()!)
+      .ToArray();
+
+    Assert.Same(privateRepo, servers.Single(s => s.Prefix == "/gated").Auth);
+    Assert.Same(privateRepo, servers.Single(s => s.Prefix == "/gated-sub").Auth);
+    Assert.Null(servers.Single(s => s.Prefix == "/mirror").Auth);
+  }
+
+  [Fact]
+  public void A_Blank_Url_Prefix_Is_Rejected_At_Startup()
+  {
+    // It covers no upstream, so the entry gates nothing while looking configured - the same failing-open
+    // half-configuration as an entry with no prefixes at all.
+    var config = new CachingProxyConfig
+    {
+      Prefixes = ["/a=private.example.com/maven"],
+      UpstreamAuth = { ["blank"] = new UpstreamAuth { UrlPrefixes = [" "], Username = "svc", Password = "pat" } },
+    };
+
+    Assert.Throws<ArgumentException>(() => new RemoteServers(config, new NullLogger<RemoteServers>()));
+  }
+
+  [Fact]
   public void An_Authenticated_Upstreams_Prefix_Requires_An_Inbound_Client_Jwt()
   {
     var privateRepo = new UpstreamAuth
     {
-      UrlPrefixes = ["private.example.com/"], TokenEndpoint = new Uri("https://private.example.com/"), ClientId = "c",
+      UrlPrefixes = ["private.example.com/maven"], TokenEndpoint = new Uri("https://private.example.com/"), ClientId = "c",
     };
     // A registry account bought for rate limit is gated the same way: what it grants upstream is not
     // visible from here, so a credential counts as an access grant.
@@ -251,7 +296,11 @@ public class RemoteServersTest
 
     var config = new CachingProxyConfig
     {
-      Prefixes = ["/a=private.example.com/maven", "/v2/docker-hub=registry-1.docker.io/v2", "/c=open.example.com"],
+      Prefixes =
+      [
+        "/a=private.example.com/maven", "/v2/docker-hub=registry-1.docker.io/v2", "/c=open.example.com",
+        "/sibling=private.example.com/maven-public",
+      ],
       UpstreamAuth = { [nameof(privateRepo)] = privateRepo, [nameof(registryAccount)] = registryAccount },
     };
 
@@ -262,6 +311,9 @@ public class RemoteServersTest
 
     Assert.True(gated["/a"]);
     Assert.True(gated["/v2/docker-hub"]);
+    // Beside the scope, not inside it: a path-scoped entry must not gate a sibling whose path merely starts
+    // with the same characters, or that public prefix 401s every request (MRI-4837).
+    Assert.False(gated["/sibling"]);
     Assert.False(gated["/c"]); // fetched anonymously, nothing to protect
   }
 

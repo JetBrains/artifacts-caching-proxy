@@ -113,30 +113,45 @@ public class RemoteServers : EndpointDataSource
   // An entry with no UrlPrefixes can never match an upstream, so every prefix it was meant to gate would be
   // left un-gated and fetched anonymously - and whatever those prefixes already hold in the cache would be
   // served to anyone. That is a half-configured secret failing open, so refuse to start, naming the entry so
-  // the missing setting (UpstreamAuth__<name>__UrlPrefixes__0) is obvious.
+  // the missing setting (UpstreamAuth__<name>__UrlPrefixes__0) is obvious. A blank prefix is the same hole:
+  // it has no path to cover, so CoversPath rejects it for every upstream.
   private static void ValidateUpstreamAuth(Dictionary<string, UpstreamAuth> auths)
   {
     foreach (var (name, auth) in auths)
+    {
       if (auth.UrlPrefixes.Length == 0)
         throw new ArgumentException(
           $"UpstreamAuth '{name}' has no UrlPrefixes, so it would gate nothing and leave its upstreams anonymous.");
+      if (auth.UrlPrefixes.Any(string.IsNullOrWhiteSpace))
+        throw new ArgumentException(
+          $"UpstreamAuth '{name}' has a blank UrlPrefix, which covers no upstream and gates nothing.");
+    }
   }
 
-  // Among the auth entries whose UrlPrefixes contain a prefix of the upstream URL, the longest (most
-  // specific) one wins, so a host-wide block and a path-scoped block can coexist. Returns null when
-  // nothing matches, leaving the upstream unauthenticated. The entry keeps its configuration name, which
-  // is what the credential-less warning has to point at (UpstreamAuth__<name>__…) to be actionable.
+  // Among the auth entries whose UrlPrefixes cover the upstream URL, the longest (most specific) one wins,
+  // so a host-wide block and a path-scoped block can coexist. Returns null when nothing matches, leaving the
+  // upstream unauthenticated. The entry keeps its configuration name, which is what the credential-less
+  // warning has to point at (UpstreamAuth__<name>__…) to be actionable.
   private static KeyValuePair<string, UpstreamAuth>? MatchAuth(
     Uri remoteUri, IReadOnlyDictionary<string, UpstreamAuth> auths)
   {
     var remotePrefix = remoteUri.GetHostPortPath();
     return auths.
       SelectMany(entry => entry.Value.UrlPrefixes.Select(prefix => (UrlPrefix: prefix, Entry: entry)))
-      .Where(match => remotePrefix.StartsWith(match.UrlPrefix, StringComparison.OrdinalIgnoreCase))
+      .Where(match => CoversPath(remotePrefix, match.UrlPrefix))
       .OrderByDescending(match => match.UrlPrefix.Length)
       .Select(match => (KeyValuePair<string, UpstreamAuth>?)match.Entry)
       .FirstOrDefault();
   }
+
+  // A UrlPrefix is a path, not a character run, so it covers an upstream only down to a segment boundary. A
+  // bare StartsWith once let the private `…/ij/jcp-github` claim the public `…/ij/jcp-github-mirror-public`:
+  // that public prefix got an AuthorizeAttribute while the redirector, reading the same origin as public,
+  // redirected clients to it unauthenticated, so every request 401'd (MRI-4837). A prefix already ending in
+  // `/` carries its own boundary; otherwise the upstream has to end there or continue with one.
+  private static bool CoversPath(string upstream, string urlPrefix) =>
+    upstream.StartsWith(urlPrefix, StringComparison.OrdinalIgnoreCase) &&
+    (urlPrefix.EndsWith('/') || upstream.Length == urlPrefix.Length || upstream[urlPrefix.Length] == '/');
 
   /// <summary>The prefix this request matched, or null when it matched none.</summary>
   public static RemoteServer? GetRemoteServer(HttpContext context) =>
