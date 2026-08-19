@@ -69,6 +69,20 @@ public sealed class RegistryTokenProvider(
   // "/v2/<name>/<verb>/<reference>" back to the part that identifies what is being pulled.
   private static readonly string[] ourApiVerbs = ["manifests", "blobs", "tags", "referrers"];
 
+  /// <summary>
+  /// An OCI distribution path split into segments, plus the index of the API verb the repository name ends
+  /// at - the only boundary the path itself states, since a repository name is an unbounded number of
+  /// segments. <c>Verb</c> is -1 when there is none, which is the <c>/v2/</c> ping and <c>/v2/_catalog</c>:
+  /// neither names a repository.
+  /// <para>The <i>last</i> verb, because a repository may legitimately be named after one
+  /// ("/v2/blobs/manifests/latest" pulls a tag of the repository "blobs").</para>
+  /// </summary>
+  public static (string[] Segments, int Verb) SplitPath(Uri upstreamUri)
+  {
+    var segments = upstreamUri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+    return (segments, Array.FindLastIndex(segments, segment => ourApiVerbs.Contains(segment)));
+  }
+
   // How much of a refused token request's body is quoted back in the exception. Enough for the one-line
   // JSON every registry answers with, short enough that an HTML error page does not become the message.
   private const int MaxErrorBodyChars = 512;
@@ -181,10 +195,8 @@ public sealed class RegistryTokenProvider(
   /// </summary>
   public static string? TryDeriveScope(Uri upstreamUri)
   {
-    var segments = upstreamUri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+    var (segments, verb) = SplitPath(upstreamUri);
     if (segments.FirstOrDefault() != "v2") return null;
-
-    var verb = Array.FindLastIndex(segments, segment => ourApiVerbs.Contains(segment));
     if (verb <= 1) return null;
 
     return $"repository:{string.Join('/', segments, 1, verb - 1)}:pull";
@@ -276,8 +288,7 @@ public sealed class RegistryTokenProvider(
   // worth remembering.
   private static string ChallengeKey(Uri upstreamUri)
   {
-    var segments = upstreamUri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
-    var verb = Array.FindLastIndex(segments, segment => ourApiVerbs.Contains(segment));
+    var (segments, verb) = SplitPath(upstreamUri);
     var repository = string.Join('/', segments, 0, verb > 0 ? verb : segments.Length);
 
     return $"registry-challenge::{upstreamUri.Authority}::{repository}";

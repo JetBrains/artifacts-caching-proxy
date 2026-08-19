@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
@@ -12,7 +13,7 @@ using Microsoft.Extensions.Primitives;
 
 namespace JetBrains.CachingProxy;
 
-public class RemoteServers : EndpointDataSource
+public partial class RemoteServers : EndpointDataSource
 {
   public RemoteServers(CachingProxyConfig config, ILogger<RemoteServers> logger)
   {
@@ -45,12 +46,14 @@ public class RemoteServers : EndpointDataSource
         throw new ArgumentException(
           $"Authenticated upstream '{remoteUri}' must use HTTPS except on loopback.");
       var profile = ResolveProfile(prefix.Profile, config.CachingProfiles);
+      ValidateDefaultNamespace(prefix, profile);
       var remoteServer = new RemoteServer(trimmedPrefix, remoteUri,
         config.CacheDuration.Union(prefix.CacheDuration), matchedAuth, profile)
       {
         // Non-null exactly when the profile resolved, so a blank name cannot reach the metric as an empty
         // label - which Prometheus reads as no label at all, forking a series off the "none" bucket.
-        ProfileName = profile == null ? null : prefix.Profile
+        ProfileName = profile == null ? null : prefix.Profile,
+        DefaultNamespace = prefix.DefaultNamespace
       };
 
       logger.LogInformation("RemoteServer: {Prefix} -> {RemoteUri}, Auth: {Auth}, Profile: {Profile}",
@@ -109,6 +112,26 @@ public class RemoteServers : EndpointDataSource
       throw new ArgumentException($"Unknown caching profile '{name}'. Defined profiles: {string.Join(", ", profiles.Keys)}");
     return profile.Compile();
   }
+
+  // A DefaultNamespace only means anything where there is a repository name to expand, which is the OCI
+  // request shape and nothing else: set on any other prefix it would silently do nothing, so say so at
+  // startup rather than leave someone to wonder why their pulls still 404. The value is spliced into an
+  // upstream path, so hold it to the one path component the distribution spec allows - that also keeps
+  // '/', '..' and an escape out of it by construction.
+  private static void ValidateDefaultNamespace(CachingProxyPrefix prefix, CachingProfile? profile)
+  {
+    if (prefix.DefaultNamespace == null) return;
+    if (profile is not { Oci: true })
+      throw new ArgumentException(
+        $"Prefix '{prefix}' sets DefaultNamespace, which only applies to a caching profile with Oci=true.");
+    if (!OurOciPathComponent.IsMatch(prefix.DefaultNamespace))
+      throw new ArgumentException(
+        $"Prefix '{prefix}' has a DefaultNamespace that is not a single OCI path component.");
+  }
+
+  // The path-component grammar of the distribution spec's repository name.
+  [GeneratedRegex("^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*$", RegexOptions.Compiled)]
+  private static partial Regex OurOciPathComponent { get; }
 
   // An entry with no UrlPrefixes can never match an upstream, so every prefix it was meant to gate would be
   // left un-gated and fetched anonymously - and whatever those prefixes already hold in the cache would be
@@ -174,6 +197,12 @@ public class RemoteServers : EndpointDataSource
     public string? ProfileName { get; init; }
 
     /// <summary>
+    /// The namespace an unqualified OCI repository name expands into (Docker Hub's <c>library</c>), or null
+    /// for a prefix that declares none. See <see cref="WithDefaultNamespace"/>.
+    /// </summary>
+    public string? DefaultNamespace { get; init; }
+
+    /// <summary>
     /// The upstream URI for a request's <c>{**path}</c> remainder, or <c>null</c> when that remainder names
     /// something this prefix is not configured for - which the caller answers with a 400, see
     /// <see cref="RemoteProxy.ValidateRequestAsync"/>.
@@ -185,6 +214,8 @@ public class RemoteServers : EndpointDataSource
     /// belong to the prefix and are fixed at startup: an un-gated prefix could resolve onto a gated one's
     /// upstream path and serve its cache entries to anyone (MRI-4842), and a gated prefix could hand our own
     /// credential to a host of the caller's choosing (MRI-4844). So only a URI inside the base is returned.</para>
+    /// <para>The one rewrite applied to a URI that passed all of that is
+    /// <see cref="WithDefaultNamespace"/>, which stays inside the base by construction.</para>
     /// </summary>
     public Uri? GetUpstreamUri(string? remainingPath)
     {
@@ -210,8 +241,50 @@ public class RemoteServers : EndpointDataSource
       // the client as a redirect Location - so two requests differing only there would share one entry.
       // Nothing legitimate produces them: the query never enters the path, and '?', '#' and '@'-with-'//'
       // cannot appear in a remainder that stays a path.
-      return upstream.Query.Length == 0 && upstream.Fragment.Length == 0 && upstream.UserInfo.Length == 0 ?
-        upstream : null;
+      if (upstream.Query.Length > 0 || upstream.Fragment.Length > 0 || upstream.UserInfo.Length > 0)
+        return null;
+
+      return WithDefaultNamespace(upstream);
+    }
+
+    /// <summary>
+    /// <paramref name="upstream"/> with <see cref="DefaultNamespace"/> spliced in front of a single-segment
+    /// OCI repository name, or unchanged when there is no such name to expand.
+    /// <para>Docker Hub keeps its unqualified images in an implicit namespace - <c>alpine</c> is really
+    /// <c>library/alpine</c> - and a registry client expands that only when the registry domain is
+    /// <c>docker.io</c> itself. Against a mirror the name travels as typed, so the pull addresses a
+    /// repository that does not exist and Hub answers <c>401</c> (it reports an unknown repository as
+    /// unauthorized, never 404). A mirror has to expand the name itself, and this is where: the cache key is
+    /// this URI (see <c>CachingProxy.InvokeAsync</c>), so both spellings land on one entry instead of caching
+    /// the same bytes twice, and the rewrite also covers the PrivateLink path that reaches us without
+    /// passing the redirector.</para>
+    /// <para>Only a name of exactly one segment, measured from <see cref="RemoteUri"/>'s own path so the rule
+    /// still means "unqualified" for a mirror served under a project path. A name that is already namespaced
+    /// is the caller's to spell, and a path that names no repository at all - the <c>/v2/</c> ping,
+    /// <c>/v2/_catalog</c> - has nothing to expand.</para>
+    /// </summary>
+    private Uri WithDefaultNamespace(Uri upstream)
+    {
+      // The profile too, not just the setting: startup rejects the combination, but this record is
+      // constructible on its own and the method rewrites an upstream path.
+      if (DefaultNamespace == null || Profile is not { Oci: true }) return upstream;
+
+      var verb = RegistryTokenProvider.SplitPath(upstream).Verb;
+      var root = RegistryTokenProvider.SplitPath(RemoteUri).Segments.Length;
+      if (verb - root != 1) return upstream;
+
+      // Spliced into the path as text rather than rebuilt from the segments, so a digest reference and an
+      // escape ('%2F' in a scoped name) reach the upstream exactly as the client wrote them. The base path
+      // is kept verbatim and one literal segment goes in after it, so containment as checked above still
+      // holds by construction - and the StartsWith says so rather than assuming the two APIs agree on
+      // escaping.
+      var basePath = RemoteUri.AbsolutePath;
+      var path = upstream.AbsolutePath;
+      if (!path.StartsWith(basePath, StringComparison.Ordinal)) return upstream;
+
+      return new Uri(
+        $"{upstream.GetLeftPart(UriPartial.Authority)}{basePath}{DefaultNamespace}/{path[basePath.Length..]}",
+        UriKind.Absolute);
     }
 
     public override string ToString() => $"{Prefix}={RemoteUri}";

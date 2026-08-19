@@ -13,12 +13,15 @@ namespace JetBrains.CachingProxy.Tests;
 
 public class RemoteServersTest
 {
-  private static RemoteServers.RemoteServer[] Build(params string[] prefixes) =>
+  private static RemoteServers.RemoteServer[] Build(CachingProxyConfig config) =>
   [
-    .. new RemoteServers(new CachingProxyConfig { Prefixes = [.. prefixes.Select(p => (CachingProxyPrefix)p)] }, new NullLogger<RemoteServers>())
+    .. new RemoteServers(config, new NullLogger<RemoteServers>())
       .Endpoints
       .Select(e => e.Metadata.GetMetadata<RemoteServers.RemoteServer>()!)
   ];
+
+  private static RemoteServers.RemoteServer[] Build(params string[] prefixes) =>
+    Build(new CachingProxyConfig { Prefixes = [.. prefixes.Select(p => (CachingProxyPrefix)p)] });
 
   [Fact]
   public void Plain_Prefix_Targets_Itself_Over_Https()
@@ -157,6 +160,94 @@ public class RemoteServersTest
     // read as a child of "/open".
     Assert.All(Build("/a=h.example.com/open", "/b=h.example.com/open/", "/c=h.example.com"),
       server => Assert.EndsWith("/", server.RemoteUri.AbsolutePath, StringComparison.Ordinal));
+
+  // The Docker Hub prefix as the redirector configures it: an alias onto the registry's /v2 root, the OCI
+  // profile, and the implicit namespace Hub keeps its unqualified images in.
+  private static RemoteServers.RemoteServer BuildHub(string? defaultNamespace = "library", bool oci = true) =>
+    Assert.Single(Build(new CachingProxyConfig
+    {
+      Prefixes =
+        [new CachingProxyPrefix("/v2/docker-hub=registry-1.docker.io/v2", Profile: "docker", DefaultNamespace: defaultNamespace)],
+      CachingProfiles = { ["docker"] = new CachingProfile { Oci = oci } },
+    }));
+
+  [Theory]
+  // What Sentry reported: "docker pull <host>/docker-hub/alpine" sends the name as typed, because a client
+  // expands it to "library/alpine" only for docker.io itself - and Hub has no repository at its /v2 root.
+  [InlineData("alpine/manifests/latest", "https://registry-1.docker.io/v2/library/alpine/manifests/latest")]
+  [InlineData("alpine/blobs/sha256:abcdef", "https://registry-1.docker.io/v2/library/alpine/blobs/sha256:abcdef")]
+  [InlineData("alpine/tags/list", "https://registry-1.docker.io/v2/library/alpine/tags/list")]
+  [InlineData("alpine/referrers/sha256:abcdef", "https://registry-1.docker.io/v2/library/alpine/referrers/sha256:abcdef")]
+  // A repository named after an API verb still expands: the boundary is the last verb, not the first.
+  [InlineData("blobs/manifests/latest", "https://registry-1.docker.io/v2/library/blobs/manifests/latest")]
+  // Already qualified - the caller named the repository, so leave it alone.
+  [InlineData("jetbrains/teamcity-server/manifests/2024.1",
+    "https://registry-1.docker.io/v2/jetbrains/teamcity-server/manifests/2024.1")]
+  [InlineData("a/b/c/manifests/1", "https://registry-1.docker.io/v2/a/b/c/manifests/1")]
+  // No repository named at all: the /v2/ ping (which is how a client probes our auth) and the catalog.
+  [InlineData(null, "https://registry-1.docker.io/v2/")]
+  [InlineData("", "https://registry-1.docker.io/v2/")]
+  [InlineData("_catalog", "https://registry-1.docker.io/v2/_catalog")]
+  // No API verb either, so not a repository request - whatever it is, it is not ours to rewrite.
+  [InlineData("alpine", "https://registry-1.docker.io/v2/alpine")]
+  [InlineData("manifests/latest", "https://registry-1.docker.io/v2/manifests/latest")]
+  public void An_Unqualified_Repository_Name_Gets_The_Default_Namespace(string? remainingPath, string expected) =>
+    Assert.Equal(expected, BuildHub().GetUpstreamUri(remainingPath)?.AbsoluteUri);
+
+  [Fact]
+  public void Without_A_Default_Namespace_The_Repository_Name_Passes_Through() =>
+    // Which is what every other OCI prefix wants: quay, gcr, ghcr and mcr have no implicit namespace, so an
+    // unqualified name there is simply a repository that does not exist.
+    Assert.Equal("https://registry-1.docker.io/v2/alpine/manifests/latest",
+      BuildHub(defaultNamespace: null).GetUpstreamUri("alpine/manifests/latest")?.AbsoluteUri);
+
+  [Fact]
+  public void Both_Spellings_Of_An_Unqualified_Image_Share_One_Cache_Key()
+  {
+    // Why the expansion is done here and not in the redirector: the key is the resolved upstream URI, so
+    // expanding it before the key is derived keeps one entry instead of caching the same bytes twice.
+    var hub = BuildHub();
+    Assert.Equal(
+      hub.GetUpstreamUri("library/alpine/manifests/latest")!.ManglePath(),
+      hub.GetUpstreamUri("alpine/manifests/latest")!.ManglePath());
+  }
+
+  [Theory]
+  [InlineData("/alpine/manifests/latest")] // an absolute-path reference, replacing the /v2 base
+  [InlineData("//evil.example.com/v2/alpine/manifests/latest")]
+  [InlineData("../alpine/manifests/latest")]
+  [InlineData("x/../../alpine/manifests/latest")]
+  [InlineData("%2e%2e/alpine/manifests/latest")]
+  public void The_Default_Namespace_Does_Not_Rescue_A_Remainder_That_Leaves_The_Base(string remainingPath) =>
+    // The expansion runs only on a URI that already passed containment, so it cannot turn a rejected
+    // remainder into an accepted one - nor can it be reached by a remainder that shapes itself to look
+    // unqualified.
+    Assert.Null(BuildHub().GetUpstreamUri(remainingPath));
+
+  [Fact]
+  public void A_Default_Namespace_Without_An_Oci_Profile_Is_Rejected_At_Startup()
+  {
+    // It would silently do nothing - only the OCI request shape has a repository name to expand - so say so
+    // at startup rather than leave someone wondering why their pulls still fail. Both ways of not being one:
+    // a profile that is not OCI, and no profile at all.
+    Assert.Throws<ArgumentException>(() => BuildHub(oci: false));
+    Assert.Throws<ArgumentException>(() => Build(new CachingProxyConfig
+    {
+      Prefixes = [new CachingProxyPrefix("/v2/docker-hub=registry-1.docker.io/v2", DefaultNamespace: "library")],
+    }));
+  }
+
+  [Theory]
+  [InlineData("library/nested")] // more than one path component
+  [InlineData("/library")]
+  [InlineData("..")]
+  [InlineData("%2f")]
+  [InlineData("")]
+  [InlineData(" ")]
+  [InlineData("Library")] // a repository name is lowercase, per the distribution spec
+  public void A_Default_Namespace_That_Is_Not_One_Path_Component_Is_Rejected_At_Startup(string defaultNamespace) =>
+    // It goes straight into an upstream path, so hold it to the grammar rather than trusting the config.
+    Assert.Throws<ArgumentException>(() => BuildHub(defaultNamespace));
 
   [Fact]
   public void An_Upstream_Auth_Entry_Without_UrlPrefixes_Is_Rejected_At_Startup()
