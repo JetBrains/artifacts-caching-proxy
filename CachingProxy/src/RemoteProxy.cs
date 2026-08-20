@@ -167,12 +167,26 @@ public partial class RemoteProxy(
     // 307 preserves the method and the client reuses its own credentials for the origin, so there is
     // no need to proxy these through (which would wrongly cache dynamic/non-cacheable content for
     // protected sources). With no matching rule the path is cached, never redirected.
+    //
+    // The query string rides along, and only here. Every endpoint that gets a Redirect rule is
+    // query-shaped - npm's search and security audit, an OCI _catalog page - and the routed path does not
+    // carry one, so a Location built from the path alone asks for an unfiltered search and the first page
+    // of a catalogue whatever the client wanted, with a 307 and no error to show for it. Safe here and
+    // not on a cached path because nothing is keyed on it: the response is written straight out and a 307
+    // is not cacheable by default. And it cannot move the target - GetUpstreamUri has already pinned
+    // scheme, host and path, none of which a query reaches. Minus the redirector's cr_exp/cr_sig: those
+    // are a credential for us, and sending them on would both hand our signature to the origin and leave
+    // it replayable here until it expires.
     if (rule is { Redirect: true })
     {
       await SetStatusAsync(context, CachingProxyStatus.ALWAYS_REDIRECT,
         new CachedResponse(HttpStatusCode.RedirectKeepVerb, new HeaderDictionary())
         {
-          Headers = { Location = upstreamUri.ToString() }
+          Headers =
+          {
+            Location =
+              $"{upstreamUri}{RedirectSignatureAuthenticationHandler.QueryWithoutSignatureParams(context.Request)}"
+          }
         });
       return null;
     }

@@ -237,10 +237,11 @@ public partial class RemoteServers : EndpointDataSource
       if (!upstream.GetHostPortPath().StartsWith(RemoteUri.GetHostPortPath(), StringComparison.Ordinal))
         return null;
 
-      // A query, a fragment or userinfo is excluded from that form yet still travels - upstream, or back to
-      // the client as a redirect Location - so two requests differing only there would share one entry.
-      // Nothing legitimate produces them: the query never enters the path, and '?', '#' and '@'-with-'//'
-      // cannot appear in a remainder that stays a path.
+      // A query, a fragment or userinfo is excluded from that form yet would still travel upstream, so two
+      // requests differing only there would share one entry. Nothing legitimate produces them: the routed
+      // path never carries the request's own query - a Redirect rule appends that to its Location itself,
+      // see RemoteProxy.ValidateRequestAsync - and '?', '#' and '@'-with-'//' cannot appear in a remainder
+      // that stays a path.
       if (upstream.Query.Length > 0 || upstream.Fragment.Length > 0 || upstream.UserInfo.Length > 0)
         return null;
 

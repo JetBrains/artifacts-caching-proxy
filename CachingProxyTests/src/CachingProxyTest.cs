@@ -79,8 +79,8 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
         },
         // The nuget profile, in the shipped order (appsettings.json): package content under
         // {id}/{version}/ is immutable and cached forever, every index document over the feed grows and
-        // revalidates on an hourly window. Nothing redirects - NuGet's query-carrying endpoints live on
-        // hosts of their own and never reach a prefix here.
+        // revalidates on an hourly window. Nothing redirects - a synthesized service index advertises
+        // NuGet's query-carrying endpoints away from these prefixes entirely.
         ["nuget"] = new()
         {
           Rules =
@@ -776,6 +776,20 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
   }
 
   [Fact]
+  public async Task Npm_Search_Redirect_Keeps_The_Query_String()
+  {
+    // A search is nothing but its query, and the routed path a request arrives as does not carry one, so
+    // a Location built from the path alone bounces every search to an unfiltered listing - a 307 with
+    // nothing wrong on the face of it.
+    await AssertGetResponse("/real-npm/-/v1/search?text=express&size=1", HttpStatusCode.RedirectKeepVerb,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.ALWAYS_REDIRECT);
+        Assert.Equal($"{myUpstreamServer.Url}-/v1/search?text=express&size=1", message.Headers.Location?.ToString());
+      });
+  }
+
+  [Fact]
   public async Task Nuget_Package_Content_Is_Cached_Eternally()
   {
     // A .nupkg is a published version, which NuGet does not let anyone replace, so the extension rule
@@ -979,6 +993,16 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
       {
         AssertStatusHeader(message, CachingProxyStatus.ALWAYS_REDIRECT);
         Assert.Equal($"{myUpstreamServer.Url}v2/_catalog", message.Headers.Location?.ToString());
+      });
+
+    // Its pagination is a query, and dropping it walks a client back to page one on every follow.
+    await AssertGetResponse("/v2/real-docker/_catalog?n=100&last=jetbrains%2Fteamcity", HttpStatusCode.RedirectKeepVerb,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.ALWAYS_REDIRECT);
+        Assert.Equal(
+          $"{myUpstreamServer.Url}v2/_catalog?n=100&last=jetbrains%2Fteamcity",
+          message.Headers.Location?.ToString());
       });
   }
 

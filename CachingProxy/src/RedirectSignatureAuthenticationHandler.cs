@@ -124,8 +124,31 @@ public sealed class RedirectSignatureAuthenticationHandler(
       return rawTarget;
 
     var path = rawTarget[..queryStart];
-    var query = rawTarget[(queryStart + 1)..];
+    var kept = KeepNonSignatureParams(rawTarget[(queryStart + 1)..]);
+    return kept.Length > 0 ? $"{path}?{kept}" : path;
+  }
 
+  /// <summary>
+  /// The request's own query string, in <c>?a=1</c> form and empty when nothing is left, with the
+  /// <c>cr_exp</c>/<c>cr_sig</c> pair removed. Those two are a credential for <i>this</i> proxy, minted
+  /// for one path and one expiry, so anything that forwards a query somewhere else - a Redirect rule's
+  /// <c>Location</c>, see <see cref="RemoteProxy"/> - has to drop them first: sent on they would both
+  /// disclose our signature to the origin and leave it replayable here until it expires.
+  /// </summary>
+  public static string QueryWithoutSignatureParams(HttpRequest request)
+  {
+    var query = request.QueryString.Value;
+    if (string.IsNullOrEmpty(query))
+      return "";
+
+    var kept = KeepNonSignatureParams(query.TrimStart('?'));
+    return kept.Length > 0 ? $"?{kept}" : "";
+  }
+
+  // The query segments, verbatim and in order, minus the two cr_* parameters. Takes and returns a query
+  // without its leading '?'.
+  private static string KeepNonSignatureParams(string query)
+  {
     var kept = new StringBuilder();
     foreach (var segment in query.Split('&'))
     {
@@ -138,7 +161,7 @@ public sealed class RedirectSignatureAuthenticationHandler(
       kept.Append(segment);
     }
 
-    return kept.Length > 0 ? $"{path}?{kept}" : path;
+    return kept.ToString();
   }
 
   private Task<AuthenticateResult> Fail(string reason)

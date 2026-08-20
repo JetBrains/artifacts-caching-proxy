@@ -97,6 +97,21 @@ public class RedirectSignatureAuthTest : IAsyncLifetime
   }
 
   [Fact]
+  public async Task Redirect_Location_Keeps_The_Query_But_Not_The_Signature()
+  {
+    // A Redirect rule forwards the request's own query in its Location, and cr_exp/cr_sig must not travel
+    // with it: they are a credential for this proxy, so at the origin they buy nothing and cost the
+    // disclosure of our signature, replayable here until it expires.
+    using var client = myProxyHost!.GetTestServer().CreateClient();
+
+    var response = await client.GetAsync(Sign("/private-redirect/-/v1/search?text=express&size=1"));
+
+    Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
+    Assert.Equal($"{UrlOf(myUpstreamServer)}secure/-/v1/search?text=express&size=1",
+      response.Headers.Location?.ToString());
+  }
+
+  [Fact]
   public async Task Valid_Signature_Response_Is_Cache_Control_Private()
   {
     // A signature authorizes exactly one client's redirect, so the artifact must not be stored by
@@ -342,7 +357,14 @@ public class RedirectSignatureAuthTest : IAsyncLifetime
     {
       LocalCachePath = myTempDirectory,
       MinimumFreeDiskSpaceMb = 2,
-      Prefixes = [$"/private={upstreamUrl}secure"],
+      // A second gated prefix whose every path is redirected rather than proxied, so a signed request
+      // can be pointed at the one branch that forwards a query string of its own.
+      Prefixes =
+      [
+        $"/private={upstreamUrl}secure",
+        new CachingProxyPrefix($"/private-redirect={upstreamUrl}secure", Profile: "redirect-all"),
+      ],
+      CachingProfiles = { ["redirect-all"] = new() { Rules = [new CachingRule { Pattern = ".", Redirect = true }] } },
       UpstreamAuth =
       {
         ["test"] = new UpstreamAuth
