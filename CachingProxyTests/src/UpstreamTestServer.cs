@@ -384,6 +384,21 @@ public class UpstreamTestServer : IAsyncLifetime
         return res.WriteAsync("nupkg-content");
       })
       .MapGet("a.jar", (req, res, data) => res.WriteAsync("a.jar"))
+      // Declares Content-Length, which the routes around it do not: the byte counter reads a MISS's size
+      // off the upstream head, so an upstream that declares none is counted only once its stored copy is
+      // served back.
+      .MapGet("sized.jar", (req, res, data) =>
+      {
+        res.ContentLength = "sized.jar"u8.Length;
+        return res.WriteAsync("sized.jar");
+      })
+      // The entity's length and no body, as a real upstream answers a HEAD: the one length the byte
+      // counter has to leave alone, since nothing is transferred and nothing but the head is cached.
+      .MapVerb(HttpMethods.Head, "sized.jar", (req, res, data) =>
+      {
+        res.ContentLength = "sized.jar"u8.Length;
+        return Task.CompletedTask;
+      })
       .MapGet("chunked.bin", async (req, res, data) =>
       {
         // Flush after the first write so the response is sent chunked, with no Content-Length.

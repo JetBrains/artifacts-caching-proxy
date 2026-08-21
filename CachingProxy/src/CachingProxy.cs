@@ -117,7 +117,7 @@ public class CachingProxy
       // A non-null response is a GET MISS body for us to stream and persist; otherwise it is handled.
       if (response == null) return;
 
-      var storedPath = await DownloadToDiskAsync(context, response, upstreamUri, variant);
+      var storedPath = await DownloadToDiskAsync(context, response, upstreamUri, variant, CachingProxyStatus.MISS);
       if (storedPath == null) return;
 
       // Unconditional, unlike the freshness stamp this replaced: a stored copy needs its head back
@@ -140,7 +140,7 @@ public class CachingProxy
   private async Task ServeFileAsync(HttpContext context, FileInfo cachedFile, CacheEntryMetadata metadata,
     string? contentEncoding, CachingProxyStatus status)
   {
-    myRemoteProxy.SetStatusHeader(context, status);
+    myRemoteProxy.SetStatusHeader(context, status, cachedContentLength: null);
     CachedResponse.SetCachingHeaderFor(context);
     if (contentEncoding != null)
       context.Response.Headers.ContentEncoding = contentEncoding;
@@ -155,6 +155,14 @@ public class CachingProxy
         entityTag: ParseETag(metadata.ETag),
         enableRangeProcessing: true)
       .ExecuteAsync(context);
+
+    // What went out, not what is on disk: the result above answers conditional and ranged requests itself,
+    // so a client that already holds the artifact gets a bodiless 304 and a resumed download gets one range
+    // of it. Both are common enough on a repository (Gradle revalidates, layer pulls resume) that counting
+    // the file every time would report traffic that never left. The framework leaves the length it served
+    // on the response, and a 304 leaves none.
+    if (context.Response.ContentLength is { } served)
+      myRemoteProxy.AddContentBytes(context, status, served);
   }
 
   // Null for an upstream that sent no ETag, or one this framework will not parse — the served head then
@@ -199,10 +207,12 @@ public class CachingProxy
         {
           // Write the (revalidated) response head, then stream+persist the new body. The head carries
           // the upstream's own Content-Type, which CachedResponse already copied over — the same one
-          // recorded below, so this response and every later HIT agree.
-          await myRemoteProxy.SetStatusAsync(context, CachingProxyStatus.REVALIDATED, new CachedResponse(response));
+          // recorded below, so this response and every later HIT agree. Its bytes are counted by the
+          // transfer that relays them, like a MISS's.
+          await myRemoteProxy.SetStatusAsync(context, CachingProxyStatus.REVALIDATED, new CachedResponse(response),
+            countContentBytes: false);
 
-          var newPath = await DownloadToDiskAsync(context, response, upstreamUri, variant);
+          var newPath = await DownloadToDiskAsync(context, response, upstreamUri, variant, CachingProxyStatus.REVALIDATED);
           if (newPath == null) return;
 
           // The new representation may use a different encoding (hence a different path) than the
@@ -222,8 +232,10 @@ public class CachingProxy
   // Streams the upstream body to the client while persisting it to the local cache via an atomic
   // temp-file + move, validating Content-Length. Returns the final cache file path, or null when the
   // download was aborted (content-length mismatch, a stalled upstream, or cancellation). Leaves no
-  // orphaned temp file.
-  private async Task<string?> DownloadToDiskAsync(HttpContext context, HttpResponseMessage response, Uri upstreamUri, string? variant)
+  // orphaned temp file. Reports the bytes it relayed to the client under the given status, which is the
+  // status the head for this body was written with.
+  private async Task<string?> DownloadToDiskAsync(HttpContext context, HttpResponseMessage response, Uri upstreamUri,
+    string? variant, CachingProxyStatus status)
   {
     var contentEncoding = response.Content.Headers.ContentEncoding.FirstOrDefault();
     var contentLength = response.Content.Headers.ContentLength;
@@ -276,6 +288,11 @@ public class CachingProxy
         myLogger.Log(LogLevel.Debug, Event.ConcurrentCacheStore, e,
           "Another request stored {RequestPath} first, keeping its copy", context.Request.Path);
       }
+
+      // The copy wrote the same bytes to the client and to the cache, so this is what the request served -
+      // counted here and not off the head, which carries the upstream's declared length and, for a chunked
+      // upstream, no length at all. An aborted download returns above and counts nothing.
+      myRemoteProxy.AddContentBytes(context, status, writtenLength);
 
       // Normalized so callers can compare it against a FileInfo.FullName (see the encoding-changed
       // cleanup in RevalidateAndServeAsync) without a raw-vs-normalized path-string mismatch.

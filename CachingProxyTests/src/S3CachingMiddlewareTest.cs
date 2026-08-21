@@ -145,6 +145,139 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   }
 
   [Fact]
+  public async Task Content_Metric_Counts_The_Bytes_A_Redirect_Sends_A_Client_To_Fetch()
+  {
+    // In bucket mode the artifact is delivered by the redirect: the client downloads the object from S3,
+    // and that is the traffic this request produced, whatever status sent it there. The bytes cannot be
+    // read off the response (a 307 has no body of its own), so they travel on the redirect's internal
+    // Cached-Content-Length header, and the HIT that replays the stored redirect reports the same size
+    // again - the client downloads it again too.
+    var server = CreateServer(signedLinks: false);
+    using var metrics = new RequestMetricRecorder(server.Services);
+
+    using (var miss = await server.CreateRequest("/real/sized.jar").SendAsync(HttpMethod.Get.Method))
+    {
+      Assert.Equal(HttpStatusCode.RedirectKeepVerb, miss.StatusCode);
+      AssertStatusHeader(miss, CachingProxyStatus.MISS);
+      // Internal bookkeeping, and a wrong Content-Length at that (a 307 sends no body): it must stay
+      // inside the process and never reach the client.
+      Assert.DoesNotContain(CachingProxyConstants.CachedContentLengthHeader,
+        miss.Headers.Select(static h => h.Key), StringComparer.OrdinalIgnoreCase);
+    }
+
+    using (var hit = await server.CreateRequest("/real/sized.jar").SendAsync(HttpMethod.Get.Method))
+    {
+      Assert.Equal(HttpStatusCode.RedirectKeepVerb, hit.StatusCode);
+      AssertStatusHeader(hit, CachingProxyStatus.HIT);
+    }
+
+    Assert.Equal(1, myS3.PutObjectCalls);
+    Assert.Equal("sized.jar".Length, myS3.Objects[GetPathKey("/real/sized.jar")].Body.Length);
+
+    // One MISS for one upload, not two. The head RemoteProxy.ProcessAsync would write for the body is
+    // suppressed here (this middleware Clear()s it and redirects instead), so the redirect is the only
+    // report the request makes - otherwise both requests and bytes come out doubled for every object the
+    // bucket gains.
+    Assert.Equal(["MISS", "HIT"], metrics.TagValues("status"));
+    Assert.Equal([("MISS", 9L), ("HIT", 9L)], metrics.ContentBytes);
+  }
+
+  [Fact]
+  public async Task Content_Metric_Counts_A_Redirected_Objects_Full_Size()
+  {
+    // The probe path: the object is already in the bucket, and the ranged prefetch read only its first
+    // slice before deciding it is too large to inline. The bytes counted are the object's own size, not
+    // the size of that slice - anything else scales with the inline window rather than with the traffic.
+    var server = CreateServer(signedLinks: false);
+    myS3.Objects[GetPathKey("/real/a.jar")] = (ourLargeBody, "application/java-archive", null);
+    using var metrics = new RequestMetricRecorder(server.Services);
+
+    using (var miss = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method))
+    {
+      Assert.Equal(HttpStatusCode.RedirectKeepVerb, miss.StatusCode);
+      AssertStatusHeader(miss, CachingProxyStatus.MISS);
+    }
+
+    Assert.Equal(0, myS3.PutObjectCalls); // already in the bucket: nothing was fetched or uploaded
+    Assert.Equal([("MISS", (long)ourLargeBody.Length)], metrics.ContentBytes);
+  }
+
+  [Fact]
+  public async Task Content_Metric_Counts_An_Inlined_Objects_Bytes()
+  {
+    // The other half of the probe path: small enough to fit the prefetch window, so it is served from
+    // memory with its body rather than redirected, and its length is on the response itself. Same status
+    // and same tags as the redirect above - which is the point, one byte counter covering both shapes.
+    var server = CreateServer(signedLinks: false);
+    myS3.Objects[GetPathKey("/real/a.jar")] = ([.. "a.jar"u8], "application/java-archive", null);
+    using var metrics = new RequestMetricRecorder(server.Services);
+
+    using (var miss = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method))
+    {
+      Assert.Equal(HttpStatusCode.OK, miss.StatusCode);
+      AssertStatusHeader(miss, CachingProxyStatus.MISS);
+      Assert.Equal("a.jar", await miss.Content.ReadAsStringAsync());
+    }
+
+    Assert.Equal([("MISS", 5L)], metrics.ContentBytes);
+  }
+
+  [Fact]
+  public async Task Content_Metric_Counts_No_Bytes_For_A_Head()
+  {
+    // A HEAD of an object too large to inline is answered from memory with the object's full size in its
+    // Content-Length - and sends none of it, nor a redirect to fetch it. So the request counts and the
+    // bytes do not, however big the object; the GET that follows is what delivers it.
+    var server = CreateServer(signedLinks: false);
+    myS3.Objects[GetPathKey("/real/a.jar")] = (ourLargeBody, "application/java-archive", null);
+    using var metrics = new RequestMetricRecorder(server.Services);
+
+    using (var head = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Head.Method))
+    {
+      Assert.Equal(HttpStatusCode.OK, head.StatusCode);
+      AssertStatusHeader(head, CachingProxyStatus.MISS);
+      Assert.Equal(ourLargeBody.Length, head.Content.Headers.ContentLength);
+    }
+
+    using (var get = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method))
+    {
+      Assert.Equal(HttpStatusCode.RedirectKeepVerb, get.StatusCode);
+      AssertStatusHeader(get, CachingProxyStatus.MISS);
+    }
+
+    Assert.Equal(["MISS", "MISS"], metrics.TagValues("status"));
+    Assert.Equal([("MISS", (long)ourLargeBody.Length)], metrics.ContentBytes);
+  }
+
+  [Fact]
+  public async Task Content_Metric_Counts_Nothing_For_A_Heads_Re_Upload()
+  {
+    // The heaviest request that counts nothing: this HEAD's revalidation found the object changed, so it
+    // pulled the whole entity from the upstream and re-uploaded it to the bucket. The client is handed a
+    // head and no body, and is not redirected either, so nothing was served to it - however much traffic
+    // the request moved behind the scenes.
+    var server = CreateServer(signedLinks: false, refreshAfter: TimeSpan.FromMinutes(1));
+    var key = GetPathKey("/real/revalidate.txt");
+    myS3.Objects[key] = ([.. "v1"u8], "text/plain", "\"v1\"");
+    myS3.CreatedAt[key] = DateTimeOffset.UtcNow - TimeSpan.FromHours(1);
+    upstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.Ok;
+    upstreamServer.RevalidateContent = "v2-longer";
+    using var metrics = new RequestMetricRecorder(server.Services);
+
+    using (var head = await server.CreateRequest("/real/revalidate.txt").SendAsync(HttpMethod.Head.Method))
+    {
+      Assert.Equal(HttpStatusCode.OK, head.StatusCode);
+      AssertStatusHeader(head, CachingProxyStatus.REVALIDATED);
+      Assert.Empty(await head.Content.ReadAsByteArrayAsync());
+    }
+
+    Assert.Equal(1, myS3.PutObjectCalls);
+    Assert.Equal("v2-longer", Encoding.UTF8.GetString(myS3.Objects[key].Body));
+    Assert.Equal(["REVALIDATED"], metrics.TagValues("status"));
+    Assert.Empty(metrics.ContentBytes);
+  }
+
+  [Fact]
   public async Task Get_Miss_Stores_Upstream_Uri_In_Object_Metadata()
   {
     // The S3 key is an opaque hash, so the original upstream URI is preserved as the object's

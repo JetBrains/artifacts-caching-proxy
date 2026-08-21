@@ -11,6 +11,8 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
+using Microsoft.Net.Http.Headers;
+using EntityTagHeaderValue = System.Net.Http.Headers.EntityTagHeaderValue;
 
 namespace JetBrains.CachingProxy;
 
@@ -130,7 +132,10 @@ public partial class RemoteProxy(
   /// Content-Encoding off the response) and must dispose it; in every other case the request is
   /// fully handled, the response (if any) is disposed internally, and <c>null</c> is returned.
   /// </summary>
-  public async Task<HttpResponseMessage?> ProcessAsync(HttpContext context, string cacheKey, CacheDuration cacheDuration, Uri upstreamUri, UpstreamAuth? auth = null, CachingRule? rule = null, CachingProfile? profile = null)
+  /// <param name="writeBodyHead">Whether the head for a returned body is this method's to write. False for
+  /// a caller that discards it and writes its own (the S3 backend redirects to the bucket instead), which
+  /// is also what keeps such a request from being counted twice.</param>
+  public async Task<HttpResponseMessage?> ProcessAsync(HttpContext context, string cacheKey, CacheDuration cacheDuration, Uri upstreamUri, UpstreamAuth? auth = null, CachingRule? rule = null, CachingProfile? profile = null, bool writeBodyHead = true)
   {
     var isHead = HttpMethods.IsHead(context.Request.Method);
 
@@ -279,7 +284,11 @@ public partial class RemoteProxy(
         return null;
       }
 
-      await SetStatusAsync(context, CachingProxyStatus.MISS, responseEntry);
+      // The head for a body the caller streams itself, so the caller's transfer is what counts the bytes it
+      // relays. And not written at all for a caller that replaces it (the S3 backend Clear()s it and sends
+      // a redirect), which would otherwise report the same request twice.
+      if (writeBodyHead)
+        await SetStatusAsync(context, CachingProxyStatus.MISS, responseEntry, countContentBytes: false);
       transferOwnership = true;
       return response;
     }
@@ -469,15 +478,56 @@ public partial class RemoteProxy(
     return contentEncoding is null or "gzip" ? ContentEncodingValidation.Ok : ContentEncodingValidation.Unsupported;
   }
 
-  public async ValueTask SetStatusAsync(HttpContext context, CachingProxyStatus status, CachedResponse response)
+  /// <summary>
+  /// Writes a cached head as the response and reports it, counting the content it delivers.
+  /// </summary>
+  /// <param name="countContentBytes">Pass false for a head that only announces a body still to be
+  /// transferred: what it declares is what the upstream said, not what goes out to the client (and a
+  /// chunked upstream declares nothing at all), so the transfer reports the bytes itself once they have
+  /// gone - see <see cref="AddContentBytes"/>. The request is still counted here, exactly once.</param>
+  public async ValueTask SetStatusAsync(HttpContext context, CachingProxyStatus status, CachedResponse response,
+    bool countContentBytes = true)
   {
-    SetStatusHeader(context, status);
+    SetStatusHeader(context, status, countContentBytes ? ContentLengthOf(response) : null);
     await response.InvokeAsync(context);
   }
 
-  public void SetStatusHeader(HttpContext context, CachingProxyStatus status)
+  // The size of the content a cached head stands for. A redirect describes something it does not carry, so
+  // it states that size on an internal header instead (see S3CachingMiddleware.RedirectToBucket); anything
+  // else describes its own body with a Content-Length.
+  private static long? ContentLengthOf(CachedResponse response)
+  {
+    if (response.Headers.TryGetValue(CachingProxyConstants.CachedContentLengthHeader, out var values) &&
+        values.Count > 0 && HeaderUtilities.TryParseNonNegativeInt64(values[0], out long cachedContentLength))
+      return cachedContentLength;
+
+    return response.Headers.ContentLength;
+  }
+
+  /// <summary>
+  /// Reports the content bytes a response delivered, for a head written earlier with
+  /// <c>countContentBytes: false</c> or with none of its own (see <c>CachingProxy.ServeFileAsync</c>). The
+  /// status must be the one that head reported, or the bytes land on a series no request counted.
+  /// </summary>
+  public void AddContentBytes(HttpContext context, CachingProxyStatus status, long bytes)
+  {
+    // The same rule the head path applies below, and it has to hold here too: a HEAD sends no body whatever
+    // was written for it, since the framework declares the length and discards the writes. So a HEAD that
+    // streamed a replacement through to disk, or was answered off a stored copy, delivered none of it.
+    if (HttpMethods.IsHead(context.Request.Method)) return;
+
+    metrics.AddContentBytes(status, RemoteServers.GetRemoteServer(context)?.ProfileName,
+      context.User.Identity?.IsAuthenticated == true, bytes);
+  }
+
+  public void SetStatusHeader(HttpContext context, CachingProxyStatus status, long? cachedContentLength)
   {
     context.Response.Headers[CachingProxyConstants.StatusHeader] = status.ToString();
+    // A HEAD describes a body it does not send: its Content-Length is the size of an entity the client
+    // still has to fetch, so no content went out - and an OCI client HEADs nearly every blob and manifest
+    // it pulls, so that is not a rounding error.
+    if (HttpMethods.IsHead(context.Request.Method))
+      cachedContentLength = null;
     // Both extra dimensions are read off the request here rather than passed in, so the call sites that
     // report a status stay untouched. Routing runs before either storage middleware, and every path here is
     // behind a GetRemoteServer gate, so the prefix is present even on the BAD_REQUEST paths above.
@@ -488,7 +538,8 @@ public partial class RemoteProxy(
     // label cannot disagree with the response it counts.
     metrics.IncrementRequests(status,
       RemoteServers.GetRemoteServer(context)?.ProfileName,
-      context.User.Identity?.IsAuthenticated == true);
+      context.User.Identity?.IsAuthenticated == true,
+      cachedContentLength);
   }
 
   private async Task<HttpResponseMessage?> InternalServerError(HttpContext context, EventId eventId, string message, Exception? exception = null)

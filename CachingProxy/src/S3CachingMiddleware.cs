@@ -170,13 +170,15 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
                 using (var fresh = result.Response!)
                 {
                   context.Response.Clear();
-                  await StoreInBucketAsync(s3Key, upstreamUri, fresh, context.RequestAborted);
+                  var freshContentLength = await StoreInBucketAsync(s3Key, upstreamUri, fresh, context.RequestAborted);
+                  // A HEAD is answered with the object's metadata and no body, so this re-upload delivered
+                  // nothing to the client, however much it moved.
                   if (isHead)
                     await remoteProxy.SetStatusAsync(context, CachingProxyStatus.REVALIDATED,
                       await responseCache.PutStatusCode(verbKey, new CachedResponse(fresh) { StatusCode = HttpStatusCode.OK },
                         remoteServer.CacheDuration, context.RequestAborted));
                   else
-                    await RedirectToBucket(CachingProxyStatus.REVALIDATED);
+                    await RedirectToBucket(CachingProxyStatus.REVALIDATED, freshContentLength);
                 }
                 return;
 
@@ -237,23 +239,28 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
             return;
           }
 
-          await RedirectToBucket(probeStatus);
+          // The object's own size comes from Content-Range's total, like the HEAD above: the response's
+          // Content-Length is the prefetched slice, which would report every large object as one inline
+          // window's worth of bytes.
+          await RedirectToBucket(probeStatus, contentRange?.Length);
           return;
         }
         catch (AmazonServiceException ex) when (ex.StatusCode is HttpStatusCode.NotFound) { }
       }
 
+      // No head for the body: it is uploaded, not streamed to the client, and the redirect below is the
+      // response (and the one report) this request gets.
       using var response = await remoteProxy.ProcessAsync(context, s3Key, remoteServer.CacheDuration, upstreamUri,
-        auth: remoteServer.Auth, rule: rule, profile: remoteServer.Profile);
+        auth: remoteServer.Auth, rule: rule, profile: remoteServer.Profile, writeBodyHead: false);
 
       // A non-null response is a GET MISS body for us to stream and persist; otherwise it is handled.
       if (response == null) return;
 
       context.Response.Clear();
 
-      await StoreInBucketAsync(s3Key, upstreamUri, response, context.RequestAborted);
+      var contentLength = await StoreInBucketAsync(s3Key, upstreamUri, response, context.RequestAborted);
 
-      await RedirectToBucket(CachingProxyStatus.MISS);
+      await RedirectToBucket(CachingProxyStatus.MISS, contentLength);
     }
     catch (OperationCanceledException)
     {
@@ -315,12 +322,18 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
 
     return;
 
-    async ValueTask RedirectToBucket(CachingProxyStatus status)
+    async ValueTask RedirectToBucket(CachingProxyStatus status, long? contentLength)
     {
       var cachingResponse = new CachedResponse(HttpStatusCode.RedirectKeepVerb, new HeaderDictionary())
       {
         Headers = { Location = myBucketBaseUrl + s3Key }
       };
+      // A redirect carries no body of its own, so the size of what it points at rides along as internal
+      // bookkeeping for the byte metric (stripped again before the response goes out, see
+      // CachedResponse.InvokeAsync). Omitted when the size is unknown, so nothing counts a guess.
+      if (contentLength is >= 0)
+        cachingResponse.Headers[CachingProxyConstants.CachedContentLengthHeader] =
+          contentLength.Value.ToString(CultureInfo.InvariantCulture);
       // Only a GET redirects (a HEAD is served from memory), so the redirect always belongs under the
       // verb-specific key and is never replayed to a HEAD.
       await remoteProxy.SetStatusAsync(context, status,
@@ -396,7 +409,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
   /// through; when it did not (e.g. chunked transfer) we first spool the body to a temp file so the
   /// SDK gets a real length and does not buffer the whole body in memory.
   /// </summary>
-  private async Task StoreInBucketAsync(string s3Key, Uri requestUri, HttpResponseMessage response, CancellationToken cancellationToken)
+  private async Task<long> StoreInBucketAsync(string s3Key, Uri requestUri, HttpResponseMessage response, CancellationToken cancellationToken)
   {
     await using var body = await response.Content.ReadAsStreamAsync(cancellationToken);
     var contentLength = response.Content.Headers.ContentLength;
@@ -453,6 +466,10 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
           upstreamLastModified.ToString("O", CultureInfo.InvariantCulture);
 
       await amazonS3.PutObjectAsync(put, cancellationToken);
+
+      // The length that was uploaded, taken from the request: PutObjectResponse carries the length of
+      // the (empty) HTTP response, not of the object.
+      return contentLength.Value;
     }
     finally
     {

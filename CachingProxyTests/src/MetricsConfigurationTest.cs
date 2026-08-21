@@ -247,6 +247,37 @@ public class MetricsConfigurationTest(ITestOutputHelper output)
   }
 
   /// <summary>
+  /// The same, for the byte counter that rides along with the request counter. Its exported name is what
+  /// makes it queryable at all - the instrument is <c>caching_content_bytes</c> and the exporter appends
+  /// <c>_total</c>, which no call site spells out - and its labels have to be the request counter's own, or
+  /// bytes cannot be divided by requests to get an average object size.
+  /// </summary>
+  [Fact]
+  public async Task ContentCounter_ExportsTheSameLabelsAsTheRequestCounter()
+  {
+    using var scrape = await MetricsScrape.Of(meter =>
+    {
+      var metrics = new CachingProxyMetrics(new PlainMeterFactory(meter), BucketModeConfig());
+      metrics.IncrementRequests(CachingProxyStatus.HIT, "maven", authenticated: true, cachedContentLength: 4096);
+      // The instrument's other entry point, for a transfer reporting what it delivered after the fact. It
+      // has to land on the very same series, or bytes would split across two of them by how they happened
+      // to be reported.
+      metrics.AddContentBytes(CachingProxyStatus.HIT, "maven", authenticated: true, bytes: 512);
+      // No length: a request that delivered no content must leave the byte counter alone rather than
+      // contribute a zero, which would still create the series and read as "an object of size 0".
+      metrics.IncrementRequests(CachingProxyStatus.NEGATIVE_MISS, "maven", authenticated: true);
+    });
+
+    Assert.Equal(scrape.LabelsOf("caching_requests_total"), scrape.LabelsOf("caching_content_bytes_total"));
+    var series = Assert.Single(scrape.SampleLines,
+      l => l.StartsWith("caching_content_bytes_total{", StringComparison.Ordinal));
+    Assert.Contains(@"status=""HIT""", series);
+    // Both reports summed onto that one series. The value is the first field after the labels, the
+    // exposition putting a scrape timestamp after it.
+    Assert.Equal("4608", series[(series.LastIndexOf('}') + 1)..].Trim().Split(' ')[0]);
+  }
+
+  /// <summary>
   /// Hands <see cref="CachingProxyMetrics"/> a plain <see cref="Meter"/>, which the scrape's provider
   /// subscribes to by name. A Meter from a real <see cref="IMeterFactory"/> carries that factory as its
   /// Scope, and a provider built from another DI container may ignore it - the counter would then be absent
@@ -272,7 +303,8 @@ public class MetricsConfigurationTest(ITestOutputHelper output)
     // A self-imposed ceiling, well under any sample_limit a deployment is likely to set. The real cap lives
     // in someone else's scrape config and is not ours to raise, so this is the one number we control. Raised
     // once, when caching_requests gained its profile and authenticated dimensions: 72 series of one sample.
-    const int sampleBudget = 1100;
+    // Raised again for caching_content_bytes, which repeats that cross-product for another 72.
+    const int sampleBudget = 1200;
 
     using var scrape = await MetricsScrape.Of(meter =>
     {
@@ -321,10 +353,12 @@ public class MetricsConfigurationTest(ITestOutputHelper output)
           new KeyValuePair<string, object?>("http.request.method", method),
           new KeyValuePair<string, object?>("http.response.status_code", status));
 
+      // With a content length throughout, so the byte counter saturates the same cross-product rather
+       // than staying absent from the scrape it has to fit in.
       foreach (var status in Enum.GetValues<CachingProxyStatus>())
       foreach (var profile in ourProfiles)
       foreach (var authenticated in ourAuthenticated)
-        requests.IncrementRequests(status, profile, authenticated);
+        requests.IncrementRequests(status, profile, authenticated, cachedContentLength: 1024);
     });
 
     output.WriteLine($"total samples: {scrape.TotalSamples}");
@@ -334,9 +368,10 @@ public class MetricsConfigurationTest(ITestOutputHelper output)
     // Non-vacuous: a counter the provider never subscribed to would simply be absent, lowering the total and
     // passing. One sample per series for a counter, so this is the cross-product exactly - and it fails if a
     // view ever starts collapsing one of the dimensions.
-    Assert.Equal(
-      Enum.GetValues<CachingProxyStatus>().Length * ourProfiles.Length * ourAuthenticated.Length,
-      scrape.SamplesOf("caching_requests_total"));
+    var requestSeries = Enum.GetValues<CachingProxyStatus>().Length * ourProfiles.Length * ourAuthenticated.Length;
+    Assert.Equal(requestSeries, scrape.SamplesOf("caching_requests_total"));
+    // The byte counter doubles that cross-product: same tags, so same series count, one sample each.
+    Assert.Equal(requestSeries, scrape.SamplesOf("caching_content_bytes_total"));
 
     Assert.True(scrape.TotalSamples <= sampleBudget,
       $"exposition would publish {scrape.TotalSamples} samples, over the {sampleBudget} budget");

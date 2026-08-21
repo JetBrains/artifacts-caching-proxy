@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Diagnostics.Metrics;
 using System.IO;
 
@@ -10,12 +11,17 @@ public class CachingProxyMetrics
   public static readonly string MeterName = typeof(CachingProxyMetrics).Namespace!;
 
   private readonly Counter<long> myRequestsCounter;
+  private readonly Counter<long> myContentCounter;
   private readonly Counter<long> myRedirectSignatureCounter;
 
   public CachingProxyMetrics(IMeterFactory meterFactory, CachingProxyConfig config)
   {
     Meter = meterFactory.Create(MeterName);
     myRequestsCounter = Meter.CreateCounter<long>("caching_requests");
+    // Content bytes delivered to clients: what this service wrote to a response body, whether it came off
+    // a stored copy or straight from an upstream on its way into the cache, plus what a redirected client
+    // is sent to fetch from the bucket. Bodies only - a HEAD, a 304 or an error head delivers none.
+    myContentCounter = Meter.CreateCounter<long>("caching_content_bytes");
     myRedirectSignatureCounter = Meter.CreateCounter<long>("caching_redirect_signature_verifications");
 
     // Headroom on the volume the cache writes to. This is what actually runs out: in disk mode the cache
@@ -79,9 +85,31 @@ public class CachingProxyMetrics
   /// <param name="status">The outcome the request was served with.</param>
   /// <param name="profile">The CachingProfiles key, or null for a prefix that declares none.</param>
   /// <param name="authenticated">Whether the inbound request carried a credential we validated.</param>
-  public void IncrementRequests(CachingProxyStatus status, string? profile, bool authenticated)
+  /// <param name="cachedContentLength">The content this response delivers, when the head already knows the
+  /// figure: a body it carries in full, or the object a redirect sends the client to fetch. Null when it
+  /// delivers none (a HEAD, an error) or when only the transfer will know how much went out, which reports
+  /// it through <see cref="AddContentBytes"/>. Reported on a second counter carrying the same tags, so
+  /// bytes served can be read by status, profile and inbound auth exactly as requests are.</param>
+  public void IncrementRequests(CachingProxyStatus status, string? profile, bool authenticated, long? cachedContentLength = null)
   {
-    myRequestsCounter.Add(1,
+    var tagList = TagsFor(status, profile, authenticated);
+    myRequestsCounter.Add(1, tagList);
+    if (cachedContentLength.HasValue)
+      myContentCounter.Add(cachedContentLength.Value, tagList);
+  }
+
+  /// <summary>
+  /// The content bytes a response turned out to deliver, for the transfers whose head could not say: a body
+  /// relayed from an upstream (a chunked one declares no length at all), and a stored copy served through a
+  /// framework that answers conditional and ranged requests itself, sending a part of the file or none of
+  /// it. Counts no request of its own - the head already counted one - so the two counters stay
+  /// one-to-one on requests and differ only in bytes.
+  /// </summary>
+  public void AddContentBytes(CachingProxyStatus status, string? profile, bool authenticated, long bytes) =>
+    myContentCounter.Add(bytes, TagsFor(status, profile, authenticated));
+
+  private static TagList TagsFor(CachingProxyStatus status, string? profile, bool authenticated) =>
+    new(
       // Literals, not nameof(...): the exported label name is what queries and alerts are written against,
       // so a parameter rename must not be able to rename it. Pinned in MetricsConfigurationTest.
       new KeyValuePair<string, object?>("status", status.ToString()),
@@ -91,7 +119,6 @@ public class CachingProxyMetrics
       // A string, not the bool: boxing allocates on every request, and the exporter renders a tag value via
       // ToString(), so a bool would export as "True"/"False" instead of the conventional lower case.
       new KeyValuePair<string, object?>("authenticated", authenticated ? "true" : "false"));
-  }
 
   /// <summary>
   /// Records which key in the rotation ring validated a redirect signature (see

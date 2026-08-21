@@ -392,6 +392,103 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
   }
 
   [Fact]
+  public async Task Content_Metric_Counts_The_Bytes_Served_To_The_Client()
+  {
+    // Traffic delivered, wherever it came from: a MISS relays the body from the upstream and a HIT reads it
+    // off disk, and both hand the client the same 9 bytes, so both count them. The status is what tells the
+    // two apart afterwards.
+    using var metrics = new RequestMetricRecorder(myHost);
+
+    await AssertGetResponse("/real/sized.jar", HttpStatusCode.OK,
+      (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.MISS));
+    await AssertGetResponse("/real/sized.jar", HttpStatusCode.OK,
+      (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.HIT));
+
+    // A chunked upstream declares no length at all, so the MISS can only count what it actually relayed -
+    // the same 5 bytes the HIT then reads back off the file.
+    await AssertGetResponse("/real/a.jar", HttpStatusCode.OK,
+      (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.MISS));
+    await AssertGetResponse("/real/a.jar", HttpStatusCode.OK,
+      (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.HIT));
+
+    // A 404 serves a head and no content, so it counts a request and no bytes. Asserted in the same
+    // sequence as the rest, so a counter that fired on every request would have to place the extra
+    // measurement somewhere visible.
+    await AssertGetResponse("/real/not_found.txt", HttpStatusCode.NotFound,
+      (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_MISS));
+
+    Assert.Equal(["MISS", "HIT", "MISS", "HIT", "NEGATIVE_MISS"], metrics.TagValues("status"));
+    Assert.Equal([("MISS", 9L), ("HIT", 9L), ("MISS", 5L), ("HIT", 5L)], metrics.ContentBytes);
+    // The byte counter is sliced by the request counter's own dimensions, not a subset of them: traffic read
+    // by profile or by inbound auth has to be readable in bytes too.
+    Assert.Equal(["maven", "maven", "maven", "maven"], metrics.ContentTagValues("profile"));
+    Assert.Equal(["false", "false", "false", "false"], metrics.ContentTagValues("authenticated"));
+  }
+
+  [Fact]
+  public async Task Content_Metric_Counts_No_Bytes_For_A_Head()
+  {
+    // A HEAD delivers no content: it answers with the entity's length and none of its bytes. Counting what
+    // it advertises would add the whole HEAD volume to the traffic figure, and an OCI client HEADs nearly
+    // every blob it pulls. The two GETs around them serve the same artifact and count it each time.
+    using var metrics = new RequestMetricRecorder(myHost);
+
+    await AssertHeadResponse("/real/sized.jar", HttpStatusCode.OK,
+      message => AssertStatusHeader(message, CachingProxyStatus.MISS));
+    await AssertGetResponse("/real/sized.jar", HttpStatusCode.OK,
+      (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.MISS));
+    await AssertHeadResponse("/real/sized.jar", HttpStatusCode.OK,
+      message =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.HIT);
+        // Answered off the stored copy, with its full length declared - the number not being counted.
+        Assert.Equal(9, message.Content.Headers.ContentLength);
+      });
+    await AssertGetResponse("/real/sized.jar", HttpStatusCode.OK,
+      (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.HIT));
+
+    Assert.Equal(["MISS", "MISS", "HIT", "HIT"], metrics.TagValues("status"));
+    Assert.Equal([("MISS", 9L), ("HIT", 9L)], metrics.ContentBytes);
+  }
+
+  [Fact]
+  public async Task Content_Metric_Counts_What_A_Conditional_Or_Ranged_Request_Was_Sent()
+  {
+    // A stored copy is served by the framework, which answers conditional and ranged requests itself: a
+    // client that already holds the artifact gets a bodiless 304, a resumed download gets one range of it.
+    // Both are ordinary repository traffic - build tools revalidate, large pulls resume - so the counter
+    // has to follow what the response actually sent rather than the size of the file behind it.
+    myUpstreamServer.RevalidateETag = "\"stored-etag\"";
+    myUpstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.Ok;
+    myUpstreamServer.RevalidateContent = "0123456789";
+    using var metrics = new RequestMetricRecorder(myHost);
+
+    // The MISS that stores it, relaying all 10 bytes.
+    await AssertGetResponse("/real/revalidate.txt", HttpStatusCode.OK,
+      (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.MISS));
+
+    using (var notModified = await myServer.CreateRequest("/real/revalidate.txt")
+             .AddHeader("If-None-Match", "\"stored-etag\"").GetAsync())
+    {
+      Assert.Equal(HttpStatusCode.NotModified, notModified.StatusCode);
+      AssertStatusHeader(notModified, CachingProxyStatus.HIT);
+      Assert.Empty(await notModified.Content.ReadAsByteArrayAsync());
+    }
+
+    using (var partial = await myServer.CreateRequest("/real/revalidate.txt")
+             .AddHeader("Range", "bytes=0-3").GetAsync())
+    {
+      Assert.Equal(HttpStatusCode.PartialContent, partial.StatusCode);
+      AssertStatusHeader(partial, CachingProxyStatus.HIT);
+      Assert.Equal("0123", await partial.Content.ReadAsStringAsync());
+    }
+
+    // Three requests, three statuses; the 304 sent nothing and the 206 sent its four bytes.
+    Assert.Equal(["MISS", "HIT", "HIT"], metrics.TagValues("status"));
+    Assert.Equal([("MISS", 10L), ("HIT", 4L)], metrics.ContentBytes);
+  }
+
+  [Fact]
   public async Task A_Prefix_Cannot_Reach_Another_Prefixs_Upstream()
   {
     // MRI-4842 on the disk backend. /overlap is configured for the upstream's "wrong/" subpath, but the
@@ -1533,6 +1630,45 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
       Assert.Equal("v1", await hit.Content.ReadAsStringAsync());
     }
     Assert.Equal(upstreamHitsBefore, myUpstreamServer.RevalidateRequestCount);
+  }
+
+  [Fact]
+  public async Task Content_Metric_Counts_Both_Revalidation_Outcomes_Once()
+  {
+    // Both outcomes of a revalidation report status=REVALIDATED and both serve a body, but from different
+    // places: a 200 relays the replacement from the upstream, a 304 serves the copy already on disk. Each
+    // counts once, and the head that announced the replacement must not count on top of the transfer that
+    // delivered it.
+    var server = CreateRefreshAfterServer(TimeSpan.FromMinutes(1));
+    using var metrics = new RequestMetricRecorder(server.Services);
+    myUpstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.Ok;
+    myUpstreamServer.RevalidateContent = "v1";
+
+    using (var miss = await server.CreateRequest("/real/revalidate.txt").GetAsync())
+      AssertStatusHeader(miss, CachingProxyStatus.MISS);
+
+    // Past the window and the upstream has new content: the stored 2 bytes are replaced by 9, relayed to
+    // the client on the way in.
+    myTimeProvider.Advance(TimeSpan.FromMinutes(2));
+    myUpstreamServer.RevalidateContent = "v2-longer";
+    using (var replaced = await server.CreateRequest("/real/revalidate.txt").GetAsync())
+    {
+      AssertStatusHeader(replaced, CachingProxyStatus.REVALIDATED);
+      Assert.Equal("v2-longer", await replaced.Content.ReadAsStringAsync());
+    }
+
+    // Past it again, this time answered 304: the upstream sends no body, so the stored copy is what ships -
+    // the same 9 bytes, off disk this time.
+    myTimeProvider.Advance(TimeSpan.FromMinutes(2));
+    myUpstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.NotModified;
+    using (var kept = await server.CreateRequest("/real/revalidate.txt").GetAsync())
+    {
+      AssertStatusHeader(kept, CachingProxyStatus.REVALIDATED);
+      Assert.Equal("v2-longer", await kept.Content.ReadAsStringAsync());
+    }
+
+    Assert.Equal(["MISS", "REVALIDATED", "REVALIDATED"], metrics.TagValues("status"));
+    Assert.Equal([("MISS", 2L), ("REVALIDATED", 9L), ("REVALIDATED", 9L)], metrics.ContentBytes);
   }
 
   [Fact]

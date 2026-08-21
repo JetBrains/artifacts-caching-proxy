@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Globalization;
 using System.Net;
 using System.Net.Http;
@@ -53,6 +54,10 @@ public sealed record CachedResponse(HttpStatusCode StatusCode, IHeaderDictionary
   private static readonly string[] ourRegistryHeaders =
     [DockerContentDigestHeader, CachingProxyConstants.DockerApiVersionHeader];
 
+  // Internal bookkeeping that travels with a cached entry but must never be written back to a client.
+  private static readonly HashSet<string> ourExcludeHeaders =
+    new(StringComparer.OrdinalIgnoreCase) { CachingProxyConstants.CachedContentLengthHeader };
+
   public CachedResponse(HttpResponseMessage response) : this(response.StatusCode, new HeaderDictionary())
   {
     Headers.LastModified = response.Content.Headers.LastModified?.ToString("R");
@@ -88,7 +93,8 @@ public sealed record CachedResponse(HttpStatusCode StatusCode, IHeaderDictionary
   {
     foreach (var (key, value) in Headers)
     {
-      context.Response.Headers[key] = value;
+      if (!ourExcludeHeaders.Contains(key))
+        context.Response.Headers[key] = value;
     }
     context.Response.StatusCode = (int)StatusCode;
     SetCachingHeaderFor(context);
