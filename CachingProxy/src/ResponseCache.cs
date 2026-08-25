@@ -143,22 +143,31 @@ public class ResponseCache(IFusionCache cache, TimeProvider timeProvider, Cachin
   public ValueTask<CachedResponse?> GetCachedStatusCode(string cacheKey, CancellationToken cancellationToken = default) =>
     cache.GetOrDefaultAsync<CachedResponse>(cacheKey, token: cancellationToken);
 
-  public ValueTask<CachedResponse> PutStatusCode(string cacheKey, HttpStatusCode statusCode, CacheDuration cacheDuration, CancellationToken cancellationToken = default) =>
-    PutStatusCode(cacheKey, new CachedResponse(statusCode, new HeaderDictionary()), cacheDuration, cancellationToken);
+  public ValueTask<CachedResponse> PutStatusCode(string cacheKey, HttpStatusCode statusCode, CacheDuration cacheDuration, CancellationToken cancellationToken = default, TimeSpan? maxDuration = null) =>
+    PutStatusCode(cacheKey, new CachedResponse(statusCode, new HeaderDictionary()), cacheDuration, cancellationToken, maxDuration);
 
-  public async ValueTask<CachedResponse> PutStatusCode(string cacheKey, CachedResponse entry, CacheDuration cacheDuration, CancellationToken cancellationToken = default)
+  /// <summary>
+  /// Stores a response head to be replayed for its status's <see cref="CacheDuration"/>.
+  /// <para><paramref name="maxDuration"/> is the caller's freshness window (a matched
+  /// <see cref="CachingRule.RefreshAfter"/>) and caps every TTL below. A cached entry is replayed without
+  /// consulting the storage layer, which is the only place a window is enforced, so an entry that outlives
+  /// its window is served stale for the difference: an OCI manifest by tag (5 minutes) stored under a
+  /// status TTL of an hour is an hour stale. Null for an immutable path, which has no window to respect.</para>
+  /// </summary>
+  public async ValueTask<CachedResponse> PutStatusCode(string cacheKey, CachedResponse entry, CacheDuration cacheDuration, CancellationToken cancellationToken = default, TimeSpan? maxDuration = null)
   {
-    var cachingTime = cacheDuration.GetDuration(entry.StatusCode);
+    var cachingTime = CapAt(cacheDuration.GetDuration(entry.StatusCode), maxDuration);
     if (cachingTime == TimeSpan.Zero)
       return entry;
 
     // L2 (distributed/Redis) TTL is controlled by the global DistributedCacheDuration, but it is never
     // allowed to be shorter than the L1 TTL: the durable backing store must outlive the in-process copy.
-    var l2CachingTime = config.DistributedCacheDuration.GetDuration(entry.StatusCode);
+    // Capped first, or the window would hold only until L1 eviction and the entry would come back from L2.
+    var l2CachingTime = CapAt(config.DistributedCacheDuration.GetDuration(entry.StatusCode), maxDuration);
     var distributedCachingTime = l2CachingTime > cachingTime ? l2CachingTime : cachingTime;
     // Reporting the durable expiration keeps the header in the future for as long as the entry is
     // actually cached, instead of going stale once the in-memory copy is evicted.
-    var durableCachingTime = GetDurableDuration(cacheDuration, entry.StatusCode);
+    var durableCachingTime = GetDurableDuration(cacheDuration, entry.StatusCode, maxDuration);
     entry.Headers[CachingProxyConstants.CachedStatusHeader] = entry.StatusCode.ToString("D");
     entry.Headers[CachingProxyConstants.CachedUntilHeader] = (timeProvider.GetUtcNow() + durableCachingTime).ToString("R");
 
@@ -175,14 +184,18 @@ public class ResponseCache(IFusionCache cache, TimeProvider timeProvider, Cachin
   /// wired the entry survives L1 eviction and is re-served from L2 for the (never-shorter) L2
   /// TTL; otherwise it lives only for the L1 TTL. This is the lifetime the Cached-Until header
   /// and any externally-minted handle (e.g. an S3 presigned URL) must be sized against.
+  /// <paramref name="maxDuration"/> caps both tiers, as in <see cref="PutStatusCode(string,CachedResponse,CacheDuration,CancellationToken,TimeSpan?)"/>.
   /// </summary>
-  public TimeSpan GetDurableDuration(CacheDuration cacheDuration, HttpStatusCode statusCode)
+  public TimeSpan GetDurableDuration(CacheDuration cacheDuration, HttpStatusCode statusCode, TimeSpan? maxDuration = null)
   {
-    var cachingTime = cacheDuration.GetDuration(statusCode);
+    var cachingTime = CapAt(cacheDuration.GetDuration(statusCode), maxDuration);
     if (!cache.HasDistributedCache)
       return cachingTime;
 
-    var l2CachingTime = config.DistributedCacheDuration.GetDuration(statusCode);
+    var l2CachingTime = CapAt(config.DistributedCacheDuration.GetDuration(statusCode), maxDuration);
     return l2CachingTime > cachingTime ? l2CachingTime : cachingTime;
   }
+
+  private static TimeSpan CapAt(TimeSpan duration, TimeSpan? limit) =>
+    limit is { } max && max < duration ? max : duration;
 }

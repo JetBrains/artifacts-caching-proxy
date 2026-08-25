@@ -171,6 +171,42 @@ public class ResponseCacheTest
   }
 
   [Fact]
+  public async Task MaxDuration_CapsTheStatusTtl()
+  {
+    // The freshness window a caching rule declares bounds the entry regardless of the status TTL: a
+    // bucket-mode redirect for an OCI manifest by tag is stored under the 307 TTL (an hour in the
+    // regional deployments) but may only be replayed for the manifest's five minutes, because replaying
+    // it is precisely what skips the revalidation the window asks for.
+    const string key = "test-key";
+    var customDuration = _cacheDuration.Union(new CacheDuration
+    {
+      [HttpStatusCode.TemporaryRedirect] = TimeSpan.FromHours(1),
+    });
+    await _cache.PutStatusCode(key, HttpStatusCode.TemporaryRedirect, customDuration, maxDuration: TimeSpan.FromMinutes(5));
+
+    _timeProvider.Advance(TimeSpan.FromMinutes(5) - TimeSpan.FromSeconds(1));
+    Assert.NotNull(await _cache.GetCachedStatusCode(key));
+
+    _timeProvider.Advance(TimeSpan.FromSeconds(2));
+    Assert.Null(await _cache.GetCachedStatusCode(key));
+  }
+
+  [Fact]
+  public async Task MaxDuration_DoesNotExtendAShorterStatusTtl()
+  {
+    // A cap, not an override: a status TTL already inside the window keeps its own, shorter lifetime.
+    const string key = "test-key";
+    var customDuration = _cacheDuration.Union(new CacheDuration
+    {
+      [HttpStatusCode.OK] = TimeSpan.FromMinutes(1),
+    });
+    await _cache.PutStatusCode(key, HttpStatusCode.OK, customDuration, maxDuration: TimeSpan.FromMinutes(5));
+
+    _timeProvider.Advance(TimeSpan.FromMinutes(2));
+    Assert.Null(await _cache.GetCachedStatusCode(key));
+  }
+
+  [Fact]
   public async Task CustomCacheDuration_OverridesDefaultForNotFound()
   {
     const string key = "test-key";
@@ -347,6 +383,34 @@ public class ResponseCacheTest
     var entry = await cache.PutStatusCode("test-key", HttpStatusCode.OK, l1Duration);
 
     var expected = (_timeProvider.GetUtcNow() + TimeSpan.FromMinutes(10)).ToString("R");
+    Assert.Equal(expected, entry.Headers[CachingProxyConstants.CachedUntilHeader].ToString());
+  }
+
+  [Fact]
+  public async Task MaxDuration_CapsTheDistributedDurationToo()
+  {
+    // L2 is the tier that outlives L1, so a cap applied to L1 alone would only defer the problem: the
+    // entry would drop out of memory at the window and come straight back from the distributed cache.
+    var memoryCache = new MemoryCache(new MemoryCacheOptions
+    {
+      Clock = new TimeProviderClock(_timeProvider)
+    });
+    CachedResponseFormatter.Register();
+    var fusionCache = new FusionCache(new FusionCacheOptions(), memoryCache);
+    fusionCache.SetupDistributedCache(
+      new MemoryDistributedCache(Options.Create(new MemoryDistributedCacheOptions())),
+      new FusionCacheCysharpMemoryPackSerializer());
+
+    var l1Duration = new CacheDuration { [HttpStatusCode.OK] = TimeSpan.FromMinutes(30) };
+    var config = new CachingProxyConfig
+    {
+      DistributedCacheDuration = new CacheDuration { [HttpStatusCode.OK] = TimeSpan.FromMinutes(60) }
+    };
+    var cache = new ResponseCache(fusionCache, _timeProvider, config);
+
+    var entry = await cache.PutStatusCode("test-key", HttpStatusCode.OK, l1Duration, maxDuration: TimeSpan.FromMinutes(5));
+
+    var expected = (_timeProvider.GetUtcNow() + TimeSpan.FromMinutes(5)).ToString("R");
     Assert.Equal(expected, entry.Headers[CachingProxyConstants.CachedUntilHeader].ToString());
   }
 

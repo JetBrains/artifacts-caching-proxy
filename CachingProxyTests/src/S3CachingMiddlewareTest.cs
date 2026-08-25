@@ -49,16 +49,16 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   private readonly RemoteServers.RemoteServer myRemoteServer = new("/real", upstreamServer.Url, new CacheDuration());
 
   private TestServer CreateServer(bool signedLinks, TimeSpan? signedLinkTTL = null, int inlineThresholdBytes = TestInlineThresholdBytes,
-    CacheDuration? distributedCacheDuration = null, TimeSpan? refreshAfter = null)
+    CacheDuration? distributedCacheDuration = null, TimeSpan? refreshAfter = null, CacheDuration? prefixCacheDuration = null)
   {
     // When a freshness window is requested, drive it through a profile with a catch-all rule (so every
     // /real path is revalidated after the window) — mirroring how the disk tests exercise revalidation.
     var profiles = new Dictionary<string, CachingProfile>();
-    CachingProxyPrefix prefix = $"/real={upstreamServer.Url}";
+    CachingProxyPrefix prefix = new($"/real={upstreamServer.Url}", prefixCacheDuration);
     if (refreshAfter is { } ra)
     {
       profiles["fresh"] = new CachingProfile { Rules = [new CachingRule { Pattern = ".", RefreshAfter = ra }] };
-      prefix = new CachingProxyPrefix($"/real={upstreamServer.Url}", Profile: "fresh");
+      prefix = new CachingProxyPrefix($"/real={upstreamServer.Url}", prefixCacheDuration, Profile: "fresh");
     }
 
     var config = new CachingProxyConfig
@@ -142,6 +142,30 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     Assert.Equal(1, myS3.PutObjectCalls);
     Assert.True(myS3.Objects.TryGetValue(GetPathKey("/real/a.jar"), out var stored));
     Assert.Equal("a.jar", Encoding.UTF8.GetString(stored.Body));
+  }
+
+  [Fact]
+  public async Task Miss_Redirect_Is_Not_Cached_Past_The_Freshness_Window()
+  {
+    // The production shape this guards: the regional deployments cache a 307 for an hour, while an OCI
+    // manifest by tag is fresh for five minutes. The cached redirect is replayed without probing the
+    // bucket, and the probe is where the window is enforced, so a redirect outliving the window is a
+    // manifest served stale for the difference — an hour instead of five minutes.
+    var window = TimeSpan.FromMinutes(5);
+    var server = CreateServer(signedLinks: true, refreshAfter: window,
+      prefixCacheDuration: new CacheDuration { [HttpStatusCode.RedirectKeepVerb] = TimeSpan.FromHours(1) });
+
+    var before = DateTimeOffset.UtcNow;
+    using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
+    var after = DateTimeOffset.UtcNow;
+
+    Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
+    AssertStatusHeader(response, CachingProxyStatus.MISS);
+
+    var until = DateTimeOffset.ParseExact(
+      response.Headers.GetValues(CachingProxyConstants.CachedUntilHeader).Single(), "R", CultureInfo.InvariantCulture);
+    // "R" truncates to the second, so the reported instant can sit just under the window's start.
+    Assert.InRange(until, before + window - TimeSpan.FromSeconds(1), after + window);
   }
 
   [Fact]

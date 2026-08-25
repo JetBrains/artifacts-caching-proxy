@@ -89,6 +89,12 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
     if (rule?.RefreshAfter is { } window)
       context.Items[CachingProxyConstants.RefreshAfterItemKey] = window;
 
+    // The window also caps every cache entry this request writes. It is enforced against the object's
+    // stored date when the bucket is probed, and a cached entry is replayed instead of probing, so an
+    // entry allowed to outlive the window is served stale for the difference - a manifest by tag held for
+    // the 307's or 200's status TTL rather than its 5 minutes. Null for an immutable path: no window, no cap.
+    var maxCacheDuration = rule?.RefreshAfter;
+
     // A content-negotiated endpoint keeps one object per requested representation (see GetCacheVariant),
     // so the variant is folded into the object key — and thereby into the in-memory keys derived from it.
     var s3Key = upstreamUri.ManglePath(RemoteProxy.GetCacheVariant(context, rule));
@@ -176,7 +182,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
                   if (isHead)
                     await remoteProxy.SetStatusAsync(context, CachingProxyStatus.REVALIDATED,
                       await responseCache.PutStatusCode(verbKey, new CachedResponse(fresh) { StatusCode = HttpStatusCode.OK },
-                        remoteServer.CacheDuration, context.RequestAborted));
+                        remoteServer.CacheDuration, context.RequestAborted, maxCacheDuration));
                   else
                     await RedirectToBucket(CachingProxyStatus.REVALIDATED, freshContentLength);
                 }
@@ -185,7 +191,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
               case RevalidationOutcome.Gone:
                 await amazonS3.DeleteObjectAsync(new DeleteObjectRequest { BucketName = config.S3!.BucketName, Key = s3Key }, context.RequestAborted);
                 await remoteProxy.SetStatusAsync(context, CachingProxyStatus.NEGATIVE_MISS,
-                  await responseCache.PutStatusCode(s3Key, HttpStatusCode.NotFound, remoteServer.CacheDuration, context.RequestAborted));
+                  await responseCache.PutStatusCode(s3Key, HttpStatusCode.NotFound, remoteServer.CacheDuration, context.RequestAborted, maxCacheDuration));
                 return;
 
               case RevalidationOutcome.NotModified:
@@ -217,7 +223,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
             var cachingResponse = new CachedResponse(s3Object) { StatusCode = HttpStatusCode.OK, Body = body };
 
             await remoteProxy.SetStatusAsync(context, probeStatus,
-              await responseCache.PutStatusCode(s3Key, cachingResponse, remoteServer.CacheDuration, context.RequestAborted));
+              await responseCache.PutStatusCode(s3Key, cachingResponse, remoteServer.CacheDuration, context.RequestAborted, maxCacheDuration));
             return;
           }
 
@@ -235,7 +241,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
               }
             };
             await remoteProxy.SetStatusAsync(context, probeStatus,
-              await responseCache.PutStatusCode(verbKey, head, remoteServer.CacheDuration, context.RequestAborted));
+              await responseCache.PutStatusCode(verbKey, head, remoteServer.CacheDuration, context.RequestAborted, maxCacheDuration));
             return;
           }
 
@@ -337,7 +343,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
       // Only a GET redirects (a HEAD is served from memory), so the redirect always belongs under the
       // verb-specific key and is never replayed to a HEAD.
       await remoteProxy.SetStatusAsync(context, status,
-        await responseCache.PutStatusCode(verbKey, cachingResponse, remoteServer.CacheDuration, context.RequestAborted));
+        await responseCache.PutStatusCode(verbKey, cachingResponse, remoteServer.CacheDuration, context.RequestAborted, maxCacheDuration));
     }
   }
 

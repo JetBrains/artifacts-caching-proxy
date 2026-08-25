@@ -194,7 +194,7 @@ public class CachingProxy
         // The 404 replaces any stored head under the same key, so nothing points at the deleted body.
         DeleteCachedVariants(upstreamUri, variant);
         await myRemoteProxy.SetStatusAsync(context, CachingProxyStatus.NEGATIVE_MISS,
-          await myResponseCache.PutStatusCode(cacheKey, HttpStatusCode.NotFound, remoteServer.CacheDuration, context.RequestAborted));
+          await myResponseCache.PutStatusCode(cacheKey, HttpStatusCode.NotFound, remoteServer.CacheDuration, context.RequestAborted, rule?.RefreshAfter));
         return;
 
       case RevalidationOutcome.UpstreamError:

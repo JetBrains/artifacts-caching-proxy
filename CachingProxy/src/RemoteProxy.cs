@@ -139,6 +139,10 @@ public partial class RemoteProxy(
   {
     var isHead = HttpMethods.IsHead(context.Request.Method);
 
+    // A cached entry is replayed without re-asking the upstream, so none of them may outlive the rule's
+    // freshness window - see ResponseCache.PutStatusCode. Null for an immutable path, which has no window.
+    var maxCacheDuration = rule?.RefreshAfter;
+
     var cachedResponse = await responseCache.GetCachedStatusCode(cacheKey, context.RequestAborted);
     switch (cachedResponse?.StatusCode)
     {
@@ -216,7 +220,7 @@ public partial class RemoteProxy(
 
       logger.LogWarning(Event.Timeout, "Timeout requesting {UpstreamUri}", upstreamUri);
 
-      var entry = await responseCache.PutStatusCode(cacheKey, HttpStatusCode.GatewayTimeout, cacheDuration, context.RequestAborted);
+      var entry = await responseCache.PutStatusCode(cacheKey, HttpStatusCode.GatewayTimeout, cacheDuration, context.RequestAborted, maxCacheDuration);
       await SetStatusAsync(context, CachingProxyStatus.NEGATIVE_MISS, entry with { StatusCode = HttpStatusCode.NotFound });
       return null;
     }
@@ -228,7 +232,7 @@ public partial class RemoteProxy(
     {
       logger.LogWarning(e, "Exception requesting {UpstreamUri}: {Message}", upstreamUri, e.Message);
 
-      var entry = await responseCache.PutStatusCode(cacheKey, HttpStatusCode.ServiceUnavailable, cacheDuration, context.RequestAborted);
+      var entry = await responseCache.PutStatusCode(cacheKey, HttpStatusCode.ServiceUnavailable, cacheDuration, context.RequestAborted, maxCacheDuration);
       await SetStatusAsync(context, CachingProxyStatus.NEGATIVE_MISS, entry with { StatusCode = HttpStatusCode.NotFound });
       return null;
     }
@@ -238,7 +242,7 @@ public partial class RemoteProxy(
     {
       if (!response.IsSuccessStatusCode)
       {
-        var entry = await responseCache.PutStatusCode(cacheKey, response.StatusCode, cacheDuration, context.RequestAborted);
+        var entry = await responseCache.PutStatusCode(cacheKey, response.StatusCode, cacheDuration, context.RequestAborted, maxCacheDuration);
         if (ClientFacingStatus(response.StatusCode) is var statusCode && statusCode != response.StatusCode)
         {
           entry = entry with { StatusCode = statusCode };
@@ -280,7 +284,7 @@ public partial class RemoteProxy(
       if (isHead)
       {
         await SetStatusAsync(context, CachingProxyStatus.MISS,
-          await responseCache.PutStatusCode(cacheKey, responseEntry, cacheDuration, context.RequestAborted));
+          await responseCache.PutStatusCode(cacheKey, responseEntry, cacheDuration, context.RequestAborted, maxCacheDuration));
         return null;
       }
 
