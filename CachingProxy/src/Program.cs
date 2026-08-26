@@ -130,10 +130,20 @@ public static class Program
       // fails and Duende falls back to no token caching.
       ClientCredentialsTokenFormatter.Register();
 
+      // Parsed up front rather than handed over as a string, so the timeouts below are explicit. One
+      // multiplexer carries the whole process's L2 traffic, so a command going nowhere has to vacate
+      // the connection quickly - anything still queued behind a stalled read waits it out.
+      var redisOptions = ConfigurationOptions.Parse(redis.ConnectionString);
+      // Server-side latency runs ~33ms, so 1s is ample headroom while giving up on a doomed command
+      // five times sooner than StackExchange.Redis' 5s default.
+      redisOptions.SyncTimeout = 1000;
+      redisOptions.AsyncTimeout = 1000;
+      // An unreachable Redis at boot must not stop the proxy starting: it degrades to L1-only.
+      redisOptions.AbortOnConnectFail = false;
+
       // Single shared connection used by both the L2 cache and the health check below. Resolves
       // lazily (on first cache/health-check use), so startup is not blocked on connecting to Redis.
-      services.AddSingleton<IConnectionMultiplexer>(
-        _ => ConnectionMultiplexer.Connect(redis.ConnectionString));
+      services.AddSingleton<IConnectionMultiplexer>(_ => ConnectionMultiplexer.Connect(redisOptions));
 
       services.AddStackExchangeRedisCache(_ => { });
       services.AddOptions<RedisCacheOptions>()
@@ -149,7 +159,25 @@ public static class Program
 
       fusionCacheBuilder
         .WithSerializer(new FusionCacheCysharpMemoryPackSerializer())
-        .WithRegisteredDistributedCache();
+        .WithRegisteredDistributedCache()
+        // A saturated Redis connection must not hold up a request: L2 is an optimization, so a proxy
+        // that cannot reach it should fall through to S3/upstream rather than wait out
+        // StackExchange.Redis' 5s command timeout. Only the hard timeout is load-bearing here - the
+        // soft one applies solely with fail-safe enabled and a stale value to serve, and fail-safe is off.
+        .WithDefaultEntryOptions(options =>
+        {
+          options.DistributedCacheHardTimeout = TimeSpan.FromMilliseconds(500);
+          // Sets and refreshes stop blocking the request that triggered them.
+          options.AllowBackgroundDistributedCacheOperations = true;
+          // By default a stale L1 entry still costs an L2 read, on the chance another node wrote a
+          // newer one. With L1 TTLs well short of L2 that fires on most repeat requests, and it is
+          // what makes L2 reads outnumber served requests several times over while ~93% of them find
+          // nothing. Freshness here does not depend on that read: a window is enforced by revalidating
+          // against the upstream, and PutStatusCode already documents replaying an entry without
+          // consulting the storage layer. The cost is that one task picks up another's refreshed entry
+          // only once its own L1 copy expires - inside the staleness the status TTLs already allow.
+          options.SkipDistributedCacheReadWhenStale = true;
+        });
     }
 
     services

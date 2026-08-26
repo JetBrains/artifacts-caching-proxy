@@ -435,4 +435,25 @@ public class ResponseCacheTest
 
     Assert.Equal("max-age=31536000, private", CachedResponse.GetCachingHeader(context).ToString());
   }
+
+  // Guards the L2 settings the app hangs off DefaultEntryOptions (hard timeout, background writes,
+  // skip-read-when-stale). FusionCache uses explicitly-passed options as-is, so PutStatusCode has to
+  // build its own from those defaults or it silently drops every one of them and puts Redis back on
+  // the critical path. SkipMemoryCacheWrite only stands in for them here: it is the one such option
+  // whose effect is observable with no distributed cache wired up.
+  [Fact]
+  public async Task PutStatusCode_CarriesDefaultEntryOptions()
+  {
+    var memoryCache = new MemoryCache(new MemoryCacheOptions
+    {
+      Clock = new TimeProviderClock(_timeProvider)
+    });
+    var options = new FusionCacheOptions();
+    options.DefaultEntryOptions.SkipMemoryCacheWrite = true;
+    var cache = new ResponseCache(new FusionCache(options, memoryCache), _timeProvider, new CachingProxyConfig());
+
+    await cache.PutStatusCode("test-key", HttpStatusCode.OK, _cacheDuration);
+
+    Assert.Null(await cache.GetCachedStatusCode("test-key"));
+  }
 }

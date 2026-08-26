@@ -21,6 +21,10 @@
     <PackageVersion Include="AWSSDK.SSO" Version="4.0.100.7" />
     <PackageVersion Include="AWSSDK.SSOOIDC" Version="4.0.100.7" />
     <PackageVersion Include="Microsoft.Extensions.Caching.StackExchangeRedis" Version="10.0.10" />
+    <!-- Direct dependency: Program.cs builds the multiplexer itself. Held ahead of the 2.7.27 that
+         Microsoft.Extensions.Caching.StackExchangeRedis asks for, which predates the write-failure
+         queue-desync teardown, TCP keep-alives, and Valkey 8+ server-mode detection. -->
+    <PackageVersion Include="StackExchange.Redis" Version="2.13.17" />
     <PackageVersion Include="Sentry.AspNetCore" Version="6.8.0" />
     <!-- Test packages -->
     <PackageVersion Include="Microsoft.AspNetCore.TestHost" Version="10.0.10" />

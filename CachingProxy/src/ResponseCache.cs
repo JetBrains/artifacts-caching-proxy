@@ -171,11 +171,13 @@ public class ResponseCache(IFusionCache cache, TimeProvider timeProvider, Cachin
     entry.Headers[CachingProxyConstants.CachedStatusHeader] = entry.StatusCode.ToString("D");
     entry.Headers[CachingProxyConstants.CachedUntilHeader] = (timeProvider.GetUtcNow() + durableCachingTime).ToString("R");
 
-    await cache.SetAsync(cacheKey, entry, new FusionCacheEntryOptions
-    {
-      MemoryCacheDuration = cachingTime,
-      DistributedCacheDuration = distributedCachingTime,
-    }, token: cancellationToken);
+    // Duplicated from the defaults rather than constructed fresh: FusionCache uses explicitly-passed
+    // options as-is - the defaults apply only when none are given - so a new instance here would drop
+    // the L2 hard timeout and background-write settings and put Redis back on the critical path.
+    var options = cache.DefaultEntryOptions.Duplicate();
+    options.MemoryCacheDuration = cachingTime;
+    options.DistributedCacheDuration = distributedCachingTime;
+    await cache.SetAsync(cacheKey, entry, options, token: cancellationToken);
     return entry;
   }
 
