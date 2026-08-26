@@ -169,14 +169,6 @@ public static class Program
           options.DistributedCacheHardTimeout = TimeSpan.FromMilliseconds(500);
           // Sets and refreshes stop blocking the request that triggered them.
           options.AllowBackgroundDistributedCacheOperations = true;
-          // By default a stale L1 entry still costs an L2 read, on the chance another node wrote a
-          // newer one. With L1 TTLs well short of L2 that fires on most repeat requests, and it is
-          // what makes L2 reads outnumber served requests several times over while ~93% of them find
-          // nothing. Freshness here does not depend on that read: a window is enforced by revalidating
-          // against the upstream, and PutStatusCode already documents replaying an entry without
-          // consulting the storage layer. The cost is that one task picks up another's refreshed entry
-          // only once its own L1 copy expires - inside the staleness the status TTLs already allow.
-          options.SkipDistributedCacheReadWhenStale = true;
         });
     }
 
