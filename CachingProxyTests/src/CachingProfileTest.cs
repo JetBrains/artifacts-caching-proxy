@@ -219,6 +219,86 @@ public class CachingProfileTest
     Assert.Equal(TimeSpan.FromHours(1), index!.RefreshAfter);
   }
 
+  [Fact]
+  public void Cargo_Profile_Rules_Resolve_By_Endpoint_Kind()
+  {
+    // Mirrors the shipped cargo profile ordering (appsettings.json). A published .crate cannot be
+    // replaced, so every download shape is eternal; the sparse index is append-only apart from
+    // `yanked` and revalidates.
+    var profile = CargoProfile();
+
+    // crates.io's own download endpoint, built by cargo from config.json's `dl` with no markers.
+    var download = profile.Match("/static.crates.io/crates/serde/1.0.219/download");
+    Assert.NotNull(download);
+    Assert.Null(download!.RefreshAfter);
+    Assert.False(download.Redirect);
+
+    // The same tarball under its legacy extension-bearing name.
+    var crate = profile.Match("/static.crates.io/crates/cfg-if/cfg-if-1.0.0.crate");
+    Assert.NotNull(crate);
+    Assert.Null(crate!.RefreshAfter);
+
+    // A Space registry's download shape: `dl` there carries {crate}/{version} markers, so the URL
+    // ends in neither an extension nor /download.
+    var spaceFile = profile.Match("/packages.jetbrains.team/crates/p/ij/crates-central-mirror/files/cfg-if/1.0.0");
+    Assert.NotNull(spaceFile);
+    Assert.Null(spaceFile!.RefreshAfter);
+
+    // static.rust-lang.org: a dated snapshot and a version-pinned channel are both immutable.
+    var dated = profile.Match("/static.rust-lang.org/dist/2026-08-20/rust-std-1.93.0-x86_64-unknown-linux-gnu.tar.xz");
+    Assert.NotNull(dated);
+    Assert.Null(dated!.RefreshAfter);
+
+    var pinnedChannel = profile.Match("/static.rust-lang.org/dist/channel-rust-1.90.0.toml");
+    Assert.NotNull(pinnedChannel);
+    Assert.Null(pinnedChannel!.RefreshAfter);
+
+    var archivedRustup = profile.Match("/static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init");
+    Assert.NotNull(archivedRustup);
+    Assert.Null(archivedRustup!.RefreshAfter);
+
+    // The sparse index and its config.json revalidate on upstream's own max-age=600.
+    foreach (var indexPath in new[]
+             {
+               "/index.crates.io/config.json",
+               "/index.crates.io/se/rd/serde",
+               "/index.crates.io/1/a",
+               "/packages.jetbrains.team/crates/p/ij/crates-central-mirror/se/rd/serde",
+             })
+    {
+      var index = profile.Match(indexPath);
+      Assert.NotNull(index);
+      Assert.Equal(TimeSpan.FromMinutes(10), index!.RefreshAfter);
+    }
+
+    // Nothing here redirects: cargo takes the download host from config.json, so no endpoint on
+    // these prefixes carries a query string that would have to ride along.
+    Assert.DoesNotContain(profile.Rules, rule => rule.Redirect);
+  }
+
+  [Fact]
+  public void Cargo_Eternal_Rules_Do_Not_Swallow_A_Rolling_Pointer()
+  {
+    // static.rust-lang.org keeps rolling pointers beside the immutable artifacts, and they are what
+    // a plain `rustup update` reads. Catching one in an eternal rule pins the toolchain silently -
+    // and the profile-less prefix this replaces did exactly that, serving max-age=31536000.
+    var profile = CargoProfile();
+
+    foreach (var pointer in new[]
+             {
+               "/static.rust-lang.org/dist/channel-rust-stable.toml",
+               "/static.rust-lang.org/dist/channel-rust-stable.toml.sha256",
+               "/static.rust-lang.org/dist/channel-rust-nightly.toml",
+               "/static.rust-lang.org/rustup/release-stable.toml",
+               "/static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init",
+             })
+    {
+      var rule = profile.Match(pointer);
+      Assert.NotNull(rule);
+      Assert.Equal(TimeSpan.FromMinutes(10), rule!.RefreshAfter);
+    }
+  }
+
   // The shipped docker profile, kept in the same order as CachingProxy/appsettings.json.
   private static CachingProfile DockerProfile() => new()
   {
@@ -244,6 +324,21 @@ public class CachingProfileTest
       new CachingRule { Pattern = @"\.snupkg$" },
       new CachingRule { Pattern = @"\.nuspec$" },
       new CachingRule { Pattern = ".", RefreshAfter = TimeSpan.FromHours(1) },
+    ]
+  };
+
+  // The shipped cargo profile, kept in the same order as CachingProxy/appsettings.json.
+  private static CachingProfile CargoProfile() => new()
+  {
+    Rules =
+    [
+      new CachingRule { Pattern = @"\.crate$" },
+      new CachingRule { Pattern = "/crates/[^/]+/[^/]+/download$" },
+      new CachingRule { Pattern = "/files/[^/]+/[^/]+$" },
+      new CachingRule { Pattern = @"/dist/\d{4}-\d{2}-\d{2}/" },
+      new CachingRule { Pattern = @"/dist/channel-rust-\d" },
+      new CachingRule { Pattern = "/rustup/archive/" },
+      new CachingRule { Pattern = ".", RefreshAfter = TimeSpan.FromMinutes(10) },
     ]
   };
 }
