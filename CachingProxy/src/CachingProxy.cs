@@ -107,7 +107,7 @@ public class CachingProxy
           return;
         }
 
-        await ServeFileAsync(context, cachedFile, metadata, contentEncoding, CachingProxyStatus.HIT);
+        await ServeFileAsync(context, cachedFile, metadata, contentEncoding, CachingProxyStatus.HIT, rule);
         return;
       }
 
@@ -138,10 +138,10 @@ public class CachingProxy
   // ones derived from the local file) and its Docker-Content-Digest, which an OCI client verifies the
   // body against. Content-Length and range handling stay with the file, which is what actually ships.
   private async Task ServeFileAsync(HttpContext context, FileInfo cachedFile, CacheEntryMetadata metadata,
-    string? contentEncoding, CachingProxyStatus status)
+    string? contentEncoding, CachingProxyStatus status, CachingRule? cachingRule)
   {
-    myRemoteProxy.SetStatusHeader(context, status, cachedContentLength: null);
-    CachedResponse.SetCachingHeaderFor(context);
+    myRemoteProxy.SetStatusHeader(context, status, cachingRule, cachedContentLength: null);
+    CachedResponse.SetCachingHeaderFor(context, cachingRule);
     if (contentEncoding != null)
       context.Response.Headers.ContentEncoding = contentEncoding;
     if (metadata.Digest != null)
@@ -186,7 +186,7 @@ public class CachingProxy
       case RevalidationOutcome.NotModified:
         // Still valid: restart the window, keeping the head the stored bytes were fetched under.
         await WriteMetadataAsync(cachedFile.FullName, metadata with { StoredAtUtc = UtcNow });
-        await ServeFileAsync(context, cachedFile, metadata, contentEncoding, CachingProxyStatus.REVALIDATED);
+        await ServeFileAsync(context, cachedFile, metadata, contentEncoding, CachingProxyStatus.REVALIDATED, rule);
         return;
 
       case RevalidationOutcome.Gone:
@@ -194,12 +194,12 @@ public class CachingProxy
         // The 404 replaces any stored head under the same key, so nothing points at the deleted body.
         DeleteCachedVariants(upstreamUri, variant);
         await myRemoteProxy.SetStatusAsync(context, CachingProxyStatus.NEGATIVE_MISS,
-          await myResponseCache.PutStatusCode(cacheKey, HttpStatusCode.NotFound, remoteServer.CacheDuration, context.RequestAborted, rule?.RefreshAfter));
+          await myResponseCache.PutStatusCode(cacheKey, HttpStatusCode.NotFound, remoteServer.CacheDuration, context.RequestAborted, rule?.RefreshAfter), rule);
         return;
 
       case RevalidationOutcome.UpstreamError:
         // Could not reach/validate the upstream: keep and serve the stale copy.
-        await ServeFileAsync(context, cachedFile, metadata, contentEncoding, CachingProxyStatus.STALE);
+        await ServeFileAsync(context, cachedFile, metadata, contentEncoding, CachingProxyStatus.STALE, rule);
         return;
 
       case RevalidationOutcome.Replaced:
@@ -209,8 +209,7 @@ public class CachingProxy
           // the upstream's own Content-Type, which CachedResponse already copied over — the same one
           // recorded below, so this response and every later HIT agree. Its bytes are counted by the
           // transfer that relays them, like a MISS's.
-          await myRemoteProxy.SetStatusAsync(context, CachingProxyStatus.REVALIDATED, new CachedResponse(response),
-            countContentBytes: false);
+          await myRemoteProxy.SetStatusAsync(context, CachingProxyStatus.REVALIDATED, new CachedResponse(response), rule, countContentBytes: false);
 
           var newPath = await DownloadToDiskAsync(context, response, upstreamUri, variant, CachingProxyStatus.REVALIDATED);
           if (newPath == null) return;
@@ -356,7 +355,7 @@ public class CachingProxy
   // their own keys, and each revalidates (or 404s) on its own request.
   private void DeleteCachedVariants(Uri upstreamUri, string? variant)
   {
-    foreach (var encoding in new string?[] { null, "gzip" })
+    foreach (var encoding in new [] { null, "gzip" })
     {
       var path = Path.Combine(myLocalCachePath, upstreamUri.GetFutureCacheFileLocation(encoding, variant));
       CatchSilently(() => { if (File.Exists(path)) File.Delete(path); });

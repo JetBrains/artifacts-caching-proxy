@@ -49,15 +49,19 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   private readonly RemoteServers.RemoteServer myRemoteServer = new("/real", upstreamServer.Url, new CacheDuration());
 
   private TestServer CreateServer(bool signedLinks, TimeSpan? signedLinkTTL = null, int inlineThresholdBytes = TestInlineThresholdBytes,
-    CacheDuration? distributedCacheDuration = null, TimeSpan? refreshAfter = null, CacheDuration? prefixCacheDuration = null)
+    CacheDuration? distributedCacheDuration = null, TimeSpan? refreshAfter = null, CacheDuration? prefixCacheDuration = null,
+    bool varyByAccept = false)
   {
     // When a freshness window is requested, drive it through a profile with a catch-all rule (so every
     // /real path is revalidated after the window) — mirroring how the disk tests exercise revalidation.
     var profiles = new Dictionary<string, CachingProfile>();
     CachingProxyPrefix prefix = new($"/real={upstreamServer.Url}", prefixCacheDuration);
-    if (refreshAfter is { } ra)
+    if (refreshAfter != null || varyByAccept)
     {
-      profiles["fresh"] = new CachingProfile { Rules = [new CachingRule { Pattern = ".", RefreshAfter = ra }] };
+      profiles["fresh"] = new CachingProfile
+      {
+        Rules = [new CachingRule { Pattern = ".", RefreshAfter = refreshAfter, VaryByAccept = varyByAccept }]
+      };
       prefix = new CachingProxyPrefix($"/real={upstreamServer.Url}", prefixCacheDuration, Profile: "fresh");
     }
 
@@ -349,6 +353,21 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     Assert.Equal(UpstreamTestServer.ManifestMediaType, hit.Content.Headers.ContentType?.ToString());
     Assert.Equal("{\"layers\":[]}", await hit.Content.ReadAsStringAsync());
     Assert.Equal(1, myS3.PutObjectCalls); // already stored, not re-uploaded
+  }
+
+  [Fact]
+  public async Task Vary_Accept_Survives_The_Response_Reset()
+  {
+    // On this backend the client's response is the redirect, and it is written after Response.Clear()
+    // wipes everything the request set beforehand - the negotiation announcement included. Cleared and
+    // never restored, a shared cache in front of us is free to hand this representation's 307, or a 404,
+    // to a client that asked for another media type (MRI-5282).
+    var server = CreateServer(signedLinks: false, varyByAccept: true);
+    using var miss = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
+
+    Assert.Equal(HttpStatusCode.RedirectKeepVerb, miss.StatusCode);
+    AssertStatusHeader(miss, CachingProxyStatus.MISS);
+    Assert.Equal(["Accept"], miss.Headers.Vary);
   }
 
   [Fact]

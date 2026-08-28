@@ -89,7 +89,7 @@ public sealed record CachedResponse(HttpStatusCode StatusCode, IHeaderDictionary
       Headers[DockerContentDigestHeader] = digest;
   }
 
-  public async ValueTask InvokeAsync(HttpContext context)
+  public async ValueTask InvokeAsync(HttpContext context, CachingRule? rule = null)
   {
     foreach (var (key, value) in Headers)
     {
@@ -97,7 +97,7 @@ public sealed record CachedResponse(HttpStatusCode StatusCode, IHeaderDictionary
         context.Response.Headers[key] = value;
     }
     context.Response.StatusCode = (int)StatusCode;
-    SetCachingHeaderFor(context);
+    SetCachingHeaderFor(context, rule);
 
     if (Body != null)
       await context.Response.BodyWriter.WriteAsync(Body, context.RequestAborted);
@@ -124,14 +124,23 @@ public sealed record CachedResponse(HttpStatusCode StatusCode, IHeaderDictionary
     return isAuthenticated ? ourPrivateCachingHeader : ourEternalCachingHeader;
   }
 
-  public static void SetCachingHeaderFor(HttpContext context)
+  public static void SetCachingHeaderFor(HttpContext context, CachingRule? rule = null)
   {
     // For successful (2xx) responses, the cached response is always eternally cacheable.
     if (context.Response.StatusCode is >= StatusCodes.Status200OK and < StatusCodes.Status300MultipleChoices)
     {
       context.Response.Headers.CacheControl = GetCachingHeader(context);
     }
+    // A 404 a content-negotiated rule produced answers about one representation: our own entry is safe
+    // because the key folds in the canonical Accept set (see RemoteProxy.GetCacheVariant), but the edge
+    // keys every Accept ordering onto one entry and caches a 4xx on its own account, so one client's
+    // negotiation failure was replayed to clients the registry would have answered (MRI-5282). no-store
+    // rather than no-cache: it must not be kept at all, not merely revalidated.
+    else if (rule is { VaryByAccept: true } && context.Response.StatusCode == StatusCodes.Status404NotFound)
+      context.Response.Headers.CacheControl = ourNoStoreHeaderValue;
   }
+
+  private static readonly StringValues ourNoStoreHeaderValue = new CacheControlHeaderValue { NoStore = true }.ToString();
 
   public static readonly CachedResponse MethodNotAllowed = new(HttpStatusCode.MethodNotAllowed, new HeaderDictionary());
   public static readonly CachedResponse InvalidPath = new(HttpStatusCode.BadRequest, new HeaderDictionary(), [.. "Invalid request path"u8]);

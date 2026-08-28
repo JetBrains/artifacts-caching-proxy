@@ -182,6 +182,20 @@ public class UpstreamTestServer : IAsyncLifetime
           }
         }
 
+        // A strict registry - ghcr, and the OCI spec's reading - answers 404 with the error document when
+        // it holds none of the media types asked for; a lenient one (Docker Hub) hands the index back
+        // whatever the Accept says. Strictness is why the Accept set is part of the answer, and so has to
+        // be part of every cache key the answer is stored under, negative entries included (MRI-5282).
+        // No Accept at all, or a wildcard one, means the client takes what there is.
+        if (accept.Length > 0 && !accept.Contains('*') &&
+            !accept.Contains(IndexMediaType, StringComparison.OrdinalIgnoreCase) &&
+            !accept.Contains(ManifestMediaType, StringComparison.OrdinalIgnoreCase))
+        {
+          res.StatusCode = StatusCodes.Status404NotFound;
+          res.ContentType = MediaTypeNames.Application.Json;
+          return res.WriteAsync("{\"errors\":[{\"code\":\"MANIFEST_UNKNOWN\"}]}");
+        }
+
         // The negotiation itself: a client that accepts an index gets one, everyone else gets a
         // single-arch manifest. Same URL, two representations, which is what VaryByAccept is for.
         var wantsIndex = accept.Contains(IndexMediaType, StringComparison.OrdinalIgnoreCase);

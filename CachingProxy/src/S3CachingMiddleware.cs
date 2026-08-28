@@ -116,7 +116,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
       // outside the per-key lock so steady-state HITs never contend on the semaphore.
       if (await responseCache.GetCachedStatusCode(verbKey, context.RequestAborted) is { } verbEntry)
       {
-        await remoteProxy.SetStatusAsync(context, CachingProxyStatus.HIT, verbEntry);
+        await remoteProxy.SetStatusAsync(context, CachingProxyStatus.HIT, verbEntry, rule);
         return;
       }
 
@@ -133,7 +133,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
       // verb-specific head (a large-object redirect or HEAD metadata) while we waited.
       if (await responseCache.GetCachedStatusCode(verbKey, context.RequestAborted) is { } cachedVerbEntry)
       {
-        await remoteProxy.SetStatusAsync(context, CachingProxyStatus.HIT, cachedVerbEntry);
+        await remoteProxy.SetStatusAsync(context, CachingProxyStatus.HIT, cachedVerbEntry, rule);
         return;
       }
 
@@ -182,7 +182,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
                   if (isHead)
                     await remoteProxy.SetStatusAsync(context, CachingProxyStatus.REVALIDATED,
                       await responseCache.PutStatusCode(verbKey, new CachedResponse(fresh) { StatusCode = HttpStatusCode.OK },
-                        remoteServer.CacheDuration, context.RequestAborted, maxCacheDuration));
+                        remoteServer.CacheDuration, context.RequestAborted, maxCacheDuration), rule);
                   else
                     await RedirectToBucket(CachingProxyStatus.REVALIDATED, freshContentLength);
                 }
@@ -191,7 +191,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
               case RevalidationOutcome.Gone:
                 await amazonS3.DeleteObjectAsync(new DeleteObjectRequest { BucketName = config.S3!.BucketName, Key = s3Key }, context.RequestAborted);
                 await remoteProxy.SetStatusAsync(context, CachingProxyStatus.NEGATIVE_MISS,
-                  await responseCache.PutStatusCode(s3Key, HttpStatusCode.NotFound, remoteServer.CacheDuration, context.RequestAborted, maxCacheDuration));
+                  await responseCache.PutStatusCode(s3Key, HttpStatusCode.NotFound, remoteServer.CacheDuration, context.RequestAborted, maxCacheDuration), rule);
                 return;
 
               case RevalidationOutcome.NotModified:
@@ -223,7 +223,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
             var cachingResponse = new CachedResponse(s3Object) { StatusCode = HttpStatusCode.OK, Body = body };
 
             await remoteProxy.SetStatusAsync(context, probeStatus,
-              await responseCache.PutStatusCode(s3Key, cachingResponse, remoteServer.CacheDuration, context.RequestAborted, maxCacheDuration));
+              await responseCache.PutStatusCode(s3Key, cachingResponse, remoteServer.CacheDuration, context.RequestAborted, maxCacheDuration), rule);
             return;
           }
 
@@ -241,7 +241,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
               }
             };
             await remoteProxy.SetStatusAsync(context, probeStatus,
-              await responseCache.PutStatusCode(verbKey, head, remoteServer.CacheDuration, context.RequestAborted, maxCacheDuration));
+              await responseCache.PutStatusCode(verbKey, head, remoteServer.CacheDuration, context.RequestAborted, maxCacheDuration), rule);
             return;
           }
 
@@ -343,7 +343,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
       // Only a GET redirects (a HEAD is served from memory), so the redirect always belongs under the
       // verb-specific key and is never replayed to a HEAD.
       await remoteProxy.SetStatusAsync(context, status,
-        await responseCache.PutStatusCode(verbKey, cachingResponse, remoteServer.CacheDuration, context.RequestAborted, maxCacheDuration));
+        await responseCache.PutStatusCode(verbKey, cachingResponse, remoteServer.CacheDuration, context.RequestAborted, maxCacheDuration), rule);
     }
   }
 
@@ -400,8 +400,11 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
       DestinationKey = s3Key,
       MetadataDirective = S3MetadataDirective.REPLACE,
       ContentType = probe.Headers.ContentType,
+      Headers =
+      {
+        ContentEncoding = probe.Headers.ContentEncoding
+      }
     };
-    copy.Headers.ContentEncoding = probe.Headers.ContentEncoding;
     foreach (var key in probe.Metadata.Keys)
       copy.Metadata[key] = probe.Metadata[key];
     copy.Metadata[CreatedAtMetadataKey] = timeProvider.GetUtcNow().ToString("O", CultureInfo.InvariantCulture);

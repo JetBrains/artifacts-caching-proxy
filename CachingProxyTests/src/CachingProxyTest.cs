@@ -1082,6 +1082,112 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
   }
 
   [Fact]
+  public async Task Oci_Manifest_Announces_Vary_Accept()
+  {
+    // Keying our own entries on the Accept set is only half of it: everything downstream - CloudFront, a
+    // corporate proxy, the client's own store - has to be told the URL has several representations, or it
+    // reuses one of them for a client that asked for another. Announced on every outcome, a negatively
+    // cached 404 included, which is the reuse that actually hurt (MRI-5282).
+    const string path = "/v2/real-docker/testimage/manifests/24.04";
+
+    foreach (var expectedStatus in new[] { CachingProxyStatus.MISS, CachingProxyStatus.HIT })
+    {
+      await AssertGetResponse(path, HttpStatusCode.OK,
+        (message, bytes) =>
+        {
+          AssertStatusHeader(message, expectedStatus);
+          Assert.Equal(["Accept"], message.Headers.Vary);
+        },
+        UpstreamTestServer.IndexMediaType);
+    }
+
+    // A blob is the same bytes for everyone: no negotiation, so no Vary to fragment a downstream cache on.
+    await AssertGetResponse($"/v2/real-docker/testimage/blobs/{UpstreamTestServer.BlobDigest}", HttpStatusCode.OK,
+      (message, bytes) => Assert.Empty(message.Headers.Vary));
+  }
+
+  [Fact]
+  public async Task Oci_Manifest_Negative_Entry_Is_Confined_To_Its_Own_Accept()
+  {
+    // A strict registry 404s a manifest asked for as a media type it is not, and that 404 is negatively
+    // cached for the rule's 5 minutes. It must be remembered per representation: under the path alone it
+    // would be replayed to the next client whose Accept differs, which is what turned a 1-in-4 unlucky
+    // Accept ordering into a docker pull that failed for five minutes straight (MRI-5282).
+    const string path = "/v2/real-docker/testimage/manifests/24.04";
+    const string unsupported = "application/vnd.docker.distribution.manifest.v1+prettyjws";
+
+    foreach (var expectedStatus in new[] { CachingProxyStatus.NEGATIVE_MISS, CachingProxyStatus.NEGATIVE_HIT })
+    {
+      await AssertGetResponse(path, HttpStatusCode.NotFound,
+        (message, bytes) =>
+        {
+          AssertStatusHeader(message, expectedStatus);
+          Assert.Equal(["Accept"], message.Headers.Vary);
+          // Ours to remember, nobody else's: our key folds in the Accept set, while a cache in front of us
+          // keys every ordering onto one entry and caches a 4xx on its own account, so it would replay this
+          // one client's negotiation failure to clients the registry would have answered (MRI-5282).
+          Assert.True(message.Headers.CacheControl?.NoStore);
+        },
+        unsupported);
+    }
+
+    // The representation the registry does hold is untouched by the entry above, and stays cacheable.
+    await AssertGetResponse(path, HttpStatusCode.OK,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.MISS);
+        Assert.Equal(UpstreamTestServer.IndexMediaType, message.Content.Headers.ContentType?.ToString());
+        Assert.False(message.Headers.CacheControl?.NoStore);
+      },
+      UpstreamTestServer.IndexMediaType);
+
+    // A 404 that no negotiation produced is unchanged: it says the resource is absent, for everyone.
+    await AssertGetResponse("/v2/real-docker/testimage/blobs/sha256:" + new string('b', 64), HttpStatusCode.NotFound,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_MISS);
+        Assert.Null(message.Headers.CacheControl);
+      });
+  }
+
+  [Fact]
+  public async Task Oci_Manifest_Repeated_Accept_Lines_Key_On_The_Whole_Set()
+  {
+    // The docker/distribution puller sends one Accept line per media type, in Go map order, so the same
+    // client sends the same set in a different order on every request. The key is the set, not the order
+    // and not the framing: whichever order arrives first fetches, the rest hit that one entry, and an
+    // unlucky ordering can neither miss again nor 404 (MRI-5282).
+    const string path = "/v2/real-docker/testimage/manifests/24.04";
+    string[] docker =
+    [
+      "application/vnd.docker.distribution.manifest.list.v2+json",
+      UpstreamTestServer.IndexMediaType,
+      UpstreamTestServer.ManifestMediaType,
+      "application/vnd.docker.distribution.manifest.v2+json",
+    ];
+
+    var before = myUpstreamServer.ManifestByTagRequestCount;
+    var expectedStatus = CachingProxyStatus.MISS;
+    foreach (var first in docker)
+    {
+      string[] lines = [first, ..docker.Where(type => type != first)];
+      await AssertGetResponse(path, HttpStatusCode.OK,
+        (message, bytes) =>
+        {
+          AssertStatusHeader(message, expectedStatus);
+          // The set names the index, so the index is what a client gets - whatever line it came on.
+          Assert.Equal(UpstreamTestServer.IndexMediaType, message.Content.Headers.ContentType?.ToString());
+          Assert.Equal("{\"manifests\":[]}", Encoding.UTF8.GetString(bytes));
+        },
+        lines);
+      expectedStatus = CachingProxyStatus.HIT;
+    }
+
+    // One fetch for the four orderings, and it carried the client's whole list.
+    Assert.Equal(before + 1, myUpstreamServer.ManifestByTagRequestCount);
+  }
+
+  [Fact]
   public async Task Oci_Catalog_Is_Redirected()
   {
     // A registry-wide listing is dynamic, so it is bounced rather than cached.
@@ -2013,12 +2119,15 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
     Assert.Empty(StoredFiles(proxy.CachePath));
   }
 
+  // Several accept values are sent as several Accept header lines, the shape docker/distribution's puller
+  // uses (one req.Header.Add per media type). RFC 9110 5.3 makes that identical to one comma-joined line,
+  // and a reader that takes only the first line truncates the client's list (MRI-5282).
   private async Task AssertGetResponse(string url, HttpStatusCode expectedCode,
-    Action<HttpResponseMessage, byte[]> assertions, string? accept = null)
+    Action<HttpResponseMessage, byte[]> assertions, params string[] accept)
   {
-    myOutput.WriteLine($"*** GET {url}{(accept == null ? "" : $" (Accept: {accept})")}");
+    myOutput.WriteLine($"*** GET {url}{(accept.Length == 0 ? "" : $" (Accept: {string.Join(" | ", accept)})")}");
     var request = myServer.CreateRequest(url);
-    if (accept != null) request.AddHeader("Accept", accept);
+    foreach (var value in accept) request.AddHeader("Accept", value);
     using var response = await request.GetAsync();
     var bytes = await response.Content.ReadAsByteArrayAsync();
 

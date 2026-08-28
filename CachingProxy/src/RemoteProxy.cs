@@ -12,6 +12,7 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
 using Microsoft.Net.Http.Headers;
+using CacheControlHeaderValue = System.Net.Http.Headers.CacheControlHeaderValue;
 using EntityTagHeaderValue = System.Net.Http.Headers.EntityTagHeaderValue;
 
 namespace JetBrains.CachingProxy;
@@ -147,8 +148,8 @@ public partial class RemoteProxy(
     switch (cachedResponse?.StatusCode)
     {
       case >= HttpStatusCode.BadRequest:
-        await SetStatusAsync(context, CachingProxyStatus.NEGATIVE_HIT,
-          cachedResponse with { StatusCode = ClientFacingStatus(cachedResponse.StatusCode) });
+        var replayed = cachedResponse with { StatusCode = ClientFacingStatus(cachedResponse.StatusCode) };
+        await SetStatusAsync(context, CachingProxyStatus.NEGATIVE_HIT, replayed, rule);
         return null;
 
       // The caller decides whether the key includes the HTTP method (the S3 backend does so to keep a
@@ -160,14 +161,14 @@ public partial class RemoteProxy(
       // on disk/S3 instead.
       case >= HttpStatusCode.MultipleChoices:
       case >= HttpStatusCode.OK when isHead || cachedResponse.Body != null:
-        await SetStatusAsync(context, CachingProxyStatus.HIT, cachedResponse);
+        await SetStatusAsync(context, CachingProxyStatus.HIT, cachedResponse, rule);
         return null;
     }
 
     var requestPath = context.Request.Path.Value!;
     if (myBlacklistRegex != null && myBlacklistRegex.IsMatch(requestPath))
     {
-      await SetStatusAsync(context, CachingProxyStatus.BLACKLISTED, CachedResponse.Blacklisted);
+      await SetStatusAsync(context, CachingProxyStatus.BLACKLISTED, CachedResponse.Blacklisted, rule);
       return null;
     }
 
@@ -196,7 +197,7 @@ public partial class RemoteProxy(
             Location =
               $"{upstreamUri}{RedirectSignatureAuthenticationHandler.QueryWithoutSignatureParams(context.Request)}"
           }
-        });
+        }, rule);
       return null;
     }
 
@@ -221,7 +222,7 @@ public partial class RemoteProxy(
       logger.LogWarning(Event.Timeout, "Timeout requesting {UpstreamUri}", upstreamUri);
 
       var entry = await responseCache.PutStatusCode(cacheKey, HttpStatusCode.GatewayTimeout, cacheDuration, context.RequestAborted, maxCacheDuration);
-      await SetStatusAsync(context, CachingProxyStatus.NEGATIVE_MISS, entry with { StatusCode = HttpStatusCode.NotFound });
+      await SetStatusAsync(context, CachingProxyStatus.NEGATIVE_MISS, entry with { StatusCode = HttpStatusCode.NotFound }, rule);
       return null;
     }
     catch (InvalidOperationException e)
@@ -233,7 +234,7 @@ public partial class RemoteProxy(
       logger.LogWarning(e, "Exception requesting {UpstreamUri}: {Message}", upstreamUri, e.Message);
 
       var entry = await responseCache.PutStatusCode(cacheKey, HttpStatusCode.ServiceUnavailable, cacheDuration, context.RequestAborted, maxCacheDuration);
-      await SetStatusAsync(context, CachingProxyStatus.NEGATIVE_MISS, entry with { StatusCode = HttpStatusCode.NotFound });
+      await SetStatusAsync(context, CachingProxyStatus.NEGATIVE_MISS, entry with { StatusCode = HttpStatusCode.NotFound }, rule);
       return null;
     }
 
@@ -256,7 +257,7 @@ public partial class RemoteProxy(
             break;
         }
 
-        await SetStatusAsync(context, CachingProxyStatus.NEGATIVE_MISS, entry);
+        await SetStatusAsync(context, CachingProxyStatus.NEGATIVE_MISS, entry, rule);
         return null;
       }
 
@@ -284,7 +285,7 @@ public partial class RemoteProxy(
       if (isHead)
       {
         await SetStatusAsync(context, CachingProxyStatus.MISS,
-          await responseCache.PutStatusCode(cacheKey, responseEntry, cacheDuration, context.RequestAborted, maxCacheDuration));
+          await responseCache.PutStatusCode(cacheKey, responseEntry, cacheDuration, context.RequestAborted, maxCacheDuration), rule);
         return null;
       }
 
@@ -292,7 +293,7 @@ public partial class RemoteProxy(
       // relays. And not written at all for a caller that replaces it (the S3 backend Clear()s it and sends
       // a redirect), which would otherwise report the same request twice.
       if (writeBodyHead)
-        await SetStatusAsync(context, CachingProxyStatus.MISS, responseEntry, countContentBytes: false);
+        await SetStatusAsync(context, CachingProxyStatus.MISS, responseEntry, rule, countContentBytes: false);
       transferOwnership = true;
       return response;
     }
@@ -490,10 +491,11 @@ public partial class RemoteProxy(
   /// chunked upstream declares nothing at all), so the transfer reports the bytes itself once they have
   /// gone - see <see cref="AddContentBytes"/>. The request is still counted here, exactly once.</param>
   public async ValueTask SetStatusAsync(HttpContext context, CachingProxyStatus status, CachedResponse response,
-    bool countContentBytes = true)
+    CachingRule? rule = null, bool countContentBytes = true)
   {
-    SetStatusHeader(context, status, countContentBytes ? ContentLengthOf(response) : null);
-    await response.InvokeAsync(context);
+    SetStatusHeader(context, status, rule, countContentBytes ? ContentLengthOf(response) : null);
+
+    await response.InvokeAsync(context, rule);
   }
 
   // The size of the content a cached head stands for. A redirect describes something it does not carry, so
@@ -524,9 +526,15 @@ public partial class RemoteProxy(
       context.User.Identity?.IsAuthenticated == true, bytes);
   }
 
-  public void SetStatusHeader(HttpContext context, CachingProxyStatus status, long? cachedContentLength)
+  public void SetStatusHeader(HttpContext context, CachingProxyStatus status, CachingRule? cachingRule, long? cachedContentLength)
   {
     context.Response.Headers[CachingProxyConstants.StatusHeader] = status.ToString();
+
+    // Announces the content negotiation downstream: <c>Vary: Accept</c> for a rule whose entries are keyed
+    // by <c>Accept</c> (see <see cref="GetCacheVariant"/>), nothing at all for any other path.
+    if (cachingRule is { VaryByAccept: true })
+      context.Response.Headers.Vary = HeaderNames.Accept;
+
     // A HEAD describes a body it does not send: its Content-Length is the size of an entity the client
     // still has to fetch, so no content went out - and an OCI client HEADs nearly every blob and manifest
     // it pulls, so that is not a rounding error.
