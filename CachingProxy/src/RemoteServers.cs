@@ -40,6 +40,9 @@ public partial class RemoteServers : EndpointDataSource
       // outside it and be rejected. Fail at startup rather than on every request.
       if (remoteUri.Query.Length > 0 || remoteUri.Fragment.Length > 0)
         throw new ArgumentException($"Prefix target must have no query or fragment: {prefix}");
+      // The credential is a property of the upstream, not of the inbound gate: a repository that is
+      // individually public can still sit inside a private origin we may only fetch with our service
+      // account. So match regardless of IsPrivate - that flag only decides gating below.
       var matched = MatchAuth(remoteUri, config.UpstreamAuth);
       var matchedAuth = matched?.Value;
       if (matchedAuth != null && !remoteUri.IsSecureOrLoopback())
@@ -71,10 +74,11 @@ public partial class RemoteServers : EndpointDataSource
       // public registry - what an upstream grants for it is not visible from here, and the expensive
       // mistake is serving private artifacts to anyone. A prefix with no matched auth is fetched
       // anonymously and stays un-gated.
-      var metadata = remoteServer.Auth != null ?
+      var isGated = prefix.IsPrivate ?? remoteServer.Auth != null;
+      var metadata = isGated ?
         new EndpointMetadataCollection(remoteServer, new AuthorizeAttribute()) :
         new EndpointMetadataCollection(remoteServer);
-      hasGatedOciPrefix |= remoteServer.Auth != null && remoteServer.Profile?.Oci == true;
+      hasGatedOciPrefix |= isGated && remoteServer.Profile?.Oci == true;
 
       // Overlapping prefixes (e.g. "/aprefix" and "/aprefix/too") both match via their {**path}
       // catch-all, and routing breaks such ties by Endpoint.Order, NOT by specificity. So order by

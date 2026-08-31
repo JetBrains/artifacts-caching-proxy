@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -406,6 +407,105 @@ public class RemoteServersTest
     // with the same characters, or that public prefix 401s every request (MRI-4837).
     Assert.False(gated["/sibling"]);
     Assert.False(gated["/c"]); // fetched anonymously, nothing to protect
+  }
+
+  // A broad private origin declared as a catch-all scope (`packages.jetbrains.team/maven`) over
+  // repositories that are individually public. Every prefix here is inside the scope and therefore carries
+  // the credential; only IsPrivate says which of them is gated inbound.
+  private static readonly UpstreamAuth catchAll = new()
+  {
+    UrlPrefixes = ["packages.example.com/maven/"], Username = "svc", Password = "pat",
+  };
+
+  private static CachingProxyConfig NestedConfig(bool? nestedIsPrivate) => new()
+  {
+    Prefixes =
+    [
+      new CachingProxyPrefix("/maven=packages.example.com/maven", IsPrivate: true),
+      new CachingProxyPrefix("/public=packages.example.com/maven/p/ij/open", IsPrivate: nestedIsPrivate),
+    ],
+    UpstreamAuth = { [nameof(catchAll)] = catchAll },
+  };
+
+  private static Dictionary<string, (RemoteServers.RemoteServer Server, bool Gated)> BuildNested(bool? nestedIsPrivate) =>
+    new RemoteServers(NestedConfig(nestedIsPrivate), new NullLogger<RemoteServers>()).Endpoints
+      .ToDictionary(
+        e => e.Metadata.GetMetadata<RemoteServers.RemoteServer>()!.Prefix.Value!,
+        e => (e.Metadata.GetMetadata<RemoteServers.RemoteServer>()!, e.Metadata.GetMetadata<IAuthorizeData>() != null));
+
+  [Fact]
+  public void A_Public_Prefix_Nested_In_A_Private_Scope_Is_Not_Gated()
+  {
+    // The catch-all covers the nested repo's upstream too, and that is deliberate: it is how the nested
+    // repo is fetched with our service account. Gating follows the declared privacy instead, so an
+    // individually public repository under a private catch-all stays reachable without a client JWT - the
+    // credential-implies-gated rule would 401 it.
+    var nested = BuildNested(nestedIsPrivate: false);
+
+    Assert.True(nested["/maven"].Gated);
+    Assert.False(nested["/public"].Gated);
+    Assert.Same(catchAll, nested["/public"].Server.Auth);
+  }
+
+  [Fact]
+  public void A_Nested_Prefix_With_No_IsPrivate_Falls_Back_To_Its_Matched_Credential()
+  {
+    // Nothing said, nothing to distinguish it from the scope it sits in: it is gated. Which is why the
+    // generator emits IsPrivate for every prefix - a dropped flag fails closed here, not open.
+    var nested = BuildNested(nestedIsPrivate: null);
+
+    Assert.True(nested["/public"].Gated);
+    Assert.Same(catchAll, nested["/public"].Server.Auth);
+  }
+
+  [Fact]
+  public void A_Nested_Prefix_Keeps_Its_Own_Route_And_Upstream()
+  {
+    // Routing breaks a tie between two catch-all patterns by specificity, so the longer prefix answers a
+    // request under it - and it resolves against its own base, not the parent's. Both are registered, and
+    // the parent cannot reach into the nested path anyway (containment is scoped to the configured base).
+    var nested = BuildNested(nestedIsPrivate: false);
+
+    Assert.Equal("https://packages.example.com/maven/p/ij/open/a.jar",
+      nested["/public"].Server.GetUpstreamUri("a.jar")?.AbsoluteUri);
+    Assert.Equal("https://packages.example.com/maven/p/ij/open/a.jar",
+      nested["/maven"].Server.GetUpstreamUri("p/ij/open/a.jar")?.AbsoluteUri);
+    Assert.Null(nested["/public"].Server.GetUpstreamUri("/maven/p/ij/other/a.jar"));
+
+    var patterns = new RemoteServers(NestedConfig(false), new NullLogger<RemoteServers>()).Endpoints
+      .Cast<RouteEndpoint>().Select(e => e.RoutePattern.RawText!).ToArray();
+    Assert.Equal(["/maven/{**path}", "/public/{**path}"], patterns);
+  }
+
+  [Fact]
+  public void A_Public_OCI_Mirror_Nested_In_A_Gated_Registry_Keeps_The_Probe_Challenged()
+  {
+    // A registry client picks its auth strategy for the whole host from the GET /v2/ probe, so one gated
+    // OCI prefix has to challenge it - carving a public mirror out of a gated registry must not un-gate the
+    // probe for everything else. The mirror itself stays open on its own route.
+    var registry = new UpstreamAuth
+    {
+      UrlPrefixes = ["registry.example.com/v2/p/"], Username = "svc", Password = "pat",
+    };
+    var config = new CachingProxyConfig
+    {
+      Prefixes =
+      [
+        new CachingProxyPrefix("/v2/jetbrains=registry.example.com/v2/p", Profile: "docker", IsPrivate: true),
+        new CachingProxyPrefix("/v2/mirror=registry.example.com/v2/p/ij/open", Profile: "docker", IsPrivate: false),
+      ],
+      CachingProfiles = { ["docker"] = new CachingProfile { Oci = true } },
+      UpstreamAuth = { [nameof(registry)] = registry },
+    };
+
+    var remoteServers = new RemoteServers(config, new NullLogger<RemoteServers>());
+    var gated = remoteServers.Endpoints.ToDictionary(
+      e => e.Metadata.GetMetadata<RemoteServers.RemoteServer>()!.Prefix.Value!,
+      e => e.Metadata.GetMetadata<IAuthorizeData>() != null);
+
+    Assert.True(remoteServers.HasGatedOciPrefix);
+    Assert.True(gated["/v2/jetbrains"]);
+    Assert.False(gated["/v2/mirror"]);
   }
 
   [Fact]

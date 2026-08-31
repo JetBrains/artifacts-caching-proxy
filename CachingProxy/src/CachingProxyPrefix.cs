@@ -10,13 +10,15 @@ public record CachingProxyPrefix(
   string Prefix,
   CacheDuration? CacheDuration = null,
   string? Profile = null,
-  string? DefaultNamespace = null)
+  string? DefaultNamespace = null,
+  bool? IsPrivate = null)
 {
   public static implicit operator CachingProxyPrefix(string prefix) => new(prefix);
 
   public override string ToString()
   {
     var result = Prefix;
+    if (IsPrivate is {} isPrivate) result += $" {(isPrivate ? "🔒" : "🔓")}";
     if (CacheDuration != null) result += $" {CacheDuration}";
     if (Profile != null) result += $" [{Profile}]";
     if (DefaultNamespace != null) result += $" +{DefaultNamespace}/";
