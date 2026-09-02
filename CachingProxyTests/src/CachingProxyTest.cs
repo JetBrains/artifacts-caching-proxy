@@ -109,6 +109,23 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
             new CachingRule { Pattern = ".", RefreshAfter = TimeSpan.FromMinutes(5) },
           ]
         },
+        // The pypi profile, in the shipped order (appsettings.json): the PEP 503/691 simple index is the
+        // one content-negotiated endpoint here and revalidates on upstream's own max-age=600, while every
+        // distribution shape is immutable - PyPI has rejected the re-upload of a filename since 2018 -
+        // and is cached forever. The index rule comes first so that no eternal rule can pin a growing
+        // index, under any alias. Nothing redirects: this profile carries private Space feeds too.
+        ["pypi"] = new()
+        {
+          Rules =
+          [
+            new CachingRule { Pattern = "/simple(/|$)", RefreshAfter = TimeSpan.FromMinutes(10), VaryByAccept = true },
+            new CachingRule { Pattern = "/packages/" },
+            new CachingRule { Pattern = @"\.(?:whl|egg|tgz|zip|exe|msi)$" },
+            new CachingRule { Pattern = @"\.tar\.(?:gz|bz2|xz|Z)$" },
+            new CachingRule { Pattern = @"\.metadata$" },
+            new CachingRule { Pattern = ".", RefreshAfter = TimeSpan.FromMinutes(10) },
+          ]
+        },
       },
       Prefixes =
       [
@@ -126,6 +143,7 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
         new CachingProxyPrefix($"/real-redirect={upstreamServer.Url}", Profile: "redirect-all"),
         new CachingProxyPrefix($"/real-npm={upstreamServer.Url}", Profile: "npm"),
         new CachingProxyPrefix($"/real-nuget={upstreamServer.Url}", Profile: "nuget"),
+        new CachingProxyPrefix($"/real-pypi={upstreamServer.Url}", Profile: "pypi"),
         // An OCI prefix carries the "/v2" on both sides, exactly as config-gen emits it: the client
         // inserts "/v2/" after the host itself, so the alias is "/v2/<name>" and the origin ends in /v2.
         new CachingProxyPrefix($"/v2/real-docker={upstreamServer.Url}v2", Profile: "docker"),
@@ -1247,6 +1265,47 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
     {
       myUpstreamServer.RequireRegistryToken = false;
     }
+  }
+
+  [Fact]
+  public async Task Pypi_Simple_Index_Is_Cached_Per_Accept()
+  {
+    // The first VaryByAccept rule outside OCI. PEP 691 gives one /simple/<name>/ URL two representations
+    // - JSON and HTML, by Accept - while the proxy's cache key is otherwise the resolved path alone, so
+    // without the flag a JSON-preferring uv is handed whatever the last pip asked for. pypi.org is
+    // lenient like Docker Hub and falls back to HTML rather than 406, which is what makes that silent.
+    const string path = "/real-pypi/simple/testpkg/";
+    var before = myUpstreamServer.SimpleIndexRequestCount;
+
+    foreach (var expectedStatus in new[] { CachingProxyStatus.MISS, CachingProxyStatus.HIT })
+    foreach (var accept in new[] { UpstreamTestServer.SimpleJsonMediaType, MediaTypeNames.Text.Html })
+    {
+      await AssertGetResponse(path, HttpStatusCode.OK,
+        (message, bytes) =>
+        {
+          AssertStatusHeader(message, expectedStatus);
+          // The representation asked for, on the miss that fetched it and on the hit that replayed it.
+          Assert.Equal(accept, message.Content.Headers.ContentType?.MediaType);
+          Assert.Equal(
+            accept == MediaTypeNames.Text.Html
+              ? "<!DOCTYPE html><html><body></body></html>"
+              : "{\"name\":\"testpkg\",\"files\":[]}",
+            Encoding.UTF8.GetString(bytes));
+          // Announced because we keyed on it - a cache in front of us must not fold the two together.
+          Assert.Equal(["Accept"], message.Headers.Vary);
+          // The window we hand the client is the one we revalidate on, which is upstream's own max-age.
+          Assert.Equal(TimeSpan.FromMinutes(10), message.Headers.CacheControl?.MaxAge);
+        },
+        accept);
+    }
+
+    // Two representations, two fetches, four client requests: the second pair came off the cache.
+    Assert.Equal(before + 2, myUpstreamServer.SimpleIndexRequestCount);
+    // And each fetch carried the client's own Accept upstream. The proxy negotiates on the client's
+    // behalf rather than picking a representation for it, so a type we have never heard of still works.
+    Assert.Equal(
+      [UpstreamTestServer.SimpleJsonMediaType, MediaTypeNames.Text.Html],
+      myUpstreamServer.SimpleAcceptHeaders.ToArray());
   }
 
   [Fact]

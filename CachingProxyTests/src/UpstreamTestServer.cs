@@ -100,6 +100,14 @@ public class UpstreamTestServer : IAsyncLifetime
   public int TokenRequestCount;
   public readonly ConcurrentQueue<string> ManifestAcceptHeaders = new();
 
+  // Counts hits on the PEP 503/691 simple-index route and records the Accept of each, in arrival order,
+  // so a test can assert that two representations of one URL cost two upstream fetches and no more - and
+  // that what negotiated was the client's own Accept rather than one the proxy invented.
+  public int SimpleIndexRequestCount;
+  public readonly ConcurrentQueue<string> SimpleAcceptHeaders = new();
+
+  public const string SimpleJsonMediaType = "application/vnd.pypi.simple.v1+json";
+
   // Set to make every OCI route answer 401 + a Bearer challenge unless the request carries
   // "Authorization: Bearer <TokenToIssue>", so a test can drive the full challenge/token/retry dance.
   // The realm points back at this server's own /oauth/token route.
@@ -264,6 +272,23 @@ public class UpstreamTestServer : IAsyncLifetime
       {
         res.ContentType = MediaTypeNames.Application.Json;
         return res.WriteAsync("{\"repositories\":[\"testimage\"]}");
+      })
+      .MapGet("simple/testpkg/{*trailing}", (req, res, data) =>
+      {
+        Interlocked.Increment(ref SimpleIndexRequestCount);
+        var accept = req.Headers.Accept.ToString();
+        SimpleAcceptHeaders.Enqueue(accept);
+
+        // PEP 691 negotiation: one URL, two representations chosen by Accept, each with an ETag of its
+        // own - the shape VaryByAccept exists for. pypi.org is lenient, like Docker Hub on a manifest: it
+        // falls back to HTML rather than 406, and that leniency is what makes a path-only cache key
+        // dangerous here. The wrong representation is simply served, with no error anywhere to notice it.
+        var wantsJson = accept.Contains(SimpleJsonMediaType, StringComparison.OrdinalIgnoreCase);
+        res.ContentType = wantsJson ? SimpleJsonMediaType : MediaTypeNames.Text.Html;
+        res.Headers.ETag = wantsJson ? "\"simple-json\"" : "\"simple-html\"";
+        return res.WriteAsync(wantsJson
+          ? "{\"name\":\"testpkg\",\"files\":[]}"
+          : "<!DOCTYPE html><html><body></body></html>");
       })
       .MapGet("conditional-500.txt", (req, res, data) =>
       {

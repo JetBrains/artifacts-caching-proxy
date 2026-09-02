@@ -299,6 +299,101 @@ public class CachingProfileTest
     }
   }
 
+  [Fact]
+  public void Pypi_Profile_Rules_Resolve_By_Endpoint_Kind()
+  {
+    // Mirrors the shipped pypi profile ordering (appsettings.json). PyPI has rejected the re-upload of
+    // a filename since 2018, so every distribution shape is eternal; the PEP 503/691 index is
+    // append-only apart from `yanked` and revalidates on upstream's own max-age=600.
+    var profile = PypiProfile();
+
+    foreach (var filePath in new[]
+             {
+               // files.pythonhosted.org, modern hash-sharded layout, and the PEP 658 sidecar beside
+               // it - that doubled extension is why .metadata needs a rule of its own.
+               "/files.pythonhosted.org/packages/76/c6/c88e154df9c4/idna-3.10-py3-none-any.whl",
+               "/files.pythonhosted.org/packages/76/c6/c88e154df9c4/idna-3.10-py3-none-any.whl.metadata",
+               // Legacy layouts, still served: no hash shard, and one keyed by python version.
+               "/files.pythonhosted.org/packages/source/D/Django/Django-1.0.tar.gz",
+               "/files.pythonhosted.org/packages/2.7/s/six/six-1.16.0-py2.py3-none-any.whl",
+               // The long tail the /packages/ segment absorbs and an extension list would not.
+               "/files.pythonhosted.org/packages/a1/b2/setuptools-0.6c11-py2.6.egg",
+               "/files.pythonhosted.org/packages/a1/b2/pywin32-306-cp312-win_amd64.exe",
+               "/files.pythonhosted.org/packages/a1/b2/numpy-1.0.tar.bz2",
+               // A Space feed serves its files off /download/{name}/{version}/, nowhere near
+               // /packages/, so only the extension rules can reach them.
+               "/pypi/p/ij/pypi-mirror/download/idna/3.10/idna-3.10-py3-none-any.whl",
+               "/packages.jetbrains.team/pypi/p/ij/pypi-mirror/download/idna/0.2/idna-0.2.tar.gz",
+             })
+    {
+      var file = profile.Match(filePath);
+      Assert.NotNull(file);
+      Assert.Null(file!.RefreshAfter);
+      Assert.False(file.Redirect);
+      Assert.False(file.VaryByAccept);
+    }
+
+    // The simple index revalidates, and negotiates: one URL, PEP 691 JSON or HTML by Accept, each with
+    // an ETag of its own. The slash-less form is covered because a client that reaches the proxy
+    // directly can ask for the bare prefix and the prefix match allows it - most of our load arrives
+    // that way, over PrivateLink, rather than through the redirector, which 404s an alias with nothing
+    // after it, for pypi.org exactly as it does for repo1.maven.org.
+    foreach (var indexPath in new[]
+             {
+               "/pypi.org/simple/",
+               "/pypi.org/simple/idna/",
+               "/pypi.org/simple",
+               "/pypi/p/ij/pypi-mirror/simple/idna/",
+               "/packages.jetbrains.team/pypi/p/ij/pypi-mirror/simple",
+             })
+    {
+      var index = profile.Match(indexPath);
+      Assert.NotNull(index);
+      Assert.Equal(TimeSpan.FromMinutes(10), index!.RefreshAfter);
+      Assert.True(index.VaryByAccept);
+    }
+
+    // The legacy JSON API is not proxied today, but it is what the catch-all is for: a short window,
+    // and nothing to negotiate on.
+    var legacyJson = profile.Match("/pypi.org/pypi/idna/json");
+    Assert.NotNull(legacyJson);
+    Assert.Equal(TimeSpan.FromMinutes(10), legacyJson!.RefreshAfter);
+    Assert.False(legacyJson.VaryByAccept);
+
+    // Nothing here redirects, and a redirect is the only way a query string could ride along. This
+    // profile also carries private Space feeds, so a client must never be bounced to an origin it
+    // holds no credential for - the reason the docker catch-all is a window and not a redirect.
+    Assert.DoesNotContain(profile.Rules, rule => rule.Redirect);
+  }
+
+  [Fact]
+  public void Pypi_Eternal_Rules_Do_Not_Swallow_A_Simple_Index()
+  {
+    // The index rule is first for this reason alone, and reordering the list is what this test catches.
+    // /packages/ is a mid-path segment rather than an end anchor, so it matches any alias that happens
+    // to contain it - and a growing index cached forever is the one mistake there is no recovering from
+    // short of a cache wipe. Keeping /simple ahead of it makes that structurally impossible instead of
+    // merely unlikely: for the aliases shipped today, and for whatever a Space project is named later.
+    var profile = PypiProfile();
+
+    foreach (var indexPath in new[]
+             {
+               // A Space project or repository literally named `packages`. The eternal segment rule
+               // does match these strings; only rule order keeps the index off an eternal entry.
+               "/pypi/p/ij/packages/simple/idna/",
+               "/pypi/p/packages/pypi-mirror/simple/",
+               // The aliases shipped today. /packages.jetbrains.team is safe on its own - a dot, not a
+               // slash - which is exactly the kind of accident worth pinning rather than re-deriving.
+               "/packages.jetbrains.team/pypi/p/ij/pypi-mirror/simple/idna/",
+               "/pypi.org/simple/idna/",
+             })
+    {
+      var index = profile.Match(indexPath);
+      Assert.NotNull(index);
+      Assert.Equal(TimeSpan.FromMinutes(10), index!.RefreshAfter);
+    }
+  }
+
   // The shipped docker profile, kept in the same order as CachingProxy/appsettings.json.
   private static CachingProfile DockerProfile() => new()
   {
@@ -338,6 +433,20 @@ public class CachingProfileTest
       new CachingRule { Pattern = @"/dist/\d{4}-\d{2}-\d{2}/" },
       new CachingRule { Pattern = @"/dist/channel-rust-\d" },
       new CachingRule { Pattern = "/rustup/archive/" },
+      new CachingRule { Pattern = ".", RefreshAfter = TimeSpan.FromMinutes(10) },
+    ]
+  };
+
+  // The shipped pypi profile, kept in the same order as CachingProxy/appsettings.json.
+  private static CachingProfile PypiProfile() => new()
+  {
+    Rules =
+    [
+      new CachingRule { Pattern = "/simple(/|$)", RefreshAfter = TimeSpan.FromMinutes(10), VaryByAccept = true },
+      new CachingRule { Pattern = "/packages/" },
+      new CachingRule { Pattern = @"\.(?:whl|egg|tgz|zip|exe|msi)$" },
+      new CachingRule { Pattern = @"\.tar\.(?:gz|bz2|xz|Z)$" },
+      new CachingRule { Pattern = @"\.metadata$" },
       new CachingRule { Pattern = ".", RefreshAfter = TimeSpan.FromMinutes(10) },
     ]
   };
