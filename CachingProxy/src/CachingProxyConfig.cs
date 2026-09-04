@@ -20,9 +20,16 @@ public class CachingProxyConfig
     public int InlineThresholdBytes { get; init; } = 32 * 1024;
 
     // Objects this big or bigger are stored with a multipart upload, smaller ones with a single
-    // PutObject. S3 rejects a single PUT above 5 GiB, which is what this defaults to; lower it only to
-    // exercise the multipart path in tests.
-    public long MultipartThresholdBytes { get; init; } = 5L * 1024 * 1024 * 1024;
+    // PutObject. 100 MiB is S3's own guidance ("it's a best practice to use multipart upload for
+    // objects that are 100 MB or larger"), in the binary units the rest of this file uses; the hard
+    // constraint is only that it stay at or below the 5 GiB a single PUT accepts, since above that the
+    // PUT is refused outright (MRI-5371).
+    //
+    // It doubles as the threshold for streaming: an object this big is relayed to the client as its
+    // parts go up, rather than being stored in full before the response starts (see
+    // S3CachingMiddleware.StreamAndStoreAsync). So lowering it also moves a first fetch's egress from
+    // S3 to the proxy, and raising it puts slow objects back at risk of a load balancer's idle timeout.
+    public long MultipartThresholdBytes { get; init; } = 100L * 1024 * 1024;
 
     // Part size floor for a multipart upload. One part is buffered in memory at a time, so this is the
     // per-upload memory cost for any object up to 10,000 parts of this size (~156 GiB); past that

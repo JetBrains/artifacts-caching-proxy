@@ -160,12 +160,16 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   }
 
   [Fact]
-  public void Multipart_Threshold_Defaults_To_S3s_Single_Put_Ceiling()
+  public void Multipart_Threshold_Defaults_Below_S3s_Single_Put_Ceiling()
   {
-    // The bug this whole path exists for (MRI-5371): a 5.68 GiB engine archive went out as one PUT,
-    // S3 answered EntityTooLarge, and the client got a 503 for an artifact the upstream had served.
-    // A default above S3's ceiling puts that back, and no other test would notice.
-    Assert.Equal(SinglePutLimitBytes, DefaultS3Config.MultipartThresholdBytes);
+    // S3's own guidance is multipart at 100 MB or larger, in the binary units the config uses.
+    Assert.Equal(100L * 1024 * 1024, DefaultS3Config.MultipartThresholdBytes);
+
+    // The invariant that matters, and the bug this whole path exists for (MRI-5371): a 5.68 GiB engine
+    // archive went out as one PUT, S3 answered EntityTooLarge, and the client got a 503 for an artifact
+    // the upstream had served. Any default above S3's ceiling puts that back, and no other test would
+    // notice - every test that reaches the multipart path pins its own threshold.
+    Assert.True(DefaultS3Config.MultipartThresholdBytes <= SinglePutLimitBytes);
   }
 
   [Theory]
@@ -187,16 +191,26 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   }
 
   [Fact]
-  public async Task Get_Miss_Uploads_A_Large_Object_In_Parts()
+  public async Task Get_Miss_Streams_A_Large_Object_While_Storing_It_In_Parts()
   {
     // "sized.jar" is 9 bytes and declares a Content-Length, so it streams straight through without the
     // temp-file spool: 4-byte parts split it 4 + 4 + 1, exercising a short final part.
     var server = CreateServer(signedLinks: true, multipartThresholdBytes: 9, multipartPartSizeBytes: 4);
+    using var metrics = new RequestMetricRecorder(server.Services);
     using var response = await server.CreateRequest("/real/sized.jar").SendAsync(HttpMethod.Get.Method);
 
-    Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
+    // A streamed 200, not the 307 a smaller object's MISS answers with. Waiting for the store to finish
+    // before responding is exactly what put a multi-gigabyte client past a load balancer's idle timeout
+    // (MRI-5371), so the body has to start moving while the parts go up.
+    Assert.Equal(HttpStatusCode.OK, response.StatusCode);
     AssertStatusHeader(response, CachingProxyStatus.MISS);
+    Assert.Equal("sized.jar", await response.Content.ReadAsStringAsync());
+    Assert.Equal(9, response.Content.Headers.ContentLength);
+    // Counted once, by the streaming path rather than by the head it wrote: a head written for a body
+    // the caller relays itself counts none of it.
+    Assert.Equal([("MISS", 9L)], metrics.ContentBytes);
 
+    // ...and it was stored on the way through, in parts, so the next request finds it in the bucket.
     Assert.Equal(0, myS3.PutObjectCalls); // not a single PUT - that is the point
     Assert.Equal(3, myS3.UploadPartCalls);
     Assert.Equal(0, myS3.AbortMultipartUploadCalls);
@@ -212,10 +226,12 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   }
 
   [Fact]
-  public async Task Get_Miss_Uploads_A_Large_Chunked_Object_In_Parts()
+  public async Task Get_Miss_Uploads_A_Large_Chunked_Object_In_Parts_Without_Streaming_It()
   {
     // No upstream Content-Length (chunked), so the body is spooled to a temp file first and the part
-    // count comes from the spooled length: "chunk1chunk2" is 12 bytes, split 5 + 5 + 2.
+    // count comes from the spooled length: "chunk1chunk2" is 12 bytes, split 5 + 5 + 2. With no declared
+    // size there is nothing to promise the client up front, so this object is stored and redirected to
+    // the way it always was - the one large-object shape the streaming path above does not cover.
     var server = CreateServer(signedLinks: true, multipartThresholdBytes: 12, multipartPartSizeBytes: 5);
     using var response = await server.CreateRequest("/real/chunked.bin").SendAsync(HttpMethod.Get.Method);
 
@@ -229,20 +245,37 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   }
 
   [Fact]
-  public async Task Failed_Part_Upload_Aborts_The_Multipart_Upload()
+  public async Task A_Part_That_Fails_Mid_Stream_Drops_The_Connection()
   {
-    // An upload left open keeps billing for the parts already stored, and an object listing does not
-    // show it, so the failure path has to abandon it explicitly.
     myS3.FailUploadPartNumber = 2;
     var server = CreateServer(signedLinks: true, multipartThresholdBytes: 9, multipartPartSizeBytes: 4);
 
-    using var response = await server.CreateRequest("/real/sized.jar").SendAsync(HttpMethod.Get.Method);
+    // The head and the first part are already on the wire, so this failure has no status left to become.
+    // Completing the response would leave the client a body short of the Content-Length it was promised,
+    // which it would keep as a whole artifact; dropping the connection makes it retry instead.
+    await Assert.ThrowsAnyAsync<HttpRequestException>(
+      () => server.CreateRequest("/real/sized.jar").SendAsync(HttpMethod.Get.Method));
 
-    // The artifact exists upstream and only the cache write failed, so this is a 503 the client retries
-    // rather than a negatively-cached 404 (see S3CachingMiddleware.InvokeAsync).
-    Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+    // An upload left open keeps billing for the parts already stored, and an object listing does not
+    // show it, so the failure path has to abandon it explicitly.
     Assert.Equal(1, myS3.AbortMultipartUploadCalls);
     Assert.DoesNotContain(GetPathKey("/real/sized.jar"), myS3.Objects.Keys);
+  }
+
+  [Fact]
+  public async Task Failed_Part_Upload_Answers_503_While_Nothing_Is_On_The_Wire_Yet()
+  {
+    // The chunked route is stored without being streamed (see above), so this failure does still have a
+    // status to report: the artifact exists upstream and only the cache write failed, which is a 503 the
+    // client retries rather than a negatively-cached 404 (see S3CachingMiddleware.InvokeAsync).
+    myS3.FailUploadPartNumber = 2;
+    var server = CreateServer(signedLinks: true, multipartThresholdBytes: 12, multipartPartSizeBytes: 5);
+
+    using var response = await server.CreateRequest("/real/chunked.bin").SendAsync(HttpMethod.Get.Method);
+
+    Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+    Assert.Equal(1, myS3.AbortMultipartUploadCalls);
+    Assert.DoesNotContain(GetPathKey("/real/chunked.bin"), myS3.Objects.Keys);
   }
 
   [Fact]

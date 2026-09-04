@@ -271,16 +271,7 @@ public partial class RemoteProxy(
             $"{upstreamUri} returned Content-Encoding '{contentEncoding}' which is not supported");
       }
 
-      // An upstream that sends no Content-Type at all falls back to octet-stream rather than to no
-      // header, so a MISS and every later HIT (which reads it back off the stored copy, where "absent"
-      // is indistinguishable from "never sent") agree on what the bytes are.
-      var responseEntry = new CachedResponse(response)
-      {
-        Headers =
-        {
-          ContentType = response.Content.Headers.ContentType?.ToString() ?? MediaTypeNames.Application.Octet,
-        }
-      };
+      var responseEntry = BodyHead(response);
 
       if (isHead)
       {
@@ -509,6 +500,27 @@ public partial class RemoteProxy(
 
     return response.Headers.ContentLength;
   }
+
+  /// <summary>
+  /// The head for a MISS body whose bytes the caller relays itself, so the caller reports what it
+  /// actually moved with <see cref="AddContentBytes"/>. Public for a caller that asked
+  /// <see cref="ProcessAsync"/> not to write this head because it did not yet know whether it would
+  /// stream the body or replace the response (see <c>S3CachingMiddleware</c>, which decides on the
+  /// object's size): the head has to come out identical either way.
+  /// </summary>
+  public ValueTask WriteBodyHeadAsync(HttpContext context, HttpResponseMessage response, CachingRule? rule) =>
+    SetStatusAsync(context, CachingProxyStatus.MISS, BodyHead(response), rule, countContentBytes: false);
+
+  // An upstream that sends no Content-Type at all falls back to octet-stream rather than to no header, so
+  // a MISS and every later HIT (which reads it back off the stored copy, where "absent" is
+  // indistinguishable from "never sent") agree on what the bytes are.
+  private static CachedResponse BodyHead(HttpResponseMessage response) => new(response)
+  {
+    Headers =
+    {
+      ContentType = response.Content.Headers.ContentType?.ToString() ?? MediaTypeNames.Application.Octet,
+    }
+  };
 
   /// <summary>
   /// Reports the content bytes a response delivered, for a head written earlier with

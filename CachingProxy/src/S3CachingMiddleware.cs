@@ -260,8 +260,9 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
         catch (AmazonServiceException ex) when (ex.StatusCode is HttpStatusCode.NotFound) { }
       }
 
-      // No head for the body: it is uploaded, not streamed to the client, and the redirect below is the
-      // response (and the one report) this request gets.
+      // No head yet for the body: whether this request streams it or replaces the response with a
+      // redirect is decided below, from a size only the upstream head can tell us, and the head has to
+      // match that decision.
       using var response = await remoteProxy.ProcessAsync(context, s3Key, remoteServer.CacheDuration, upstreamUri,
         auth: remoteServer.Auth, rule: rule, profile: remoteServer.Profile, writeBodyHead: false);
 
@@ -269,6 +270,22 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
       if (response == null) return;
 
       context.Response.Clear();
+
+      // Store-then-redirect leaves the client with nothing on the wire until the whole object is fetched
+      // AND uploaded, and a load balancer closes an idle connection long before that finishes for a
+      // multi-gigabyte artifact - a 60s ALB idle timeout against the several minutes a 5.68 GiB archive
+      // takes, which is MRI-5371's second half. So an object big enough to be uploaded in parts is
+      // relayed to the client as those parts go up: bytes move from the first part on, and the object is
+      // still stored for the next request to redirect to.
+      //
+      // A null ContentLength (chunked upstream) compares false and keeps the spool-then-store path
+      // below: without a declared size there is nothing to promise the client up front and no way to
+      // size the parts.
+      if (response.Content.Headers.ContentLength >= config.S3!.MultipartThresholdBytes)
+      {
+        await StreamAndStoreAsync(context, s3Key, upstreamUri, response, rule);
+        return;
+      }
 
       var contentLength = await StoreInBucketAsync(s3Key, upstreamUri, response, context.RequestAborted);
 
@@ -280,12 +297,21 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
     }
     catch (Exception e)
     {
-      // The artifact exists upstream; we just failed to store or redirect it. Respond 503 (and do
-      // NOT cache a negative result) so the client retries and a transient S3 problem recovers on
-      // the next request, instead of serving a "not found" for an artifact that is actually available.
-      context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
-      context.Response.ContentType = MediaTypeNames.Text.Plain;
-      await context.Response.WriteAsync("Failed to cache response");
+      if (context.Response.HasStarted)
+        // The streaming path (StreamAndStoreAsync) has already put a 200 and part of the body on the
+        // wire, so there is no status left to turn into an error. Drop the connection: a client that
+        // sees a truncated transfer retries, whereas completing a short body against the declared
+        // Content-Length would hand it a corrupt artifact it believes is whole.
+        context.Abort();
+      else
+      {
+        // The artifact exists upstream; we just failed to store or redirect it. Respond 503 (and do
+        // NOT cache a negative result) so the client retries and a transient S3 problem recovers on
+        // the next request, instead of serving a "not found" for an artifact that is actually available.
+        context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+        context.Response.ContentType = MediaTypeNames.Text.Plain;
+        await context.Response.WriteAsync("Failed to cache response");
+      }
 
       switch (e)
       {
@@ -448,7 +474,8 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
 
       if (contentLength.Value >= config.S3!.MultipartThresholdBytes)
       {
-        await StoreInBucketMultipartAsync(s3Key, requestUri, response, uploadStream, contentLength.Value, cancellationToken);
+        await StoreInBucketMultipartAsync(s3Key, requestUri, response, uploadStream, contentLength.Value,
+          relayTo: null, cancellationToken);
         return contentLength.Value;
       }
 
@@ -474,12 +501,44 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
   }
 
   /// <summary>
+  /// Streams the upstream body to the client while storing it, for an object big enough that storing it
+  /// first would keep the connection idle past a load balancer's timeout (MRI-5371). The client gets an
+  /// ordinary streamed-MISS 200, not the redirect a smaller object's MISS returns; the next request
+  /// finds the object in the bucket and is redirected as usual.
+  ///
+  /// Known trade-off: the caller still holds this object's prefix lease for the whole relay, and the
+  /// loop now advances at the slower of the upstream and the client, so a slow client both paces the
+  /// upload and keeps other objects in its prefix partition queued for longer than the store alone
+  /// would have. Store-then-redirect held the lease for minutes too, so this is a widening rather than
+  /// a new problem, but decoupling the relay from the upload is the follow-up.
+  /// </summary>
+  private async Task StreamAndStoreAsync(HttpContext context, string s3Key, Uri requestUri,
+    HttpResponseMessage response, CachingRule? rule)
+  {
+    var contentLength = response.Content.Headers.ContentLength!.Value;
+
+    // Before a single byte of the body, so the client sees a response head immediately - the whole point
+    // of this path. Identical to the head ProcessAsync writes for any other streamed MISS.
+    await remoteProxy.WriteBodyHeadAsync(context, response, rule);
+
+    await using var body = await response.Content.ReadAsStreamAsync(context.RequestAborted);
+    await StoreInBucketMultipartAsync(s3Key, requestUri, response, body, contentLength,
+      relayTo: context.Response.Body, context.RequestAborted);
+
+    // Exactly contentLength bytes reached the client: the parts loop reads with ReadExactlyAsync, so an
+    // upstream that ends early throws there rather than completing a short body. The head declared that
+    // length and counted none of it (countContentBytes: false), so this is the request's one report.
+    remoteProxy.AddContentBytes(context, CachingProxyStatus.MISS, contentLength);
+  }
+
+  /// <summary>
   /// Uploads the body in parts, for an object at or over S3Config.MultipartThresholdBytes. Parts go
   /// out one at a time: the body is a single forward-only stream, so there is nothing to parallelise
-  /// over, and sequential parts keep the memory cost at one part buffer per upload.
+  /// over, and sequential parts keep the memory cost at one part buffer per upload. When
+  /// <paramref name="relayTo"/> is set, each part is also written there as it is uploaded.
   /// </summary>
   private async Task StoreInBucketMultipartAsync(string s3Key, Uri requestUri, HttpResponseMessage response,
-    Stream body, long contentLength, CancellationToken cancellationToken)
+    Stream body, long contentLength, Stream? relayTo, CancellationToken cancellationToken)
   {
     var initiate = new InitiateMultipartUploadRequest
     {
@@ -491,7 +550,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
     var uploadId = (await amazonS3.InitiateMultipartUploadAsync(initiate, cancellationToken)).UploadId;
     try
     {
-      var parts = await UploadPartsAsync(s3Key, uploadId, body, contentLength, cancellationToken);
+      var parts = await UploadPartsAsync(s3Key, uploadId, body, contentLength, relayTo, cancellationToken);
 
       await amazonS3.CompleteMultipartUploadAsync(new CompleteMultipartUploadRequest
       {
@@ -528,7 +587,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
   }
 
   private async Task<List<PartETag>> UploadPartsAsync(string s3Key, string uploadId, Stream body,
-    long contentLength, CancellationToken cancellationToken)
+    long contentLength, Stream? relayTo, CancellationToken cancellationToken)
   {
     var partSize = PartSizeFor(contentLength, config.S3!.MultipartPartSizeBytes);
     // Reused across parts: each UploadPartAsync is awaited before the next read overwrites the buffer,
@@ -544,7 +603,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
 
       // A MemoryStream over the buffer, not the body itself: a part has to be re-readable for the SDK
       // to retry it, which a forward-only response body is not.
-      var part = await amazonS3.UploadPartAsync(new UploadPartRequest
+      var upload = amazonS3.UploadPartAsync(new UploadPartRequest
       {
         BucketName = config.S3!.BucketName,
         Key = s3Key,
@@ -553,6 +612,14 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
         PartSize = partLength,
         InputStream = new MemoryStream(buffer, 0, partLength, writable: false),
       }, cancellationToken);
+
+      // Both reads of the same buffer, run together rather than one after the other so the client's copy
+      // is not serialized behind the S3 round trip. Neither may outlive the await: the next iteration
+      // overwrites the buffer, so awaiting both here is what makes reusing it safe.
+      if (relayTo != null)
+        await Task.WhenAll(upload, relayTo.WriteAsync(buffer, 0, partLength, cancellationToken));
+
+      var part = await upload;
 
       parts.Add(new PartETag(partNumber, part.ETag));
       uploaded += partLength;
