@@ -244,6 +244,15 @@ public static class Program
         handler.ConnectTimeout = TimeSpan.FromSeconds(config.ConnectTimeoutSec);
         handler.MaxConnectionsPerServer = config.MaxConnectionsPerServer;
 
+        // Without this the cap above is inert against every origin that negotiates HTTP/2 - which is most
+        // of them, since the client requests 2.0 or higher: a pool holds exactly one HTTP/2 connection per
+        // origin (RFC 9113 9.1 says not to open more) and queues everything past that connection's
+        // SETTINGS_MAX_CONCURRENT_STREAMS, commonly 100. That queueing is what MaxConnectionsPerServer is
+        // sized to prevent - requests wait, spend the request budget, come back negative-cached as 404s -
+        // and it would start an order of magnitude below the configured value. The RFC is written for
+        // browsers, not for a proxy fanning out to one origin, which is why YARP defaults this on too.
+        handler.EnableMultipleHttp2Connections = true;
+
         // NOTE on "Cannot assign requested address" (EADDRNOTAVAIL) when connecting upstream:
         // .NET's resolver does not pass AI_ADDRCONFIG, so AAAA records are returned even where no
         // routable IPv6 source address exists (archive.apache.org and downloads.apache.org publish
