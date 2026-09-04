@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.IO;
@@ -32,6 +33,11 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
   // carried separately to make a conditional revalidation land. The two coincide only where the upstream
   // also tags by body MD5 (Maven Central does, which is why this went unnoticed).
   private const string UpstreamETagMetadataKey = "upstream-etag";
+
+  // A multipart upload gets at most this many parts. An object big enough to exhaust the budget at the
+  // configured part size gets larger parts instead (see PartSizeFor), because running out of parts
+  // fails the upload while a bigger buffer merely costs more memory.
+  private const int MaxPartCount = 10_000;
 
   // The bucket endpoint URL (assumed to end with '/', as AWS virtual-hosted-style endpoints do, so it
   // joins to an "aa/bb/<hash>" key with a single separator). Used both to build the redirect Location
@@ -416,7 +422,8 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
   /// Streams the upstream response body into the bucket. S3 PutObject needs a definite
   /// Content-Length: when the upstream declared one we stream the (non-seekable) body straight
   /// through; when it did not (e.g. chunked transfer) we first spool the body to a temp file so the
-  /// SDK gets a real length and does not buffer the whole body in memory.
+  /// SDK gets a real length and does not buffer the whole body in memory. An object too big for a
+  /// single PUT goes out as a multipart upload instead (S3Config.MultipartThresholdBytes).
   /// </summary>
   private async Task<long> StoreInBucketAsync(string s3Key, Uri requestUri, HttpResponseMessage response, CancellationToken cancellationToken)
   {
@@ -439,40 +446,20 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
         uploadStream = body;
       }
 
+      if (contentLength.Value >= config.S3!.MultipartThresholdBytes)
+      {
+        await StoreInBucketMultipartAsync(s3Key, requestUri, response, uploadStream, contentLength.Value, cancellationToken);
+        return contentLength.Value;
+      }
+
       var put = new PutObjectRequest
       {
         BucketName = config.S3!.BucketName,
         Key = s3Key,
-        Headers =
-        {
-          ContentType = response.Content.Headers.ContentType?.ToString(),
-          ContentEncoding = response.Content.Headers.ContentEncoding.FirstOrDefault(),
-          ContentLength = contentLength.Value,
-        },
-        Metadata =
-        {
-          ["uri"] = requestUri.ToString(),
-          [CreatedAtMetadataKey] = timeProvider.GetUtcNow().ToString("O", CultureInfo.InvariantCulture),
-        },
+        Headers = { ContentLength = contentLength.Value },
         InputStream = uploadStream,
       };
-
-      // An OCI client resolves a manifest by this digest, and it cannot be recomputed from the bytes we
-      // store, so it has to travel with the object (see CachedResponse). Only set when the upstream sent
-      // one, so non-registry objects gain no metadata.
-      if (response.Headers.TryGetValues(CachedResponse.DockerContentDigestHeader, out var digests) &&
-          digests.FirstOrDefault() is { Length: > 0 } digest)
-        put.Metadata[CachedResponse.DockerContentDigestMetadataKey] = digest;
-
-      // The upstream's validators for these bytes, for the next revalidation to be conditional on (see
-      // UpstreamETag and CachedResponse.UpstreamLastModified). The date is also what a HIT then serves;
-      // the ETag is not, S3 answering a 307'd client by matching its own.
-      if (response.Headers.ETag?.ToString() is { Length: > 0 } upstreamETag)
-        put.Metadata[UpstreamETagMetadataKey] = upstreamETag;
-
-      if (response.Content.Headers.LastModified is { } upstreamLastModified)
-        put.Metadata[CachedResponse.UpstreamLastModifiedMetadataKey] =
-          upstreamLastModified.ToString("O", CultureInfo.InvariantCulture);
+      ApplyObjectMetadata(put.Headers, put.Metadata, requestUri, response);
 
       await amazonS3.PutObjectAsync(put, cancellationToken);
 
@@ -484,5 +471,137 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
     {
       await uploadStream.DisposeAsync();
     }
+  }
+
+  /// <summary>
+  /// Uploads the body in parts, for an object at or over S3Config.MultipartThresholdBytes. Parts go
+  /// out one at a time: the body is a single forward-only stream, so there is nothing to parallelise
+  /// over, and sequential parts keep the memory cost at one part buffer per upload.
+  /// </summary>
+  private async Task StoreInBucketMultipartAsync(string s3Key, Uri requestUri, HttpResponseMessage response,
+    Stream body, long contentLength, CancellationToken cancellationToken)
+  {
+    var initiate = new InitiateMultipartUploadRequest
+    {
+      BucketName = config.S3!.BucketName,
+      Key = s3Key,
+    };
+    ApplyObjectMetadata(initiate.Headers, initiate.Metadata, requestUri, response);
+
+    var uploadId = (await amazonS3.InitiateMultipartUploadAsync(initiate, cancellationToken)).UploadId;
+    try
+    {
+      var parts = await UploadPartsAsync(s3Key, uploadId, body, contentLength, cancellationToken);
+
+      await amazonS3.CompleteMultipartUploadAsync(new CompleteMultipartUploadRequest
+      {
+        BucketName = config.S3.BucketName,
+        Key = s3Key,
+        UploadId = uploadId,
+        PartETags = parts,
+      }, cancellationToken);
+    }
+    catch
+    {
+      // An upload left open keeps billing for the parts already stored and is invisible to an object
+      // listing, so abandon it here rather than relying on a bucket lifecycle rule this app does not
+      // own. CancellationToken.None because the usual reason we are here is that the token tripped.
+      try
+      {
+        await amazonS3.AbortMultipartUploadAsync(new AbortMultipartUploadRequest
+        {
+          BucketName = config.S3.BucketName,
+          Key = s3Key,
+          UploadId = uploadId,
+        }, CancellationToken.None);
+      }
+      catch (Exception abortFailure)
+      {
+        // Swallowed: the upload failure below is what the caller has to see, and this one only costs
+        // storage. It is logged because that cost is otherwise silent.
+        logger.LogWarning(Event.FailedToCacheInS3, abortFailure,
+          "Failed to abort multipart upload {UploadId} of {S3Key}", uploadId, s3Key);
+      }
+
+      throw;
+    }
+  }
+
+  private async Task<List<PartETag>> UploadPartsAsync(string s3Key, string uploadId, Stream body,
+    long contentLength, CancellationToken cancellationToken)
+  {
+    var partSize = PartSizeFor(contentLength, config.S3!.MultipartPartSizeBytes);
+    // Reused across parts: each UploadPartAsync is awaited before the next read overwrites the buffer,
+    // and the SDK's own retries of a part happen inside that await.
+    var buffer = new byte[partSize];
+    var parts = new List<PartETag>();
+
+    var partNumber = 1;
+    for (long uploaded = 0; uploaded < contentLength; partNumber++)
+    {
+      var partLength = (int)Math.Min(partSize, contentLength - uploaded);
+      await body.ReadExactlyAsync(buffer, 0, partLength, cancellationToken);
+
+      // A MemoryStream over the buffer, not the body itself: a part has to be re-readable for the SDK
+      // to retry it, which a forward-only response body is not.
+      var part = await amazonS3.UploadPartAsync(new UploadPartRequest
+      {
+        BucketName = config.S3!.BucketName,
+        Key = s3Key,
+        UploadId = uploadId,
+        PartNumber = partNumber,
+        PartSize = partLength,
+        InputStream = new MemoryStream(buffer, 0, partLength, writable: false),
+      }, cancellationToken);
+
+      parts.Add(new PartETag(partNumber, part.ETag));
+      uploaded += partLength;
+    }
+
+    return parts;
+  }
+
+  /// <summary>
+  /// The content headers and user metadata to store with the object, shared by the single-PUT and the
+  /// multipart path so a stored object reads back the same either way.
+  /// </summary>
+  private void ApplyObjectMetadata(HeadersCollection headers, MetadataCollection metadata,
+    Uri requestUri, HttpResponseMessage response)
+  {
+    headers.ContentType = response.Content.Headers.ContentType?.ToString();
+    headers.ContentEncoding = response.Content.Headers.ContentEncoding.FirstOrDefault();
+
+    metadata["uri"] = requestUri.ToString();
+    metadata[CreatedAtMetadataKey] = timeProvider.GetUtcNow().ToString("O", CultureInfo.InvariantCulture);
+
+    // An OCI client resolves a manifest by this digest, and it cannot be recomputed from the bytes we
+    // store, so it has to travel with the object (see CachedResponse). Only set when the upstream sent
+    // one, so non-registry objects gain no metadata.
+    if (response.Headers.TryGetValues(CachedResponse.DockerContentDigestHeader, out var digests) &&
+        digests.FirstOrDefault() is { Length: > 0 } digest)
+      metadata[CachedResponse.DockerContentDigestMetadataKey] = digest;
+
+    // The upstream's validators for these bytes, for the next revalidation to be conditional on (see
+    // UpstreamETag and CachedResponse.UpstreamLastModified). The date is also what a HIT then serves;
+    // the ETag is not, S3 answering a 307'd client by matching its own.
+    if (response.Headers.ETag?.ToString() is { Length: > 0 } upstreamETag)
+      metadata[UpstreamETagMetadataKey] = upstreamETag;
+
+    if (response.Content.Headers.LastModified is { } upstreamLastModified)
+      metadata[CachedResponse.UpstreamLastModifiedMetadataKey] =
+        upstreamLastModified.ToString("O", CultureInfo.InvariantCulture);
+  }
+
+  /// <summary>
+  /// The smallest part that still fits <paramref name="contentLength"/> into S3's part budget, floored
+  /// at <paramref name="partSizeFloor"/> (S3Config.MultipartPartSizeBytes). Public so the part
+  /// arithmetic can be unit-tested without pushing gigabytes through the middleware.
+  /// </summary>
+  public static int PartSizeFor(long contentLength, int partSizeFloor)
+  {
+    // Ceiling division. S3's own 5 TiB object ceiling keeps the result under 550 MiB, so the cast
+    // cannot overflow for anything S3 would have accepted in the first place.
+    var needed = (contentLength + MaxPartCount - 1) / MaxPartCount;
+    return (int)Math.Max(partSizeFloor, needed);
   }
 }

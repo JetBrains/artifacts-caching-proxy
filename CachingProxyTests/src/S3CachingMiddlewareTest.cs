@@ -44,13 +44,20 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   // 32 KiB window (so Inline_Threshold_Is_Configurable inlines it).
   private static readonly byte[] ourLargeBody = new byte[32 * 1024];
 
+  // The production defaults, for the tests that assert them and as the fallback for the ones that do not
+  // care (CreateServer).
+  private static readonly CachingProxyConfig.S3Config DefaultS3Config = new(BucketName);
+
+  // S3's own single-PutObject ceiling, which is what MultipartThresholdBytes has to default to.
+  private const long SinglePutLimitBytes = 5L * 1024 * 1024 * 1024;
+
   private readonly FakeAmazonS3 myS3 = new();
   private readonly List<IHost> myHosts = [];
   private readonly RemoteServers.RemoteServer myRemoteServer = new("/real", upstreamServer.Url, new CacheDuration());
 
   private TestServer CreateServer(bool signedLinks, TimeSpan? signedLinkTTL = null, int inlineThresholdBytes = TestInlineThresholdBytes,
     CacheDuration? distributedCacheDuration = null, TimeSpan? refreshAfter = null, CacheDuration? prefixCacheDuration = null,
-    bool varyByAccept = false)
+    bool varyByAccept = false, long? multipartThresholdBytes = null, int? multipartPartSizeBytes = null)
   {
     // When a freshness window is requested, drive it through a profile with a catch-all rule (so every
     // /real path is revalidated after the window) — mirroring how the disk tests exercise revalidation.
@@ -71,6 +78,10 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
       {
         SignedLinkTTL = signedLinkTTL ?? TimeSpan.FromMinutes(10),
         InlineThresholdBytes = inlineThresholdBytes,
+        // Left at the production 5 GiB unless a test asks otherwise: the multipart path is only
+        // reachable in a test by lowering the threshold to the size of a test body.
+        MultipartThresholdBytes = multipartThresholdBytes ?? DefaultS3Config.MultipartThresholdBytes,
+        MultipartPartSizeBytes = multipartPartSizeBytes ?? DefaultS3Config.MultipartPartSizeBytes,
       },
       DistributedCacheDuration = distributedCacheDuration ?? new CacheDuration(),
       CachingProfiles = profiles,
@@ -146,6 +157,92 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     Assert.Equal(1, myS3.PutObjectCalls);
     Assert.True(myS3.Objects.TryGetValue(GetPathKey("/real/a.jar"), out var stored));
     Assert.Equal("a.jar", Encoding.UTF8.GetString(stored.Body));
+  }
+
+  [Fact]
+  public void Multipart_Threshold_Defaults_To_S3s_Single_Put_Ceiling()
+  {
+    // The bug this whole path exists for (MRI-5371): a 5.68 GiB engine archive went out as one PUT,
+    // S3 answered EntityTooLarge, and the client got a 503 for an artifact the upstream had served.
+    // A default above S3's ceiling puts that back, and no other test would notice.
+    Assert.Equal(SinglePutLimitBytes, DefaultS3Config.MultipartThresholdBytes);
+  }
+
+  [Theory]
+  // Below the part budget the floor decides, so the buffer stays at one part's worth.
+  [InlineData(1, 16 * 1024 * 1024)]
+  [InlineData(6L * 1024 * 1024 * 1024, 16 * 1024 * 1024)]
+  // 10,000 * 16 MiB is the last size the floor covers; one byte past it the part grows just enough.
+  [InlineData(10_000L * 16 * 1024 * 1024, 16 * 1024 * 1024)]
+  [InlineData(10_000L * 16 * 1024 * 1024 + 1, 16 * 1024 * 1024 + 1)]
+  // S3's own 5 TiB object ceiling, the largest part this can ever be asked for.
+  [InlineData(5L * 1024 * 1024 * 1024 * 1024, 549755814)]
+  public void Part_Size_Is_Floored_And_Grows_To_Fit_The_Part_Budget(long contentLength, int expectedPartSize)
+  {
+    var partSize = S3CachingMiddleware.PartSizeFor(contentLength, DefaultS3Config.MultipartPartSizeBytes);
+
+    Assert.Equal(expectedPartSize, partSize);
+    // The budget is the hard constraint: a part size that needs more than 10,000 parts cannot complete.
+    Assert.True((contentLength + partSize - 1) / partSize <= 10_000);
+  }
+
+  [Fact]
+  public async Task Get_Miss_Uploads_A_Large_Object_In_Parts()
+  {
+    // "sized.jar" is 9 bytes and declares a Content-Length, so it streams straight through without the
+    // temp-file spool: 4-byte parts split it 4 + 4 + 1, exercising a short final part.
+    var server = CreateServer(signedLinks: true, multipartThresholdBytes: 9, multipartPartSizeBytes: 4);
+    using var response = await server.CreateRequest("/real/sized.jar").SendAsync(HttpMethod.Get.Method);
+
+    Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
+    AssertStatusHeader(response, CachingProxyStatus.MISS);
+
+    Assert.Equal(0, myS3.PutObjectCalls); // not a single PUT - that is the point
+    Assert.Equal(3, myS3.UploadPartCalls);
+    Assert.Equal(0, myS3.AbortMultipartUploadCalls);
+    Assert.Equal([4, 4, 1], myS3.CompletedPartSizes);
+
+    // The assembled object is byte-identical to the upstream body, and carries the same metadata a
+    // single PUT would have stored.
+    var key = GetPathKey("/real/sized.jar");
+    Assert.True(myS3.Objects.TryGetValue(key, out var stored));
+    Assert.Equal("sized.jar", Encoding.UTF8.GetString(stored.Body));
+    Assert.Equal(upstreamServer.Url + "sized.jar", myS3.PutObjectUris[key]);
+    Assert.True(myS3.CreatedAt.ContainsKey(key));
+  }
+
+  [Fact]
+  public async Task Get_Miss_Uploads_A_Large_Chunked_Object_In_Parts()
+  {
+    // No upstream Content-Length (chunked), so the body is spooled to a temp file first and the part
+    // count comes from the spooled length: "chunk1chunk2" is 12 bytes, split 5 + 5 + 2.
+    var server = CreateServer(signedLinks: true, multipartThresholdBytes: 12, multipartPartSizeBytes: 5);
+    using var response = await server.CreateRequest("/real/chunked.bin").SendAsync(HttpMethod.Get.Method);
+
+    Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
+    AssertStatusHeader(response, CachingProxyStatus.MISS);
+
+    Assert.Equal(0, myS3.PutObjectCalls);
+    Assert.Equal([5, 5, 2], myS3.CompletedPartSizes);
+    Assert.True(myS3.Objects.TryGetValue(GetPathKey("/real/chunked.bin"), out var stored));
+    Assert.Equal("chunk1chunk2", Encoding.UTF8.GetString(stored.Body));
+  }
+
+  [Fact]
+  public async Task Failed_Part_Upload_Aborts_The_Multipart_Upload()
+  {
+    // An upload left open keeps billing for the parts already stored, and an object listing does not
+    // show it, so the failure path has to abandon it explicitly.
+    myS3.FailUploadPartNumber = 2;
+    var server = CreateServer(signedLinks: true, multipartThresholdBytes: 9, multipartPartSizeBytes: 4);
+
+    using var response = await server.CreateRequest("/real/sized.jar").SendAsync(HttpMethod.Get.Method);
+
+    // The artifact exists upstream and only the cache write failed, so this is a 503 the client retries
+    // rather than a negatively-cached 404 (see S3CachingMiddleware.InvokeAsync).
+    Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+    Assert.Equal(1, myS3.AbortMultipartUploadCalls);
+    Assert.DoesNotContain(GetPathKey("/real/sized.jar"), myS3.Objects.Keys);
   }
 
   [Fact]
@@ -1294,6 +1391,18 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     public int PutObjectCalls;
     public int CopyObjectCalls;
     public int DeleteObjectCalls;
+    public int UploadPartCalls;
+    public int AbortMultipartUploadCalls;
+
+    // In-flight multipart uploads: uploadId -> the initiate request (which carries the metadata the
+    // completed object gets) plus the parts received so far.
+    private readonly Dictionary<string, (InitiateMultipartUploadRequest Request, SortedDictionary<int, byte[]> Parts)> myMultipartUploads = new();
+
+    // Part number whose upload should fail, standing in for a transient S3 error mid-upload.
+    public int? FailUploadPartNumber;
+
+    // Sizes of the parts of the last completed multipart upload, in the order they were assembled.
+    public IReadOnlyList<int> CompletedPartSizes = [];
     public HttpVerb? LastPresignVerb;
     public DateTime? LastPresignExpires;
     public string? LastPresignCacheControl;
@@ -1367,16 +1476,79 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     public override async Task<PutObjectResponse> PutObjectAsync(PutObjectRequest request, CancellationToken cancellationToken = default)
     {
       Interlocked.Increment(ref PutObjectCalls);
+      // What real S3 does, and the whole reason the multipart path exists (MRI-5371): a single PUT this
+      // big is refused, so a regression that routes a huge object back here fails instead of passing.
+      if (request.Headers.ContentLength >= SinglePutLimitBytes)
+        throw new AmazonS3Exception("Your proposed upload exceeds the maximum allowed size")
+        {
+          ErrorCode = "EntityTooLarge", StatusCode = HttpStatusCode.BadRequest,
+        };
+
       using var ms = new MemoryStream();
       await request.InputStream.CopyToAsync(ms, cancellationToken);
-      Objects[request.Key] = (ms.ToArray(), request.Headers.ContentType, null);
-      PutObjectUris[request.Key] = request.Metadata["uri"];
-      Digests[request.Key] = request.Metadata[CachedResponse.DockerContentDigestMetadataKey];
-      UpstreamETags[request.Key] = request.Metadata["upstream-etag"];
-      UpstreamLastModified[request.Key] = ParseMetadataDate(request.Metadata["upstream-last-modified"]);
-      if (request.Metadata["created-at"] is { } createdAt)
-        CreatedAt[request.Key] = DateTimeOffset.Parse(createdAt);
+      Store(request.Key, ms.ToArray(), request.Headers, request.Metadata);
       return new PutObjectResponse { HttpStatusCode = HttpStatusCode.OK };
+    }
+
+    public override Task<InitiateMultipartUploadResponse> InitiateMultipartUploadAsync(InitiateMultipartUploadRequest request, CancellationToken cancellationToken = default)
+    {
+      var uploadId = "upload-" + Guid.NewGuid();
+      myMultipartUploads[uploadId] = (request, new SortedDictionary<int, byte[]>());
+      return Task.FromResult(new InitiateMultipartUploadResponse { UploadId = uploadId, HttpStatusCode = HttpStatusCode.OK });
+    }
+
+    public override async Task<UploadPartResponse> UploadPartAsync(UploadPartRequest request, CancellationToken cancellationToken = default)
+    {
+      Interlocked.Increment(ref UploadPartCalls);
+      if (request.PartNumber == FailUploadPartNumber)
+        throw new AmazonS3Exception("Please reduce your request rate.")
+        {
+          ErrorCode = "SlowDown", StatusCode = HttpStatusCode.ServiceUnavailable,
+        };
+
+      using var ms = new MemoryStream();
+      await request.InputStream.CopyToAsync(ms, cancellationToken);
+      var part = ms.ToArray();
+      // A part stream that does not hold exactly PartSize bytes means the caller mis-sliced the body,
+      // which S3 would accept and store as a corrupt object.
+      Assert.Equal(request.PartSize, part.LongLength);
+      myMultipartUploads[request.UploadId].Parts[request.PartNumber!.Value] = part;
+      return new UploadPartResponse
+      {
+        PartNumber = request.PartNumber, ETag = $"\"part-{request.PartNumber}\"", HttpStatusCode = HttpStatusCode.OK,
+      };
+    }
+
+    public override Task<CompleteMultipartUploadResponse> CompleteMultipartUploadAsync(CompleteMultipartUploadRequest request, CancellationToken cancellationToken = default)
+    {
+      var upload = myMultipartUploads[request.UploadId];
+      // Assembled in the order the caller listed the parts, not in part-number order: a caller that
+      // lists them out of order has to show up as a wrong body rather than as a silent success.
+      var ordered = request.PartETags.Select(tag => upload.Parts[tag.PartNumber!.Value]).ToList();
+      CompletedPartSizes = ordered.Select(static part => part.Length).ToList();
+      Store(request.Key, ordered.SelectMany(static part => part).ToArray(), upload.Request.Headers, upload.Request.Metadata);
+      myMultipartUploads.Remove(request.UploadId);
+      return Task.FromResult(new CompleteMultipartUploadResponse { HttpStatusCode = HttpStatusCode.OK });
+    }
+
+    public override Task<AbortMultipartUploadResponse> AbortMultipartUploadAsync(AbortMultipartUploadRequest request, CancellationToken cancellationToken = default)
+    {
+      Interlocked.Increment(ref AbortMultipartUploadCalls);
+      myMultipartUploads.Remove(request.UploadId);
+      return Task.FromResult(new AbortMultipartUploadResponse { HttpStatusCode = HttpStatusCode.OK });
+    }
+
+    // Shared by the single-PUT and the multipart completion, so a test cannot tell the two apart by the
+    // object they leave behind - which is the point of the multipart path.
+    private void Store(string key, byte[] body, HeadersCollection headers, MetadataCollection metadata)
+    {
+      Objects[key] = (body, headers.ContentType, null);
+      PutObjectUris[key] = metadata["uri"];
+      Digests[key] = metadata[CachedResponse.DockerContentDigestMetadataKey];
+      UpstreamETags[key] = metadata["upstream-etag"];
+      UpstreamLastModified[key] = ParseMetadataDate(metadata["upstream-last-modified"]);
+      if (metadata["created-at"] is { } createdAt)
+        CreatedAt[key] = DateTimeOffset.Parse(createdAt);
     }
 
     // Metadata-only self-copy used to bump an object's "created-at" (its freshness clock) on a 304.

@@ -18,6 +18,17 @@ public class CachingProxyConfig
     // more probe bandwidth and cache footprint for fewer client round-trips on small/medium artifacts
     // (e.g. dependency metadata). Hosts have ample RAM headroom; the cost dimension is the L2 cache.
     public int InlineThresholdBytes { get; init; } = 32 * 1024;
+
+    // Objects this big or bigger are stored with a multipart upload, smaller ones with a single
+    // PutObject. S3 rejects a single PUT above 5 GiB, which is what this defaults to; lower it only to
+    // exercise the multipart path in tests.
+    public long MultipartThresholdBytes { get; init; } = 5L * 1024 * 1024 * 1024;
+
+    // Part size floor for a multipart upload. One part is buffered in memory at a time, so this is the
+    // per-upload memory cost for any object up to 10,000 parts of this size (~156 GiB); past that
+    // S3CachingMiddleware.PartSizeFor grows the part instead. S3 requires every part but the last to be
+    // at least 5 MiB, so do not take this below that outside tests.
+    public int MultipartPartSizeBytes { get; init; } = 16 * 1024 * 1024;
   }
 
   public record RedisConfig(string? ConnectionString = null)
