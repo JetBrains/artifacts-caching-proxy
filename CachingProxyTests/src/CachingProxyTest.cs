@@ -1537,6 +1537,30 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
   }
 
   [Fact]
+  public async Task Remote_MethodNotAllowed_IsSurfacedVerbatim()
+  {
+    // An upstream 405 is relayed as 405, not masked to 404: the path exists, the verb was refused, and a
+    // 404 would send the client looking for a missing artifact instead. Unlike the auth errors above its
+    // cache duration is not zero (no CacheDuration entry => the 1-minute default), so the entry is stored
+    // and the replay has to surface the same status the live response did.
+    await AssertGetResponse("/real/405.jar", HttpStatusCode.MethodNotAllowed,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_MISS);
+        AssertCachedStatusHeader(message, HttpStatusCode.MethodNotAllowed);
+        Assert.Null(message.Headers.CacheControl);
+      });
+
+    await AssertGetResponse("/real/405.jar", HttpStatusCode.MethodNotAllowed,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_HIT);
+        AssertCachedStatusHeader(message, HttpStatusCode.MethodNotAllowed);
+        Assert.Null(message.Headers.CacheControl);
+      });
+  }
+
+  [Fact]
   public async Task More_Specific_Prefix_Wins_Over_Shorter_Overlapping_One()
   {
     // /overlap/nested/a.jar must be served by the more specific "/overlap/nested" prefix (-> upstream

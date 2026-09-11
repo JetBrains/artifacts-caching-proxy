@@ -320,7 +320,15 @@ public class UpstreamTestServer : IAsyncLifetime
       {
         res.StatusCode = StatusCodes.Status403Forbidden;
         return res.WriteAsync("Forbidden");
-      }).MapGet("wrong-content-length.jar", (req, res, data) =>
+      })
+      // An upstream that refuses the verb on an otherwise valid path, which is a different answer from
+      // "no such artifact" and is relayed as itself.
+      .MapGet("405.jar", (req, res, data) =>
+      {
+        res.StatusCode = StatusCodes.Status405MethodNotAllowed;
+        return res.WriteAsync("Method Not Allowed");
+      })
+      .MapGet("wrong-content-length.jar", (req, res, data) =>
       {
         res.ContentLength = 1024;
         return res.WriteAsync("not too much");

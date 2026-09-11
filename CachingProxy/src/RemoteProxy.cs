@@ -117,6 +117,7 @@ public partial class RemoteProxy(
       HttpStatusCode.Unauthorized or
       HttpStatusCode.PaymentRequired or
       HttpStatusCode.Forbidden or
+      HttpStatusCode.MethodNotAllowed or
       HttpStatusCode.ProxyAuthenticationRequired or
       HttpStatusCode.UnavailableForLegalReasons => upstream,
     _ => HttpStatusCode.NotFound,
