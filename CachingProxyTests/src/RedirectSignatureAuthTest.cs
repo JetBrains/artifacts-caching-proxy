@@ -28,8 +28,10 @@ namespace JetBrains.CachingProxy.Tests;
 // proxy must accept that signature as sufficient authorization for a private prefix. The signing here
 // is a faithful C# re-implementation of the redirector's Lua auth.lua, so these tests double as an
 // interop contract. Asserts: valid signature -> proxied (and Cache-Control: private), and every failure
-// mode (no signature, tampered path, wrong key, expired) -> 401. Also asserts the JWT path still works
-// when a signature key is configured, and that signatures are inert when it is not.
+// mode (no signature, tampered path, wrong key, expired) -> 401. Also asserts that signatures are inert
+// when no key is configured, and covers both inbound-auth shapes: a signature alongside JWT validation
+// (JWT still accepted), and the deployed signature-only one, where a client JWT is rejected because the
+// redirector is the layer that validates it.
 //
 // The rotation tests further down cover the three states of a rotation against a multi-key ring (active
 // accepted, retiring still accepted, dropped rejected) plus a forgery attempt against one.
@@ -234,6 +236,57 @@ public class RedirectSignatureAuthTest : IAsyncLifetime
     }
   }
 
+  [Fact]
+  public async Task Valid_Signature_Is_Served_When_Jwt_Validation_Is_Off()
+  {
+    // The deployed configuration: no JWT parameters at all, so the signature handler is the only scheme
+    // and a signed redirect has to be sufficient on its own.
+    await WithJwtValidationOff(async client =>
+    {
+      var response = await client.GetAsync(Sign("/private/one.jar"));
+
+      Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+      Assert.Equal("artifact-body", await response.Content.ReadAsStringAsync());
+    });
+  }
+
+  [Fact]
+  public async Task Jwt_Is_Rejected_When_Jwt_Validation_Is_Off()
+  {
+    // A token this proxy would have accepted when the JWT scheme was registered: right issuer, right
+    // audience, unexpired. With the scheme gone it establishes no identity, so the gated prefix answers
+    // 401. That is the point of the split - the redirector is the only layer that validates a client
+    // token, because it is the only one that also asks Space whether the token is still live (MRI-4847).
+    await WithJwtValidationOff(async client =>
+    {
+      client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", MintToken());
+
+      var response = await client.GetAsync("/private/one.jar");
+
+      Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    });
+  }
+
+  [Fact]
+  public async Task Basic_Password_Jwt_Is_Rejected_When_Jwt_Validation_Is_Off()
+  {
+    // The same credential in the form a build tool sends it, the Basic password: nothing extracts a token
+    // from it once the JWT scheme is unregistered, so the JWT cannot re-enter by the path Maven/Gradle
+    // actually use.
+    await WithJwtValidationOff(async client =>
+    {
+      client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue(
+        "Basic", Convert.ToBase64String(Encoding.UTF8.GetBytes($"user:{MintToken()}")));
+
+      var response = await client.GetAsync("/private/one.jar");
+
+      Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+      // Basic and only Basic, as on every other 401: the rejection looks the same whichever scheme
+      // produced it, and never advertises Bearer (which an OCI client reads as a token endpoint).
+      Assert.Equal("Basic", Assert.Single(response.Headers.WwwAuthenticate).Scheme);
+    });
+  }
+
   // The three states of a key rotation, exercised end to end. The wire format is unchanged in all of
   // them — nothing on the URL says which key was used.
 
@@ -305,6 +358,22 @@ public class RedirectSignatureAuthTest : IAsyncLifetime
     }
   }
 
+  // A second host with inbound JWT validation off and the signature ring intact - the deployed shape.
+  private async Task WithJwtValidationOff(Func<HttpClient, Task> assertions)
+  {
+    using var host = BuildProxyHost(BuildConfig(withJwt: false));
+    await host.StartAsync();
+    try
+    {
+      using var client = host.GetTestServer().CreateClient();
+      await assertions(client);
+    }
+    finally
+    {
+      await host.StopAsync();
+    }
+  }
+
   // Faithful C# port of the redirector's auth.lua signing: sig = base64url(HMAC-SHA256(key,
   // path_and_query + "\n" + exp)), URL-safe base64 without padding, cr_exp/cr_sig appended last.
   private static string Sign(string pathAndQuery, string key = SigningKey, DateTimeOffset? expiry = null)
@@ -350,7 +419,8 @@ public class RedirectSignatureAuthTest : IAsyncLifetime
     await myProxyHost.StartAsync();
   }
 
-  private CachingProxyConfig BuildConfig(bool withSignature = true, string signatureKey = SigningKey)
+  private CachingProxyConfig BuildConfig(
+    bool withSignature = true, string signatureKey = SigningKey, bool withJwt = true)
   {
     var upstreamUrl = UrlOf(myUpstreamServer);
     return new CachingProxyConfig
@@ -377,9 +447,10 @@ public class RedirectSignatureAuthTest : IAsyncLifetime
       },
       InboundAuth = new CachingProxyConfig.InboundAuthConfig
       {
-        Issuer = Issuer,
-        Audiences = [Audience],
-        JwksUrl = new Uri(UrlOf(myAuthServer), "jwks.json"),
+        // All three unset in the deployed configuration, which leaves the client JWT to the redirector.
+        Issuer = withJwt ? Issuer : null,
+        Audiences = withJwt ? new[] { Audience } : null,
+        JwksUrl = withJwt ? new Uri(UrlOf(myAuthServer), "jwks.json") : null,
         RedirectSignature = withSignature
           ? new CachingProxyConfig.RedirectSignatureConfig { Key = signatureKey }
           : null,

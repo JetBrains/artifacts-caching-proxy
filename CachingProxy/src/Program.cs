@@ -275,7 +275,7 @@ public static class Program
     app.UseRouting();
     app.UseHealthChecks("/health");
     app.UseInboundAuth();
-    app.UseOciPing(config.InboundAuth != null);
+    app.UseOciPing(config.InboundAuth?.ValidatesJwt == true);
     if (config.IsS3Mode)
     {
       app.UseMiddleware<S3CachingMiddleware>();
@@ -304,11 +304,14 @@ public static class Program
   /// of its own, so <c>UseAuthorization</c> has no endpoint metadata to enforce here and the challenge is
   /// issued explicitly.</para>
   /// </summary>
-  private static void UseOciPing(this IApplicationBuilder app, bool inboundAuthConfigured)
+  private static void UseOciPing(this IApplicationBuilder app, bool clientTokensAccepted)
   {
-    // Both halves are fixed at startup, so resolve them once instead of per request. Without InboundAuth
-    // there is nothing a client could present, and challenging would only make the registry unusable.
-    var challengeTheProbe = inboundAuthConfigured &&
+    // Both halves are fixed at startup, so resolve them once instead of per request. Challenge only where
+    // a client actually has something to present: with inbound JWT validation off (the deployed
+    // configuration - the redirector validates the token and hands us a signed redirect instead) no
+    // credential sent to this host is accepted, so a challenge here would gate the probe on a credential
+    // that can never satisfy it and make the registry unusable for nothing.
+    var challengeTheProbe = clientTokensAccepted &&
                             app.ApplicationServices.GetRequiredService<RemoteServers>().HasGatedOciPrefix;
 
     app.Use(async (context, next) =>

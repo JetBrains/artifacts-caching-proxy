@@ -27,13 +27,13 @@ using StackExchange.Redis;
 namespace JetBrains.CachingProxy;
 
 /// <summary>
-/// Outbound (per-upstream) and inbound (client JWT) authentication wiring, split out of Program so the
-/// startup file stays focused on the cache/storage/observability pipeline.
+/// Outbound (per-upstream) and inbound (client JWT or redirector signature) authentication wiring, split
+/// out of Program so the startup file stays focused on the cache/storage/observability pipeline.
 /// </summary>
 public static class AuthExtensions
 {
-  // Default scheme used when redirect-signature validation is enabled: a policy scheme that forwards
-  // each request to JwtBearer or the redirect-signature handler (see AddInboundAuth).
+  // Default scheme when both inbound credentials are accepted: a policy scheme that forwards each
+  // request to JwtBearer or the redirect-signature handler (see AddInboundAuth).
   private const string CombinedInboundScheme = "CombinedInbound";
 
   /// <summary>
@@ -119,13 +119,22 @@ public static class AuthExtensions
   }
 
   /// <summary>
-  /// Inbound JWT bearer validation. Authentication/authorization are always registered, since a prefix
-  /// whose upstream requires auth carries an AuthorizeAttribute (attached per prefix in RemoteServers)
-  /// regardless of inbound config. When InboundAuth is configured, the JWT bearer scheme validates
-  /// issuer/audience/lifetime explicitly; the signing keys come from the configured JWKS endpoint via a
-  /// ConfigurationManager that caches and auto-refreshes them (so key rotation needs no redeploy). When it
-  /// is NOT configured, a fail-closed default scheme (<see cref="DenyAuthenticationHandler"/>) answers any
-  /// AuthorizeAttribute challenge with 401 instead of letting the middleware throw a 500.
+  /// Inbound authentication. Authentication/authorization are always registered, since a prefix whose
+  /// upstream requires auth carries an AuthorizeAttribute (attached per prefix in RemoteServers)
+  /// regardless of inbound config. Which credential satisfies it follows from InboundAuth:
+  /// <list type="bullet">
+  /// <item><b>signature only</b> (the deployed configuration) - <see
+  /// cref="RedirectSignatureAuthenticationHandler"/> is the sole scheme, so a request that arrives with a
+  /// client JWT instead of a signed redirect establishes no identity and is answered 401. Client JWTs are
+  /// validated by the redirector alone.</item>
+  /// <item><b>JWT only</b> - the JWT bearer scheme validates issuer/audience/lifetime explicitly; the
+  /// signing keys come from the configured JWKS endpoint via a ConfigurationManager that caches and
+  /// auto-refreshes them (so key rotation needs no redeploy).</item>
+  /// <item><b>both</b> - a policy scheme forwards each request to whichever handler its credentials fit.</item>
+  /// </list>
+  /// When InboundAuth is absent altogether, a fail-closed default scheme (<see
+  /// cref="DenyAuthenticationHandler"/>) answers any AuthorizeAttribute challenge with 401 instead of
+  /// letting the middleware throw a 500.
   /// </summary>
   public static IServiceCollection AddInboundAuth(this IServiceCollection services, IConfiguration configuration, IHostEnvironment hostEnvironment)
   {
@@ -166,12 +175,32 @@ public static class AuthExtensions
       return services;
     }
 
-    if (string.IsNullOrWhiteSpace(inboundAuth.Issuer))
-      throw new ArgumentException("InboundAuth.Issuer must not be empty.");
-    if (inboundAuth.Audiences == null || inboundAuth.Audiences.Length == 0 || inboundAuth.Audiences.Any(string.IsNullOrWhiteSpace))
-      throw new ArgumentException("InboundAuth.Audiences must contain at least one non-empty audience.");
-    if (inboundAuth.JwksUrl == null || !inboundAuth.JwksUrl.IsSecureOrLoopback())
-      throw new ArgumentException("InboundAuth.JwksUrl must use HTTPS except on loopback.");
+    // JWT validation is optional, and off in the deployed configuration: a client JWT is validated by the
+    // redirector, the only layer that both sees one on a redirected request and checks it against Space
+    // for revocation (MRI-4847). Validating it here as well would accept a token Space has withdrawn, on
+    // the strength of offline checks alone. So validate the JWT parameters only when they are configured;
+    // ValidatesJwt reads a half-filled section as "JWT expected" so that fails here rather than silently
+    // downgrading to signature-only.
+    var validatesJwt = inboundAuth.ValidatesJwt;
+    if (validatesJwt)
+    {
+      if (string.IsNullOrWhiteSpace(inboundAuth.Issuer))
+        throw new ArgumentException("InboundAuth.Issuer must not be empty.");
+      if (inboundAuth.Audiences == null || inboundAuth.Audiences.Length == 0 || inboundAuth.Audiences.Any(string.IsNullOrWhiteSpace))
+        throw new ArgumentException("InboundAuth.Audiences must contain at least one non-empty audience.");
+      if (inboundAuth.JwksUrl == null || !inboundAuth.JwksUrl.IsSecureOrLoopback())
+        throw new ArgumentException("InboundAuth.JwksUrl must use HTTPS except on loopback.");
+    }
+    else if (inboundAuth.RedirectSignature == null)
+    {
+      // Neither credential: every gated prefix would 401 with nothing able to unblock it. Refuse to start
+      // rather than serve a deployment whose private aliases are all dead.
+      throw new ArgumentException(
+        "InboundAuth is configured with neither the JWT parameters (Issuer/Audiences/JwksUrl) nor " +
+        "RedirectSignature, so no inbound credential could authorize a gated prefix. Configure one, or " +
+        "omit InboundAuth to fail closed deliberately.");
+    }
+
     // Parsed and validated once here, so the per-request path never touches raw key text.
     RedirectSignatureKeyRing? keyRing = null;
     if (inboundAuth.RedirectSignature is { } signatureConfig)
@@ -183,38 +212,39 @@ public static class AuthExtensions
         throw new ArgumentException("InboundAuth.RedirectSignature.ClockSkew must not be negative.");
     }
 
-    var jwks = new ConfigurationManager<OpenIdConnectConfiguration>(
-      inboundAuth.JwksUrl.AbsoluteUri,
-      new JwksConfigurationRetriever(),
-      new HttpDocumentRetriever { RequireHttps = inboundAuth.JwksUrl.Scheme == Uri.UriSchemeHttps });
-
     var redirectSignature = inboundAuth.RedirectSignature;
 
-    // When redirect-signature validation is enabled, a private request may authenticate with EITHER a
-    // client JWT OR a redirector HMAC signature (the two never coexist: the JWT is dropped on the
-    // cross-host redirect that carries the signature). Make the default scheme a policy scheme that
-    // forwards each request to whichever handler its credentials fit — cr_sig present => the signature
-    // handler, otherwise JwtBearer — so a single [Authorize] on the prefix accepts both. With no
-    // signature configured, JwtBearer stays the sole default scheme, exactly as before.
-    var authenticationBuilder = services.AddAuthentication(
-      redirectSignature != null ? CombinedInboundScheme : JwtBearerDefaults.AuthenticationScheme);
+    // The default scheme is the one credential this deployment accepts. When it accepts both, it is a
+    // policy scheme that forwards each request to whichever handler its credentials fit - cr_sig present
+    // => the signature handler, otherwise JwtBearer - so a single [Authorize] on the prefix takes either.
+    // The two never coexist on one request anyway: the JWT is dropped on the cross-host redirect that
+    // carries the signature.
+    var defaultScheme = validatesJwt
+      ? (redirectSignature != null ? CombinedInboundScheme : JwtBearerDefaults.AuthenticationScheme)
+      : RedirectSignatureAuthenticationHandler.SchemeName;
+    var authenticationBuilder = services.AddAuthentication(defaultScheme);
 
     // The only challenge we advertise on a 401, so clients prompt for / send the JWT as the Basic
     // password. We do not advertise Bearer even though we accept it: our realm is an application name
     // rather than a token endpoint, and an OCI client reads a Bearer challenge as "fetch a token from
     // realm" (the registry token dance) and fails `docker pull` outright instead of retrying with the
     // `docker login` credentials. Nothing is lost — clients that authenticate with a bearer token
-    // (npm, CI) send it unprompted.
+    // (npm, CI) send it unprompted. In signature-only mode nothing a client sends to this host is
+    // accepted at all, so the challenge is there for shape alone: every 401 from the proxy looks the
+    // same, whichever scheme produced it.
     var basicChallenge = $"Basic realm=\"{hostEnvironment.ApplicationName}\"";
 
     if (redirectSignature != null)
     {
+      if (validatesJwt)
+        authenticationBuilder
+          .AddPolicyScheme(CombinedInboundScheme, displayName: null, options =>
+            options.ForwardDefaultSelector = context =>
+              context.Request.Query.ContainsKey(RedirectSignatureAuthenticationHandler.SignatureQueryParam)
+                ? RedirectSignatureAuthenticationHandler.SchemeName
+                : JwtBearerDefaults.AuthenticationScheme);
+
       authenticationBuilder
-        .AddPolicyScheme(CombinedInboundScheme, displayName: null, options =>
-          options.ForwardDefaultSelector = context =>
-            context.Request.Query.ContainsKey(RedirectSignatureAuthenticationHandler.SignatureQueryParam)
-              ? RedirectSignatureAuthenticationHandler.SchemeName
-              : JwtBearerDefaults.AuthenticationScheme)
         .AddScheme<RedirectSignatureOptions, RedirectSignatureAuthenticationHandler>(
           RedirectSignatureAuthenticationHandler.SchemeName,
           options =>
@@ -224,6 +254,14 @@ public static class AuthExtensions
             options.Challenge = basicChallenge;
           });
     }
+
+    if (!validatesJwt)
+      return services;
+
+    var jwks = new ConfigurationManager<OpenIdConnectConfiguration>(
+      inboundAuth.JwksUrl!.AbsoluteUri,
+      new JwksConfigurationRetriever(),
+      new HttpDocumentRetriever { RequireHttps = inboundAuth.JwksUrl.Scheme == Uri.UriSchemeHttps });
 
     authenticationBuilder
       .AddJwtBearer(options =>

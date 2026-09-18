@@ -44,20 +44,32 @@ public class CachingProxyConfig
     public string? InstanceName { get; init; }
   }
 
-  // Validation parameters for inbound client JWT bearer tokens. Issuer, audience and lifetime are
-  // validated explicitly; the token-signing public keys are fetched from a JSON Web Key Set (JWKS)
-  // endpoint (e.g. https://jetbrains.team/oauth/jwks.json) and cached/refreshed automatically, so key
-  // rotation needs no redeploy. Any JWKS key type (RSA/EC) is accepted.
+  // Inbound credentials the proxy accepts for a gated prefix. Two independent mechanisms, either of
+  // which may be configured alone:
+  //
+  //  * client JWT bearer tokens (Issuer/Audiences/JwksUrl below) - issuer, audience and lifetime are
+  //    validated explicitly; the token-signing public keys are fetched from a JSON Web Key Set (JWKS)
+  //    endpoint (e.g. https://jetbrains.team/oauth/jwks.json) and cached/refreshed automatically, so key
+  //    rotation needs no redeploy. Any JWKS key type (RSA/EC) is accepted.
+  //  * RedirectSignature - the HMAC on a redirect the cache-redirector already authorized.
+  //
+  // The deployed configuration sets only RedirectSignature: a client JWT is validated by the redirector
+  // alone, which is the only layer that sees one on the common redirected path and the only one that can
+  // check it against Space for revocation. Leaving the JWT parameters unset here keeps the proxy from
+  // accepting a credential it could only validate offline, i.e. one Space has since withdrawn.
   public record InboundAuthConfig
   {
-    public required string Issuer { get; init; }
-    public required string[] Audiences { get; init; }
-    public required Uri JwksUrl { get; init; }
+    // All three or none: with none set the JWT scheme is not registered at all (see
+    // AuthExtensions.AddInboundAuth) and a signed redirect is the only credential the proxy accepts.
+    public string? Issuer { get; init; }
+    public string[]? Audiences { get; init; }
+    public Uri? JwksUrl { get; init; }
 
     // Whether tokens must carry an 'exp' claim. Default true (any token without an expiration is
     // rejected). Set false to accept non-expiring tokens such as JetBrains hub permanent tokens; a
     // token that does carry exp/nbf is still validated against them. Trade-off: a leaked non-expiring
     // token stays valid until the signing key rotates or it is revoked at the issuer (not checked here).
+    // Ignored unless the JWT parameters above are set.
     public bool RequireExpiration { get; init; } = true;
 
     // HMAC signature validation for redirects issued by the cache-redirector. When the redirector
@@ -65,8 +77,13 @@ public class CachingProxyConfig
     // client JWT (Authorization header) is dropped by HTTP clients on the cross-host hop. The
     // redirector instead proves the request was authorized by appending cr_exp/cr_sig query
     // parameters signed with a key shared out-of-band (see the cache-redirector repo's auth.lua).
-    // Null by default: no signature is accepted and only the JWT authorizes a private prefix.
+    // Null by default, in which case a client JWT is the only credential that authorizes a prefix.
     public RedirectSignatureConfig? RedirectSignature { get; init; }
+
+    // Whether to register the client-JWT scheme. Any one of the three parameters means "JWT expected",
+    // so a half-filled section (an unresolved secret reference, a dropped env var) is a startup error
+    // rather than a silent downgrade to signature-only.
+    public bool ValidatesJwt => Issuer != null || Audiences != null || JwksUrl != null;
   }
 
   // Shared-secret HMAC verification of cache-redirector signed links. The signature covers the
