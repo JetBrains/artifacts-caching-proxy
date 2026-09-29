@@ -47,6 +47,7 @@ public static class Program
   {
     var builder = WebApplication.CreateBuilder(args);
 
+    // Registers the Sentry logger provider too: Logging.AddSentry() on top would capture everything twice.
     builder.WebHost.UseSentry();
 
     if (builder.Environment.IsDevelopment())
@@ -59,7 +60,6 @@ public static class Program
     else
     {
       builder.Logging.AddJsonConsole();
-      builder.Logging.AddSentry();
     }
 
     // Bind CachingProxyConfig from configuration
@@ -155,7 +155,7 @@ public static class Program
         });
 
       services.AddHealthChecks()
-        .AddRedis(sp => sp.GetRequiredService<IConnectionMultiplexer>(), failureStatus: HealthStatus.Degraded, name: "redis");
+        .AddCheck<RedisHealthCheck>("redis", failureStatus: HealthStatus.Degraded);
 
       fusionCacheBuilder
         .WithSerializer(new FusionCacheCysharpMemoryPackSerializer())

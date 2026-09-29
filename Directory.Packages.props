@@ -4,7 +4,6 @@
   </PropertyGroup>
   <ItemGroup>
     <!-- App packages -->
-    <PackageVersion Include="AspNetCore.HealthChecks.Redis" Version="9.0.0" />
     <PackageVersion Include="Cronos" Version="0.13.0" />
     <PackageVersion Include="DotNetEnv" Version="3.2.0" />
     <PackageVersion Include="Duende.AccessTokenManagement" Version="4.2.0" />
