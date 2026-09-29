@@ -278,6 +278,29 @@ public class MetricsConfigurationTest(ITestOutputHelper output)
   }
 
   /// <summary>
+  /// Asked for OpenMetrics, the exporter would add a <c>_created</c> sample to every counter and histogram
+  /// series. Asserted directly so dropping the text-format pin names itself, rather than surfacing as every
+  /// sample count above going up by one.
+  /// </summary>
+  [Fact]
+  public async Task Scrape_CarriesNoCreatedSeries()
+  {
+    using var scrape = await MetricsScrape.Of(meter =>
+    {
+      meter("System.Net.Http").CreateHistogram<double>("http.client.request.duration", "s").Record(0.5);
+      new CachingProxyMetrics(new PlainMeterFactory(meter), BucketModeConfig())
+        .IncrementRequests(CachingProxyStatus.HIT, "maven", authenticated: true);
+    });
+
+    // Non-vacuous: both kinds that would carry one are present.
+    Assert.Contains(scrape.SampleLines, static l => l.StartsWith("caching_requests_total{", StringComparison.Ordinal));
+    Assert.Contains(scrape.SampleLines,
+      static l => l.StartsWith("http_client_request_duration_seconds_count{", StringComparison.Ordinal));
+    Assert.DoesNotContain(scrape.SampleLines,
+      static l => l.Split('{', ' ')[0].EndsWith("_created", StringComparison.Ordinal));
+  }
+
+  /// <summary>
   /// Hands <see cref="CachingProxyMetrics"/> a plain <see cref="Meter"/>, which the scrape's provider
   /// subscribes to by name. A Meter from a real <see cref="IMeterFactory"/> carries that factory as its
   /// Scope, and a provider built from another DI container may ignore it - the counter would then be absent
@@ -389,6 +412,13 @@ public class MetricsConfigurationTest(ITestOutputHelper output)
 
     private string[] mySampleLines = [];
 
+    // What Prometheus 3 sends by default. It prefers OpenMetrics, so a scrape only counts what production
+    // publishes if the endpoint's pin to plain text holds against it.
+    private const string PrometheusAccept =
+      "application/openmetrics-text;version=1.0.0;escaping=allow-utf-8;q=0.6," +
+      "application/openmetrics-text;version=0.0.1;q=0.5,text/plain;version=1.0.0;escaping=allow-utf-8;q=0.4," +
+      "text/plain;version=0.0.4;q=0.3,*/*;q=0.2";
+
     public static async Task<MetricsScrape> Of(Action<Func<string, Meter>> record)
     {
       var scrape = new MetricsScrape();
@@ -400,12 +430,14 @@ public class MetricsConfigurationTest(ITestOutputHelper output)
             .WithMetrics(metrics => metrics
               .ConfigureOurMetrics()
               .AddPrometheusExporter()))
-          .Configure(app => app.UseOpenTelemetryPrometheusScrapingEndpoint()))
+          .Configure(app => app.UseOurPrometheusScrapingEndpoint()))
         .StartAsync();
 
       record(scrape.Meter);
 
-      var exposition = await scrape.myHost.GetTestClient().GetStringAsync("/metrics");
+      var client = scrape.myHost.GetTestClient();
+      client.DefaultRequestHeaders.TryAddWithoutValidation("Accept", PrometheusAccept);
+      var exposition = await client.GetStringAsync("/metrics");
       scrape.mySampleLines =
         [.. exposition.Split('\n').Select(static l => l.Trim()).Where(static l => l.Length > 0 && l[0] != '#')];
       return scrape;

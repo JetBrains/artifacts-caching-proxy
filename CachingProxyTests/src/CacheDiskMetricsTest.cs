@@ -107,7 +107,9 @@ public class CacheDiskMetricsTest(ITestOutputHelper output) : IAsyncLifetime
 
     var host = await StartHostAsync(services => services
       .AddOpenTelemetry()
-      .WithMetrics(metrics => metrics.AddMeter(probeMeterName).AddPrometheusExporter()));
+      // target_info is resource metadata the exporter adds, not a declared instrument.
+      .WithMetrics(metrics => metrics.AddMeter(probeMeterName)
+        .AddPrometheusExporter(static options => options.TargetInfoEnabled = false)));
 
     var exposition = await host.GetTestClient().GetStringAsync("/metrics");
     output.WriteLine(exposition);

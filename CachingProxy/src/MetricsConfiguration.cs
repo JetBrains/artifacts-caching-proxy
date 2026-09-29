@@ -1,11 +1,12 @@
+using Microsoft.AspNetCore.Builder;
 using OpenTelemetry.Metrics;
 
 namespace JetBrains.CachingProxy;
 
 /// <summary>
-/// Meter selection and stream shaping for the metrics this service publishes. Kept out of
-/// <see cref="Program"/> and exporter-free so a test can build the same configuration and count what a
-/// Prometheus scrape would see: the limits below are only breached in aggregate, never at one call site.
+/// Meter selection, stream shaping and the scrape endpoint for the metrics this service publishes. Kept out
+/// of <see cref="Program"/> so a test can build the same configuration and count what a Prometheus scrape
+/// would see: the limits below are only breached in aggregate, never at one call site.
 /// </summary>
 public static class MetricsConfiguration
 {
@@ -114,4 +115,19 @@ public static class MetricsConfiguration
       Boundaries = ourCountAndSumOnly
     })
     .AddMeter(CachingProxyMetrics.MeterName);
+
+  /// <summary>
+  /// The scrape endpoint, pinned to the Prometheus text format. Prometheus prefers OpenMetrics, where the
+  /// exporter adds a _created sample to every counter and histogram series; nothing reads them, and they
+  /// cost as many samples as the counters and histograms themselves have series.
+  /// </summary>
+  public static IApplicationBuilder UseOurPrometheusScrapingEndpoint(this IApplicationBuilder app) =>
+    app.UseOpenTelemetryPrometheusScrapingEndpoint(
+      meterProvider: null, predicate: null, path: null,
+      configureBranchedPipeline: static branch => branch.Use(static (context, next) =>
+      {
+        context.Request.Headers.Accept = "text/plain;version=0.0.4";
+        return next(context);
+      }),
+      optionsName: null);
 }

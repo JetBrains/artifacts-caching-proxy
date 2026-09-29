@@ -84,7 +84,7 @@ public static class Program
       app.UseDeveloperExceptionPage();
     }
 
-    app.UseOpenTelemetryPrometheusScrapingEndpoint();
+    app.UseOurPrometheusScrapingEndpoint();
 
     app.ConfigureOurApp(app.Configuration);
 
