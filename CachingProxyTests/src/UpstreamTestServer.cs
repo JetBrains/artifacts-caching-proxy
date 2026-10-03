@@ -328,6 +328,13 @@ public class UpstreamTestServer : IAsyncLifetime
         res.StatusCode = StatusCodes.Status405MethodNotAllowed;
         return res.WriteAsync("Method Not Allowed");
       })
+      // A rate-limited upstream, as GAR answers once its upstream read quota is spent.
+      .MapGet("429.jar", (req, res, data) =>
+      {
+        res.StatusCode = StatusCodes.Status429TooManyRequests;
+        res.Headers.RetryAfter = "30";
+        return res.WriteAsync("Too Many Requests");
+      })
       .MapGet("wrong-content-length.jar", (req, res, data) =>
       {
         res.ContentLength = 1024;

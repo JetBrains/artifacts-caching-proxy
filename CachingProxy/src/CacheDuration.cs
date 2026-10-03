@@ -15,6 +15,8 @@ public class CacheDuration : Dictionary<HttpStatusCode, TimeSpan>
     this[HttpStatusCode.PaymentRequired] = TimeSpan.Zero;
     this[HttpStatusCode.Forbidden] = TimeSpan.Zero;
     this[HttpStatusCode.NotFound] = TimeSpan.FromMinutes(5);
+    // Says nothing about the artifact, only about the moment, so the next request asks again
+    this[HttpStatusCode.TooManyRequests] = TimeSpan.Zero;
   }
 
   public CacheDuration(IDictionary<HttpStatusCode, TimeSpan> baseline) : base(baseline) { }

@@ -138,6 +138,9 @@ public sealed record CachedResponse(HttpStatusCode StatusCode, IHeaderDictionary
     // rather than no-cache: it must not be kept at all, not merely revalidated.
     else if (rule is { VaryByAccept: true } && context.Response.StatusCode == StatusCodes.Status404NotFound)
       context.Response.Headers.CacheControl = ourNoStoreHeaderValue;
+    // A rate limit answers about the moment, not the artifact: no cache downstream may replay it.
+    else if (context.Response.StatusCode == StatusCodes.Status429TooManyRequests)
+      context.Response.Headers.CacheControl = ourNoStoreHeaderValue;
   }
 
   private static readonly StringValues ourNoStoreHeaderValue = new CacheControlHeaderValue { NoStore = true }.ToString();

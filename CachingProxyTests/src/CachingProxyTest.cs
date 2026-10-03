@@ -1561,6 +1561,23 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
   }
 
   [Fact]
+  public async Task Remote_TooManyRequests_IsSurfacedVerbatim_AndNeverNegativelyCached()
+  {
+    // A rate limit (GAR once its upstream read quota is spent) answers about the moment, not the artifact.
+    // Masked to a cached 404 it made the artifact look missing for the whole TTL, so it is relayed with the
+    // upstream's Retry-After, never stored, and marked no-store for every cache downstream.
+    for (var i = 0; i < 2; i++)
+      await AssertGetResponse("/real/429.jar", HttpStatusCode.TooManyRequests,
+        (message, bytes) =>
+        {
+          AssertStatusHeader(message, CachingProxyStatus.NEGATIVE_MISS);
+          AssertNoCachedStatusHeader(message);
+          Assert.Equal(TimeSpan.FromSeconds(30), message.Headers.RetryAfter?.Delta);
+          Assert.True(message.Headers.CacheControl?.NoStore);
+        });
+  }
+
+  [Fact]
   public async Task More_Specific_Prefix_Wins_Over_Shorter_Overlapping_One()
   {
     // /overlap/nested/a.jar must be served by the more specific "/overlap/nested" prefix (-> upstream

@@ -111,6 +111,10 @@ public partial class RemoteProxy(
   // 404 and authentication / access errors are surfaced to the client verbatim (we do not mask
   // them); every other non-success status is masked to 404. Used for both negative cache hits and
   // misses so a replayed entry returns the same status the live response did.
+  //
+  // 429 is relayed too. Masked, a rate-limited POM looked missing, and Maven resolves a missing POM as
+  // an artifact without dependencies, so builds silently lost transitive jars; Maven and Gradle retry
+  // a 429 with backoff instead.
   private static HttpStatusCode ClientFacingStatus(HttpStatusCode upstream) => upstream switch
   {
     HttpStatusCode.NotFound or
@@ -119,6 +123,7 @@ public partial class RemoteProxy(
       HttpStatusCode.Forbidden or
       HttpStatusCode.MethodNotAllowed or
       HttpStatusCode.ProxyAuthenticationRequired or
+      HttpStatusCode.TooManyRequests or
       HttpStatusCode.UnavailableForLegalReasons => upstream,
     _ => HttpStatusCode.NotFound,
   };
@@ -244,13 +249,19 @@ public partial class RemoteProxy(
     {
       if (!response.IsSuccessStatusCode)
       {
-        var entry = await responseCache.PutStatusCode(cacheKey, response.StatusCode, cacheDuration, context.RequestAborted, maxCacheDuration);
+        var negative = new CachedResponse(response.StatusCode, new HeaderDictionary());
+        // Tells the client when to ask again. A 429 is not cached unless a CacheDuration says otherwise, so
+        // this is the live value.
+        if (response.StatusCode == HttpStatusCode.TooManyRequests && response.Headers.RetryAfter is { } retryAfter)
+          negative.Headers.RetryAfter = retryAfter.ToString();
+        var entry = await responseCache.PutStatusCode(cacheKey, negative, cacheDuration, context.RequestAborted, maxCacheDuration);
         if (ClientFacingStatus(response.StatusCode) is var statusCode && statusCode != response.StatusCode)
         {
           entry = entry with { StatusCode = statusCode };
         }
         switch (statusCode)
         {
+          case HttpStatusCode.TooManyRequests:
           case HttpStatusCode.NotFound when statusCode != response.StatusCode:
           case not HttpStatusCode.NotFound when auth != null:
             logger.LogWarning(Event.NegativeMiss(response.StatusCode),
