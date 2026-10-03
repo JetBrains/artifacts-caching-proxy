@@ -303,6 +303,18 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
         // sees a truncated transfer retries, whereas completing a short body against the declared
         // Content-Length would hand it a corrupt artifact it believes is whole.
         context.Abort();
+      else if (IsThrottling(e))
+      {
+        // S3 throttles a hot prefix (SlowDown) on the probe or the store alike. That says come back
+        // later, not that the store is broken, so answer like a rate-limited upstream (see
+        // RemoteProxy.ClientFacingStatus): 429, which Maven and Gradle retry with backoff, and no-store
+        // so no cache downstream replays it.
+        context.Response.StatusCode = StatusCodes.Status429TooManyRequests;
+        context.Response.Headers.RetryAfter = "1";
+        context.Response.Headers.CacheControl = "no-store";
+        context.Response.ContentType = MediaTypeNames.Text.Plain;
+        await context.Response.WriteAsync("Storage is throttling requests, retry later");
+      }
       else
       {
         // The artifact exists upstream; we just failed to store or redirect it. Respond 503 (and do
@@ -390,6 +402,10 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
   /// </summary>
   private static string? UpstreamETag(GetObjectResponse s3Object) =>
     s3Object.Metadata[UpstreamETagMetadataKey] is { Length: > 0 } etag ? etag : null;
+
+  // S3 throttles with 503 SlowDown; a 429 is how S3-compatible stores answer the same thing.
+  private static bool IsThrottling(Exception e) =>
+    e is AmazonServiceException { ErrorCode: "SlowDown" } or AmazonServiceException { StatusCode: HttpStatusCode.TooManyRequests };
 
   /// <summary>
   /// Whether a probed object has outlived <paramref name="refreshAfter"/>, reporting its stored date for

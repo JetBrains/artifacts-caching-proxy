@@ -269,11 +269,29 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     // status to report: the artifact exists upstream and only the cache write failed, which is a 503 the
     // client retries rather than a negatively-cached 404 (see S3CachingMiddleware.InvokeAsync).
     myS3.FailUploadPartNumber = 2;
+    myS3.FailUploadPartErrorCode = "InternalError";
     var server = CreateServer(signedLinks: true, multipartThresholdBytes: 12, multipartPartSizeBytes: 5);
 
     using var response = await server.CreateRequest("/real/chunked.bin").SendAsync(HttpMethod.Get.Method);
 
     Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+    Assert.Equal(1, myS3.AbortMultipartUploadCalls);
+    Assert.DoesNotContain(GetPathKey("/real/chunked.bin"), myS3.Objects.Keys);
+  }
+
+  [Fact]
+  public async Task S3_Throttling_Answers_429_While_Nothing_Is_On_The_Wire_Yet()
+  {
+    // S3 throttles a hot prefix with 503 SlowDown. That says come back later, not that the store is broken,
+    // so the client gets what a rate-limited upstream gives it: a 429 to retry shortly, kept by no cache.
+    myS3.FailUploadPartNumber = 2;
+    var server = CreateServer(signedLinks: true, multipartThresholdBytes: 12, multipartPartSizeBytes: 5);
+
+    using var response = await server.CreateRequest("/real/chunked.bin").SendAsync(HttpMethod.Get.Method);
+
+    Assert.Equal(HttpStatusCode.TooManyRequests, response.StatusCode);
+    Assert.Equal(TimeSpan.FromSeconds(1), response.Headers.RetryAfter?.Delta);
+    Assert.True(response.Headers.CacheControl?.NoStore);
     Assert.Equal(1, myS3.AbortMultipartUploadCalls);
     Assert.DoesNotContain(GetPathKey("/real/chunked.bin"), myS3.Objects.Keys);
   }
@@ -1434,6 +1452,9 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     // Part number whose upload should fail, standing in for a transient S3 error mid-upload.
     public int? FailUploadPartNumber;
 
+    // How that part fails: S3's throttling answer by default, or InternalError for a failure that is not one.
+    public string FailUploadPartErrorCode = "SlowDown";
+
     // Sizes of the parts of the last completed multipart upload, in the order they were assembled.
     public IReadOnlyList<int> CompletedPartSizes = [];
     public HttpVerb? LastPresignVerb;
@@ -1534,10 +1555,15 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     {
       Interlocked.Increment(ref UploadPartCalls);
       if (request.PartNumber == FailUploadPartNumber)
-        throw new AmazonS3Exception("Please reduce your request rate.")
-        {
-          ErrorCode = "SlowDown", StatusCode = HttpStatusCode.ServiceUnavailable,
-        };
+        throw FailUploadPartErrorCode == "SlowDown"
+          ? new AmazonS3Exception("Please reduce your request rate.")
+          {
+            ErrorCode = "SlowDown", StatusCode = HttpStatusCode.ServiceUnavailable,
+          }
+          : new AmazonS3Exception("We encountered an internal error. Please try again.")
+          {
+            ErrorCode = FailUploadPartErrorCode, StatusCode = HttpStatusCode.InternalServerError,
+          };
 
       using var ms = new MemoryStream();
       await request.InputStream.CopyToAsync(ms, cancellationToken);
