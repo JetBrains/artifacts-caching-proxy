@@ -394,6 +394,51 @@ public class CachingProfileTest
     }
   }
 
+  [Fact]
+  public void AndroidSdk_Profile_Revalidates_Indexes_And_Floating_Zips_Only()
+  {
+    // Mirrors the shipped android-sdk profile (appsettings.json). The indexes are rewritten in place
+    // on every SDK release; versioned packages never change.
+    var profile = AndroidSdkProfile();
+
+    foreach (var mutable in new[]
+             {
+               "/dl.google.com/android/repository/repository2-3.xml",
+               "/dl.google.com/android/repository/repository2-1.xml",
+               "/dl.google.com/android/repository/addons_list-5.xml",
+               "/dl.google.com/android/repository/sys-img/android/sys-img2-3.xml",
+               "/dl.google.com/android/repository/glass/addon2-3.xml",
+               "/dl.google.com/android/repository/platform-tools-latest-linux.zip",
+               "/dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip",
+             })
+    {
+      var rule = profile.Match(mutable);
+      Assert.NotNull(rule);
+      Assert.Equal(TimeSpan.FromHours(1), rule!.RefreshAfter);
+    }
+
+    foreach (var immutable in new[]
+             {
+               "/dl.google.com/android/repository/platform-tools_r35.0.2-linux.zip",
+               "/dl.google.com/android/repository/build-tools_r35.0.0_linux.zip",
+               "/dl.google.com/android/repository/platform-36_r01.zip",
+               "/dl.google.com/android/repository/sys-img/android/x86_64-35_r02.zip",
+             })
+      Assert.Null(profile.Match(immutable));
+
+    Assert.DoesNotContain(profile.Rules, rule => rule.Redirect);
+  }
+
+  // The shipped android-sdk profile, kept in the same order as CachingProxy/appsettings.json.
+  private static CachingProfile AndroidSdkProfile() => new()
+  {
+    Rules =
+    [
+      new CachingRule { Pattern = @"\.xml$", RefreshAfter = TimeSpan.FromHours(1) },
+      new CachingRule { Pattern = "latest[^/]*$", RefreshAfter = TimeSpan.FromHours(1) },
+    ]
+  };
+
   // The shipped docker profile, kept in the same order as CachingProxy/appsettings.json.
   private static CachingProfile DockerProfile() => new()
   {
