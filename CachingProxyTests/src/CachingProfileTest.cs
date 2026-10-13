@@ -429,6 +429,59 @@ public class CachingProfileTest
     Assert.DoesNotContain(profile.Rules, rule => rule.Redirect);
   }
 
+  [Fact]
+  public void NodejsDist_Profile_Revalidates_Catalogs_Latest_And_Listings_Only()
+  {
+    // Mirrors the shipped nodejs-dist profile (appsettings.json). Each channel's catalog, the latest*
+    // directories and the listings change on every release; versioned files never do.
+    var profile = NodejsDistProfile();
+
+    foreach (var mutable in new[]
+             {
+               "/nodejs.org/dist/index.json",
+               "/nodejs.org/dist/index.tab",
+               "/nodejs.org/download/nightly/index.json",
+               "/nodejs.org/download/rc/index.tab",
+               "/nodejs.org/dist/latest/SHASUMS256.txt",
+               "/nodejs.org/dist/latest-v22.x/node-v22.20.0-linux-x64.tar.xz",
+               "/nodejs.org/dist/latest-jod/",
+               "/nodejs.org/dist/latest",
+               "/nodejs.org/dist/",
+               "/nodejs.org/download/release/",
+               "/nodejs.org/dist/v22.11.0/",
+             })
+    {
+      var rule = profile.Match(mutable);
+      Assert.NotNull(rule);
+      Assert.Equal(TimeSpan.FromHours(1), rule!.RefreshAfter);
+    }
+
+    foreach (var immutable in new[]
+             {
+               "/nodejs.org/dist/v22.11.0/node-v22.11.0-linux-x64.tar.xz",
+               "/nodejs.org/dist/v22.11.0/SHASUMS256.txt",
+               "/nodejs.org/dist/v22.11.0/SHASUMS256.txt.asc",
+               "/nodejs.org/dist/v22.11.0/node-v22.11.0-headers.tar.gz",
+               "/nodejs.org/dist/v22.11.0/win-x64/node.lib",
+               "/nodejs.org/download/release/v22.11.0/node-v22.11.0-x64.msi",
+               "/nodejs.org/download/nightly/v25.0.0-nightly20261010abcdef1234/node-v25.0.0-nightly20261010abcdef1234-linux-x64.tar.gz",
+             })
+      Assert.Null(profile.Match(immutable));
+
+    Assert.DoesNotContain(profile.Rules, rule => rule.Redirect);
+  }
+
+  // The shipped nodejs-dist profile, kept in the same order as CachingProxy/appsettings.json.
+  private static CachingProfile NodejsDistProfile() => new()
+  {
+    Rules =
+    [
+      new CachingRule { Pattern = @"/index\.(?:json|tab)$", RefreshAfter = TimeSpan.FromHours(1) },
+      new CachingRule { Pattern = "/latest[^/]*(/|$)", RefreshAfter = TimeSpan.FromHours(1) },
+      new CachingRule { Pattern = "/$", RefreshAfter = TimeSpan.FromHours(1) },
+    ]
+  };
+
   // The shipped android-sdk profile, kept in the same order as CachingProxy/appsettings.json.
   private static CachingProfile AndroidSdkProfile() => new()
   {
