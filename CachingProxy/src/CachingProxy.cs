@@ -13,7 +13,6 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Logging;
 using Microsoft.Net.Http.Headers;
-using Sentry;
 
 namespace JetBrains.CachingProxy;
 
@@ -66,9 +65,6 @@ public class CachingProxy
       await myRequestDelegate(context);
       return;
     }
-
-    // Lets Sentry fingerprint rules group upstream failures per domain: {{ tags.remote_host }}
-    SentrySdk.ConfigureScope(scope => scope.SetTag("remote_host", remoteServer.RemoteUri.Host));
 
     var upstreamUri = await myRemoteProxy.ValidateRequestAsync(context, remoteServer, remainingPath);
     if (upstreamUri == null)

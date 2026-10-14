@@ -12,6 +12,7 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
 using Microsoft.Net.Http.Headers;
+using Sentry;
 using CacheControlHeaderValue = System.Net.Http.Headers.CacheControlHeaderValue;
 using EntityTagHeaderValue = System.Net.Http.Headers.EntityTagHeaderValue;
 
@@ -54,6 +55,10 @@ public partial class RemoteProxy(
   /// <returns>The upstream URI, or <c>null</c> when the request was rejected and already answered.</returns>
   public async ValueTask<Uri?> ValidateRequestAsync(HttpContext context, RemoteServers.RemoteServer remoteServer, string? remainingPath)
   {
+    // Lets Sentry fingerprint rules group upstream failures per domain: {{ tags.remote_host }}. Set here
+    // because every storage middleware passes through, so disk and S3 events group alike.
+    SentrySdk.ConfigureScope(scope => scope.SetTag("remote_host", remoteServer.RemoteUri.Host));
+
     if (!HttpMethods.IsHead(context.Request.Method) && !HttpMethods.IsGet(context.Request.Method))
     {
       await SetStatusAsync(context, CachingProxyStatus.BAD_REQUEST, CachedResponse.MethodNotAllowed);
