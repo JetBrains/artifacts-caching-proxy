@@ -22,6 +22,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using Polly;
 using StackExchange.Redis;
 
 namespace JetBrains.CachingProxy;
@@ -101,22 +102,38 @@ public static class AuthExtensions
         client.ClientSecret = ClientSecret.Parse(auth.ClientSecret);
         if (!string.IsNullOrEmpty(auth.Scope))
           client.Scope = Scope.Parse(auth.Scope);
+        client.HttpClientName = auth.ClientId;
       });
+
+      services.AddHttpClient(auth.ClientId!)
+        .AddTokenClientRetryPolicy();
     }
 
     // GitHub App installation-token provider plus its dedicated GitHub REST client.
     // Registered whenever any upstream auth exists — harmless when no GitHub App entry is configured. The
     // dispatch provider also resolves the (optional) Duende token manager.
+    services.AddHttpClient(nameof(GitHubAppInstallationTokenProvider))
+      .AddTokenClientRetryPolicy();
     services.AddSingleton<GitHubAppInstallationTokenProvider>();
     services.AddSingleton<IUpstreamAuthorizationProvider, UpstreamAuthorizationProvider>();
 
     // The OCI registry token dance. Not driven by UpstreamAuth entries at all — a registry demands a token
     // for anonymous pulls too — so it is registered unconditionally and engages only for prefixes whose
     // profile sets Oci.
+    services.AddHttpClient(nameof(RegistryTokenProvider))
+      .AddTokenClientRetryPolicy();
     services.AddSingleton<RegistryTokenProvider>();
 
     return services;
   }
+
+  /// <summary>
+  /// Adds transient error retry policy for token issuing and auth clients: up to 3 retries with short exponential backoff.
+  /// </summary>
+  public static IHttpClientBuilder AddTokenClientRetryPolicy(this IHttpClientBuilder builder) =>
+    builder.AddTransientHttpErrorPolicy(static policyBuilder => policyBuilder.WaitAndRetryAsync(
+      retryCount: 3,
+      sleepDurationProvider: static retryAttempt => TimeSpan.FromMilliseconds(100 * Math.Pow(2, retryAttempt - 1))));
 
   /// <summary>
   /// Inbound authentication. Authentication/authorization are always registered, since a prefix whose

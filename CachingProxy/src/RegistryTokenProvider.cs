@@ -234,7 +234,7 @@ public sealed class RegistryTokenProvider(
       parameters.Add($"service={Uri.EscapeDataString(challenge.Service)}");
     builder.Query = string.Join('&', query.Length > 0 ? parameters.Prepend(query) : parameters);
 
-    using var http = httpClientFactory.CreateClient();
+    using var http = httpClientFactory.CreateClient(nameof(RegistryTokenProvider));
     using var request = new HttpRequestMessage(HttpMethod.Get, builder.Uri) { Headers = { Authorization = credentials } };
 
     using var response = await http.SendAsync(request, ct);

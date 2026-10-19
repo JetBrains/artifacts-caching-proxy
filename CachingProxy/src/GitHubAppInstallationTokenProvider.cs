@@ -55,7 +55,7 @@ public sealed class GitHubAppInstallationTokenProvider(
   private async Task<(string Token, DateTimeOffset ExpiresAt)> FetchInstallationTokenAsync(UpstreamAuth auth, CancellationToken ct)
   {
     var jwt = CreateAppJwt(auth);
-    using var http = httpClientFactory.CreateClient();
+    using var http = httpClientFactory.CreateClient(nameof(GitHubAppInstallationTokenProvider));
     http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
     http.BaseAddress = new Uri(auth.GitHubApiBaseUrl);
 
