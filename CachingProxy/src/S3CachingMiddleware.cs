@@ -165,16 +165,16 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
           // verdict so the serve-from-probe paths below report REVALIDATED (kept after a 304) or STALE
           // (upstream unreachable) instead of MISS. A 200 re-stores and serves fresh; a 404 deletes it.
           var probeStatus = CachingProxyStatus.MISS;
-          if (rule?.RefreshAfter is { } refreshAfter && IsPastRefreshWindow(s3Object, refreshAfter, out var createdAt))
+          if (rule?.RefreshAfter is { } refreshAfter && IsPastRefreshWindow(s3Object, refreshAfter))
           {
-            // The upstream's own date in preference to ours, which is sound but has a window: a change
-            // made while we were downloading precedes the date we then stamp, so revalidating on that
-            // draws a 304 for the version we missed and the touch pushes the date forward again - stale
-            // for good. Only decides anything where the date is the sole validator, an upstream sending
-            // an ETag being revalidated on that instead, and that is a real case:
-            // redirector.kotlinlang.org sends Last-Modified and no ETag.
+            // Only the upstream's own validators, never our "created-at" in place of a missing date. Ours
+            // is our clock: a 304 touch moves it past a change the upstream (or a lagging replica of it)
+            // had not shown us yet, and from then on that change draws a 304 too - stale for good. That
+            // froze objects stored before validators were recorded: eu-central-1 served a July
+            // maven-metadata.xml in October. With neither recorded the request is unconditional, and the
+            // 200 re-store records them.
             var result = await remoteProxy.RevalidateAsync(context, upstreamUri, UpstreamETag(s3Object),
-              CachedResponse.UpstreamLastModified(s3Object) ?? createdAt,
+              CachedResponse.UpstreamLastModified(s3Object),
               remoteServer.Auth, rule, remoteServer.Profile, context.RequestAborted);
             switch (result.Outcome)
             {
@@ -408,9 +408,9 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
     e is AmazonServiceException { ErrorCode: "SlowDown" } or AmazonServiceException { StatusCode: HttpStatusCode.TooManyRequests };
 
   /// <summary>
-  /// Whether a probed object has outlived <paramref name="refreshAfter"/>, reporting its stored date for
-  /// the conditional request. A missing or unparsable "created-at" counts as past any window rather than
-  /// eternally fresh: the key is younger than the bucket, so objects predating it carry none, and a
+  /// Whether a probed object has outlived <paramref name="refreshAfter"/>. A missing or unparsable
+  /// "created-at" counts as past any window rather than eternally fresh: the key is younger than the
+  /// bucket, so objects predating it carry none, and a
   /// mutable one (maven-metadata.xml, a manifest by tag) would otherwise never leave a window it cannot
   /// be measured against. Revalidating heals it - both outcomes that keep the object write the key, a
   /// 304 via <see cref="TouchStoredDateAsync"/> and a 200 via <see cref="StoreInBucketAsync"/> - so this
@@ -418,18 +418,10 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
   /// the date lacks the recorded upstream ETag too, so there is no precondition to send and the answer is
   /// a full body.
   /// </summary>
-  private bool IsPastRefreshWindow(GetObjectResponse s3Object, TimeSpan refreshAfter, out DateTimeOffset? createdAt)
-  {
-    if (!DateTimeOffset.TryParse(s3Object.Metadata[CreatedAtMetadataKey], CultureInfo.InvariantCulture,
-          DateTimeStyles.RoundtripKind, out var storedAt))
-    {
-      createdAt = null;
-      return true;
-    }
-
-    createdAt = storedAt;
-    return timeProvider.GetUtcNow() - storedAt > refreshAfter;
-  }
+  private bool IsPastRefreshWindow(GetObjectResponse s3Object, TimeSpan refreshAfter) =>
+    !DateTimeOffset.TryParse(s3Object.Metadata[CreatedAtMetadataKey], CultureInfo.InvariantCulture,
+      DateTimeStyles.RoundtripKind, out var storedAt)
+    || timeProvider.GetUtcNow() - storedAt > refreshAfter;
 
   /// <summary>
   /// Resets a stored object's "created-at" metadata (the freshness clock) without re-downloading it,

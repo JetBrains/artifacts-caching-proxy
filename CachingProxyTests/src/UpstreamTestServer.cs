@@ -405,6 +405,8 @@ public class UpstreamTestServer : IAsyncLifetime
           }
         }
         res.ContentType = MediaTypeNames.Application.Json;
+        // A validator to revalidate on, as registry.npmjs.org sends: without one the request is unconditional.
+        res.Headers.LastModified = "Tue, 10 Jul 2018 04:58:42 GMT";
         return res.WriteAsync("{\"name\":\"express\",\"dist-tags\":{\"latest\":\"1.0.0\"}}");
       })
       .MapGet("express/-/express-1.0.0.tgz", (req, res, data) =>
@@ -430,6 +432,7 @@ public class UpstreamTestServer : IAsyncLifetime
           }
         }
         res.ContentType = MediaTypeNames.Application.Json;
+        res.Headers.LastModified = "Tue, 10 Jul 2018 04:58:42 GMT"; // as api.nuget.org sends
         return res.WriteAsync("{\"versions\":[\"13.0.3\"]}");
       })
       .MapGet("v3-flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg", (req, res, data) =>

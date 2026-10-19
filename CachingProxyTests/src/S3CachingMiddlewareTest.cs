@@ -1127,12 +1127,14 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   [Fact]
   public async Task Revalidation_Sends_No_ETag_When_None_Was_Recorded()
   {
-    // Nothing recorded - an upstream that issues no ETag, or an object stored before this was recorded -
-    // so the request is conditional on the stored date alone. Sending the bucket's own tag instead would
-    // make the origin skip the date it can actually evaluate.
+    // No ETag recorded - an upstream that issues none - so the request is conditional on the upstream's
+    // date alone. Sending the bucket's own tag instead would make the origin skip the date it can
+    // actually evaluate.
     var server = CreateServer(signedLinks: false, refreshAfter: TimeSpan.FromMinutes(1));
     var key = GetPathKey("/real/revalidate.txt");
+    var upstreamDate = new DateTimeOffset(2025, 4, 27, 15, 7, 12, TimeSpan.Zero);
     myS3.Objects[key] = ([.. "v1"u8], "text/plain", "\"s3-body-md5\"");
+    myS3.UpstreamLastModified[key] = upstreamDate;
     myS3.CreatedAt[key] = DateTimeOffset.UtcNow - TimeSpan.FromHours(1);
     Assert.DoesNotContain(key, myS3.UpstreamETags.Keys);
     upstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.NotModified;
@@ -1141,7 +1143,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
 
     AssertStatusHeader(response, CachingProxyStatus.REVALIDATED);
     Assert.Null(upstreamServer.RevalidateIfNoneMatch);
-    Assert.NotNull(upstreamServer.RevalidateIfModifiedSince); // the date still is a precondition
+    Assert.Equal(upstreamDate.ToString("R"), upstreamServer.RevalidateIfModifiedSince); // the date still is a precondition
   }
 
   [Fact]
@@ -1262,23 +1264,29 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   }
 
   [Fact]
-  public async Task Revalidation_Falls_Back_To_The_Stored_Date_When_No_Upstream_Date_Was_Recorded()
+  public async Task Revalidation_Is_Unconditional_When_No_Upstream_Validator_Was_Recorded()
   {
-    // Nothing recorded - an upstream that sends no Last-Modified, or an object stored before this was
-    // recorded - so the request is conditional on our own store date. That is sound, being never earlier
-    // than the upstream's: an unchanged object still 304s and a changed one still gets a full body.
+    // Nothing recorded - an object stored before validators were, or an upstream that sends neither - so
+    // the request carries no precondition. Our own store date in their place froze objects: each 304
+    // touch moved it past a change a lagging upstream replica had not shown us yet, and from then on
+    // that change drew a 304 too. The 200 re-store records the upstream's validators.
     var server = CreateServer(signedLinks: false, refreshAfter: TimeSpan.FromMinutes(1));
     var key = GetPathKey("/real/revalidate.txt");
-    var storedAt = new DateTimeOffset(2026, 1, 2, 3, 4, 5, TimeSpan.Zero);
-    myS3.Objects[key] = ([.. "v1"u8], "text/plain", "\"s3-body-md5\"");
-    myS3.CreatedAt[key] = storedAt;
+    var newDate = new DateTimeOffset(2026, 9, 12, 2, 10, 9, TimeSpan.Zero);
+    myS3.Objects[key] = ([.. "old"u8], "text/plain", "\"s3-body-md5\"");
+    myS3.CreatedAt[key] = DateTimeOffset.UtcNow - TimeSpan.FromHours(1);
+    Assert.DoesNotContain(key, myS3.UpstreamETags.Keys);
     Assert.DoesNotContain(key, myS3.UpstreamLastModified.Keys);
-    upstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.NotModified;
+    upstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.Ok;
+    upstreamServer.RevalidateContent = "new-content";
+    upstreamServer.RevalidateLastModified = newDate.ToString("R");
 
     using var response = await server.CreateRequest("/real/revalidate.txt").SendAsync(HttpMethod.Get.Method);
 
     AssertStatusHeader(response, CachingProxyStatus.REVALIDATED);
-    Assert.Equal(storedAt.ToString("R"), upstreamServer.RevalidateIfModifiedSince);
+    Assert.Null(upstreamServer.RevalidateIfNoneMatch);
+    Assert.Null(upstreamServer.RevalidateIfModifiedSince);
+    Assert.Equal(newDate, myS3.UpstreamLastModified[key]); // healed: the next revalidation is conditional
   }
 
   [Fact]

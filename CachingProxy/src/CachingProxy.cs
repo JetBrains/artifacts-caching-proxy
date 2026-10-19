@@ -174,11 +174,11 @@ public class CachingProxy
     Uri upstreamUri, string cacheKey, string? contentEncoding, FileInfo cachedFile,
     CacheEntryMetadata metadata, CachingRule? rule, string? variant)
   {
-    // The conditional validators come from the entry's metadata. Last-Modified falls back to when we
-    // stored the copy for an upstream that sent none: that is never earlier than the upstream's own, so
-    // a resource changed since is still answered with a full body while an unchanged one still 304s.
-    var result = await myRemoteProxy.RevalidateAsync(context, upstreamUri, metadata.ETag,
-      metadata.LastModified ?? new DateTimeOffset(metadata.StoredAtUtc, TimeSpan.Zero),
+    // The conditional validators are the upstream's own, from the entry's metadata. Never our store date
+    // in place of a missing Last-Modified: a window reset moves it past a change the upstream (or a
+    // lagging replica of it) had not shown us yet, and from then on that change draws a 304 too - stale
+    // for good. With neither recorded the request is unconditional, and the 200 re-store records them.
+    var result = await myRemoteProxy.RevalidateAsync(context, upstreamUri, metadata.ETag, metadata.LastModified,
       remoteServer.Auth, rule, remoteServer.Profile, context.RequestAborted);
 
     switch (result.Outcome)

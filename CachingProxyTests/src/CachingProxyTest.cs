@@ -1965,6 +1965,30 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
   }
 
   [Fact]
+  public async Task Revalidation_Without_Upstream_Validators_Is_Unconditional()
+  {
+    // An upstream that sent neither ETag nor Last-Modified leaves nothing to be conditional on. Our store
+    // date in their place moves with every window reset, so a change it overtook would draw 304s for good.
+    var server = CreateRefreshAfterServer(TimeSpan.FromMinutes(1));
+    myUpstreamServer.RevalidateETag = null;
+    myUpstreamServer.RevalidateLastModified = null;
+    myUpstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.Ok;
+    myUpstreamServer.RevalidateContent = "v1";
+
+    using (var miss = await server.CreateRequest("/real/revalidate.txt").GetAsync())
+      AssertStatusHeader(miss, CachingProxyStatus.MISS);
+
+    myTimeProvider.Advance(TimeSpan.FromMinutes(2));
+    myUpstreamServer.RevalidateContent = "v2";
+
+    using var reval = await server.CreateRequest("/real/revalidate.txt").GetAsync();
+    AssertStatusHeader(reval, CachingProxyStatus.REVALIDATED);
+    Assert.Equal("v2", await reval.Content.ReadAsStringAsync());
+    Assert.Null(myUpstreamServer.RevalidateIfNoneMatch);
+    Assert.Null(myUpstreamServer.RevalidateIfModifiedSince);
+  }
+
+  [Fact]
   public async Task Stale_Upstream_Error_Serves_Stale_Copy()
   {
     var server = CreateRefreshAfterServer(TimeSpan.FromMinutes(1));
