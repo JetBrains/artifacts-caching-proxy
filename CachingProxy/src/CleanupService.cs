@@ -171,6 +171,11 @@ public class CleanupService(TimeProvider timeProvider, CachingProxyConfig config
         deletedBytes += size;
         return true;
       }
+      // Already gone: during a rolling deploy the old and new task share the host volume and both sweep it.
+      catch (FileNotFoundException)
+      {
+        return true;
+      }
       catch (Exception ex)
       {
         logger.LogWarning(ex, "Failed to delete {Path}", file.FullName);
