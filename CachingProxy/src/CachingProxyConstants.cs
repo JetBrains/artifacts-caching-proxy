@@ -16,5 +16,14 @@ namespace JetBrains.CachingProxy
     // relayed from an upstream registry through the cache (see CachedResponse).
     public const string DockerApiVersionHeader = "Docker-Distribution-API-Version";
     public const string DockerApiVersion = "registry/2.0";
+
+    // MRI-5711, edge verification of signed redirects (docs/design/edge-verified-signed-redirects.md in
+    // Cache-Redirector). The CloudFront function verify-signed-redirect sets EdgeVerified ("1") on a request
+    // whose cr_sig it verified, and EdgeVerdict (its outcome) on every request it sees. A response flagged
+    // EdgeCacheable is public for CloudFront alone: restore-private-cache-control strips the flag and makes
+    // it private again before it reaches a viewer.
+    public const string EdgeVerifiedHeader = "X-CR-Edge-Verified";
+    public const string EdgeVerdictHeader = "X-CR-Edge-Verdict";
+    public const string EdgeCacheableHeader = "X-CR-Edge-Cacheable";
   }
 }

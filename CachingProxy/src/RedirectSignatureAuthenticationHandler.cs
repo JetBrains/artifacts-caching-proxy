@@ -54,13 +54,27 @@ public sealed class RedirectSignatureAuthenticationHandler(
 
   protected override Task<AuthenticateResult> HandleAuthenticateAsync()
   {
+    var result = Verify();
+
+    // MRI-5711 shadow check: what the CloudFront edge decided about this same signature, if it passed one.
+    if (!result.None)
+    {
+      var edgeVerdict = Request.Headers[CachingProxyConstants.EdgeVerdictHeader];
+      metrics.IncrementEdgeSignatureVerdict(edgeVerdict.Count > 0 ? edgeVerdict.ToString() : null, result.Succeeded);
+    }
+
+    return Task.FromResult(result);
+  }
+
+  private AuthenticateResult Verify()
+  {
     // cr_exp is used verbatim (as the string that arrived on the wire) in the signed payload, so a
     // valid signature pins the exact bytes the redirector signed; it is only additionally parsed as a
     // number for the expiry check.
     var expiry = Request.Query[ExpiryQueryParam].ToString();
     var signature = Request.Query[SignatureQueryParam].ToString();
     if (string.IsNullOrEmpty(expiry) || string.IsNullOrEmpty(signature))
-      return Task.FromResult(AuthenticateResult.NoResult());
+      return AuthenticateResult.NoResult();
 
     if (!long.TryParse(expiry, out var expiryUnixSeconds))
       return Fail("cr_exp is not an integer");
@@ -101,7 +115,7 @@ public sealed class RedirectSignatureAuthenticationHandler(
       // just like a JWT-authenticated request, marks the response Cache-Control: private so the private
       // artifact is not stored by shared caches.
       var principal = new ClaimsPrincipal(new ClaimsIdentity(SchemeName));
-      return Task.FromResult(AuthenticateResult.Success(new AuthenticationTicket(principal, Scheme.Name)));
+      return AuthenticateResult.Success(new AuthenticationTicket(principal, Scheme.Name));
     }
 
     // Its own metric tag because mid-rotation this means the steps ran out of order — the signer moved to
@@ -164,10 +178,10 @@ public sealed class RedirectSignatureAuthenticationHandler(
     return kept.ToString();
   }
 
-  private Task<AuthenticateResult> Fail(string reason)
+  private AuthenticateResult Fail(string reason)
   {
     Logger.LogWarning("Rejecting redirect signature: {Reason}", reason);
-    return Task.FromResult(AuthenticateResult.Fail(reason));
+    return AuthenticateResult.Fail(reason);
   }
 
   // Mirror the JwtBearer/deny paths: a rejected signed request still advertises Basic so a Basic-only

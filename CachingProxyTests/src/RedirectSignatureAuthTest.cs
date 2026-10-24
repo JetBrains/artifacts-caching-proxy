@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Concurrent;
+using System.Diagnostics.Metrics;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -124,6 +126,142 @@ public class RedirectSignatureAuthTest : IAsyncLifetime
 
     Assert.Equal(HttpStatusCode.OK, response.StatusCode);
     Assert.Equal("max-age=31536000, private", response.Headers.CacheControl?.ToString());
+  }
+
+  // MRI-5711: edge verification. A signed request the CloudFront edge verified itself may be stored there,
+  // so it is answered public plus the flag the viewer-response function turns back into private. Every
+  // other combination keeps today's private header and carries no flag.
+
+  [Fact]
+  public async Task Edge_Verified_Signature_Is_Public_With_Flag()
+  {
+    using var client = myProxyHost!.GetTestServer().CreateClient();
+
+    var response = await SendAsync(client, Sign("/private/one.jar"), edgeVerified: "1");
+
+    Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    Assert.Equal("public, max-age=31536000", response.Headers.CacheControl?.ToString());
+    Assert.Equal("1", Assert.Single(response.Headers.GetValues(CachingProxyConstants.EdgeCacheableHeader)));
+
+    // The second request is served off the local cache file, a different code path to the same header.
+    var cached = await SendAsync(client, Sign("/private/one.jar"), edgeVerified: "1");
+    Assert.Equal("public, max-age=31536000", cached.Headers.CacheControl?.ToString());
+    Assert.True(cached.Headers.Contains(CachingProxyConstants.EdgeCacheableHeader));
+  }
+
+  [Fact]
+  public async Task Edge_Flag_Without_Signature_Is_Unauthorized()
+  {
+    // The flag is no credential: the proxy still authorizes on the signature alone.
+    using var client = myProxyHost!.GetTestServer().CreateClient();
+
+    var response = await SendAsync(client, "/private/one.jar", edgeVerified: "1");
+
+    Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    Assert.False(response.Headers.Contains(CachingProxyConstants.EdgeCacheableHeader));
+  }
+
+  [Fact]
+  public async Task Edge_Flag_With_Bad_Signature_Is_Unauthorized()
+  {
+    using var client = myProxyHost!.GetTestServer().CreateClient();
+
+    var response = await SendAsync(client, Sign("/private/one.jar", key: "the-wrong-key"), edgeVerified: "1");
+
+    Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    Assert.False(response.Headers.Contains(CachingProxyConstants.EdgeCacheableHeader));
+  }
+
+  [Theory]
+  [InlineData("0")]
+  [InlineData("true")]
+  [InlineData("")]
+  public async Task Signature_With_Other_Edge_Flag_Value_Stays_Private(string value)
+  {
+    using var client = myProxyHost!.GetTestServer().CreateClient();
+
+    var response = await SendAsync(client, Sign("/private/one.jar"), edgeVerified: value);
+
+    Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    Assert.Equal("max-age=31536000, private", response.Headers.CacheControl?.ToString());
+    Assert.False(response.Headers.Contains(CachingProxyConstants.EdgeCacheableHeader));
+  }
+
+  [Fact]
+  public async Task Jwt_With_Edge_Flag_Stays_Private()
+  {
+    // Each credential would be its own edge entry, so only signatures are ever made edge-cacheable.
+    using var client = myProxyHost!.GetTestServer().CreateClient();
+    client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", MintToken());
+
+    var response = await SendAsync(client, "/private/one.jar", edgeVerified: "1");
+
+    Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    Assert.Equal("max-age=31536000, private", response.Headers.CacheControl?.ToString());
+    Assert.False(response.Headers.Contains(CachingProxyConstants.EdgeCacheableHeader));
+  }
+
+  [Fact]
+  public async Task Edge_Verdict_Is_Counted_Against_Proxy_Decision()
+  {
+    using var verdicts = new EdgeVerdictRecorder(myProxyHost!);
+    using var client = myProxyHost!.GetTestServer().CreateClient();
+
+    await SendAsync(client, Sign("/private/one.jar"), edgeVerdict: "valid");
+    await SendAsync(client, Sign("/private/one.jar", key: "the-wrong-key"), edgeVerdict: "valid");
+    await SendAsync(client, Sign("/private/one.jar"), edgeVerdict: "mismatch");
+    await SendAsync(client, Sign("/private/one.jar"), edgeVerdict: "made-up");
+    await SendAsync(client, Sign("/private/one.jar"));
+    // No signature, no verification: nothing to compare.
+    await SendAsync(client, "/private/one.jar", edgeVerdict: "absent");
+
+    Assert.Equal(
+      ["valid/accept", "valid/reject", "mismatch/accept", "other/accept", "none/accept"],
+      verdicts.Recorded);
+  }
+
+  private static Task<HttpResponseMessage> SendAsync(
+    HttpClient client, string pathAndQuery, string? edgeVerified = null, string? edgeVerdict = null)
+  {
+    var request = new HttpRequestMessage(HttpMethod.Get, pathAndQuery);
+    if (edgeVerified != null)
+      request.Headers.TryAddWithoutValidation(CachingProxyConstants.EdgeVerifiedHeader, edgeVerified);
+    if (edgeVerdict != null)
+      request.Headers.TryAddWithoutValidation(CachingProxyConstants.EdgeVerdictHeader, edgeVerdict);
+    return client.SendAsync(request);
+  }
+
+  // caching_edge_signature_verdicts as "edge/proxy", in order. Bound to this host's Meter, like
+  // RequestMetricRecorder, so other test hosts publishing the same counter do not leak in.
+  private sealed class EdgeVerdictRecorder : IDisposable
+  {
+    private readonly MeterListener myListener = new();
+    private readonly ConcurrentQueue<string> myRecorded = new();
+
+    public EdgeVerdictRecorder(IHost host)
+    {
+      var meter = host.Services.GetRequiredService<CachingProxyMetrics>().Meter;
+      myListener.InstrumentPublished = (instrument, listener) =>
+      {
+        if (ReferenceEquals(instrument.Meter, meter) && instrument.Name == "caching_edge_signature_verdicts")
+          listener.EnableMeasurementEvents(instrument);
+      };
+      myListener.SetMeasurementEventCallback<long>((_, _, tags, _) =>
+      {
+        string? edge = null, proxy = null;
+        foreach (var tag in tags)
+        {
+          if (tag.Key == "edge") edge = tag.Value as string;
+          if (tag.Key == "proxy") proxy = tag.Value as string;
+        }
+        myRecorded.Enqueue($"{edge}/{proxy}");
+      });
+      myListener.Start();
+    }
+
+    public string[] Recorded => [.. myRecorded];
+
+    public void Dispose() => myListener.Dispose();
   }
 
   [Fact]

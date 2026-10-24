@@ -13,6 +13,7 @@ public class CachingProxyMetrics
   private readonly Counter<long> myRequestsCounter;
   private readonly Counter<long> myContentCounter;
   private readonly Counter<long> myRedirectSignatureCounter;
+  private readonly Counter<long> myEdgeSignatureVerdictCounter;
 
   public CachingProxyMetrics(IMeterFactory meterFactory, CachingProxyConfig config)
   {
@@ -23,6 +24,7 @@ public class CachingProxyMetrics
     // is sent to fetch from the bucket. Bodies only - a HEAD, a 304 or an error head delivers none.
     myContentCounter = Meter.CreateCounter<long>("caching_content_bytes");
     myRedirectSignatureCounter = Meter.CreateCounter<long>("caching_redirect_signature_verifications");
+    myEdgeSignatureVerdictCounter = Meter.CreateCounter<long>("caching_edge_signature_verdicts");
 
     // Headroom on the volume the cache writes to. This is what actually runs out: in disk mode the cache
     // is a host path shared with whatever else the node runs, and eviction is driven by
@@ -133,5 +135,26 @@ public class CachingProxyMetrics
     myRedirectSignatureCounter.Add(1,
       new KeyValuePair<string, object?>("key_role", keyRole),
       new KeyValuePair<string, object?>("key_fingerprint", keyFingerprint));
+  }
+
+  // What verify-signed-redirect can report. Off the CDN path the header is client-forgeable, so anything
+  // else counts as "other", which bounds the cardinality.
+  private static readonly HashSet<string> ourEdgeVerdicts =
+    ["valid", "mismatch", "expired", "too_far", "malformed", "unsupported", "absent", "nokey", "error"];
+
+  /// <summary>
+  /// MRI-5711 shadow check: the CloudFront edge's verdict on a redirect signature next to this proxy's own.
+  /// <c>edge="valid", proxy="reject"</c> is a signature the edge would have let through to an edge-cached
+  /// private artifact, so it must stay at zero before edge caching is switched on. <c>edge</c> anything else
+  /// with <c>proxy="accept"</c> only costs cache hits.
+  /// </summary>
+  /// <param name="edgeVerdict">The X-CR-Edge-Verdict header, or null when the request did not pass the edge.</param>
+  /// <param name="proxyAccepted">Whether this proxy accepted the signature.</param>
+  public void IncrementEdgeSignatureVerdict(string? edgeVerdict, bool proxyAccepted)
+  {
+    myEdgeSignatureVerdictCounter.Add(1,
+      new KeyValuePair<string, object?>("edge",
+        edgeVerdict == null ? "none" : ourEdgeVerdicts.Contains(edgeVerdict) ? edgeVerdict : "other"),
+      new KeyValuePair<string, object?>("proxy", proxyAccepted ? "accept" : "reject"));
   }
 }

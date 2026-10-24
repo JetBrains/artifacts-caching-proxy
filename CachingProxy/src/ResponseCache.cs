@@ -124,12 +124,31 @@ public sealed record CachedResponse(HttpStatusCode StatusCode, IHeaderDictionary
     return isAuthenticated ? ourPrivateCachingHeader : ourEternalCachingHeader;
   }
 
+  /// <summary>
+  /// MRI-5711: a redirect-signature request the CloudFront edge has verified itself. CloudFront may store its
+  /// response, because it keys that copy on X-CR-Edge-Verified and only a request carrying a valid signature
+  /// for this path can reach it. The header is not a secret: off the CDN path, forging it only earns the
+  /// sender a public header on a response they were authorized for anyway. A JWT-authenticated response
+  /// stays private, since every credential would be its own edge entry.
+  /// </summary>
+  public static bool IsEdgeCacheable(HttpContext context) =>
+    context.User.Identity is { IsAuthenticated: true, AuthenticationType: RedirectSignatureAuthenticationHandler.SchemeName } &&
+    context.Request.Headers[CachingProxyConstants.EdgeVerifiedHeader] == "1";
+
   public static void SetCachingHeaderFor(HttpContext context, CachingRule? rule = null)
   {
     // For successful (2xx) responses, the cached response is always eternally cacheable.
     if (context.Response.StatusCode is >= StatusCodes.Status200OK and < StatusCodes.Status300MultipleChoices)
     {
-      context.Response.Headers.CacheControl = GetCachingHeader(context);
+      if (IsEdgeCacheable(context))
+      {
+        // Public with the same max-age, for CloudFront only: the viewer-response function turns it back into
+        // private on the way out and removes the flag.
+        context.Response.Headers.CacheControl = GetPublicCachingHeader(context);
+        context.Response.Headers[CachingProxyConstants.EdgeCacheableHeader] = "1";
+      }
+      else
+        context.Response.Headers.CacheControl = GetCachingHeader(context);
     }
     // A 404 a content-negotiated rule produced answers about one representation: our own entry is safe
     // because the key folds in the canonical Accept set (see RemoteProxy.GetCacheVariant), but the edge
@@ -144,6 +163,11 @@ public sealed record CachedResponse(HttpStatusCode StatusCode, IHeaderDictionary
   }
 
   private static readonly StringValues ourNoStoreHeaderValue = new CacheControlHeaderValue { NoStore = true }.ToString();
+
+  private static StringValues GetPublicCachingHeader(HttpContext context) =>
+    context.Items[CachingProxyConstants.RefreshAfterItemKey] is TimeSpan refreshAfter
+      ? new CacheControlHeaderValue { Public = true, MaxAge = refreshAfter }.ToString()
+      : ourEternalCachingHeader;
 
   public static readonly CachedResponse MethodNotAllowed = new(HttpStatusCode.MethodNotAllowed, new HeaderDictionary());
   public static readonly CachedResponse InvalidPath = new(HttpStatusCode.BadRequest, new HeaderDictionary(), [.. "Invalid request path"u8]);
