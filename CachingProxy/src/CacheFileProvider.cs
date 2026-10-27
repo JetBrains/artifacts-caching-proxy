@@ -20,15 +20,19 @@ namespace JetBrains.CachingProxy;
 /// the object and its user metadata (see the <c>GetObjectResponse</c> constructor of
 /// <see cref="CachedResponse"/>), so a HIT is served with the same head whichever backend holds it.</para>
 /// </summary>
+/// <param name="RewrittenETag">Our ETag for a body <see cref="UpstreamUrlRewrite"/> changed, served in place of
+/// the upstream's validators; <see cref="ETag"/> and <see cref="LastModified"/> then serve revalidation only.</param>
 public sealed record CacheEntryMetadata(
   DateTime StoredAtUtc,
   string? ContentType = null,
   string? ETag = null,
   DateTimeOffset? LastModified = null,
-  string? Digest = null)
+  string? Digest = null,
+  string? RewrittenETag = null)
 {
-  // Our own field, so it gets a name no HTTP header has.
+  // Our own fields, so they get names no HTTP header has.
   private const string StoredAtField = "StoredAt";
+  private const string RewrittenETagField = "RewrittenETag";
 
   /// <summary>The metadata to record for a body just fetched from the upstream.</summary>
   public static CacheEntryMetadata FromResponse(DateTime storedAtUtc, HttpResponseMessage response) => new(
@@ -36,7 +40,8 @@ public sealed record CacheEntryMetadata(
     response.Content.Headers.ContentType?.ToString(),
     response.Headers.ETag?.ToString(),
     response.Content.Headers.LastModified,
-    response.Headers.TryGetValues(CachedResponse.DockerContentDigestHeader, out var digest) ? digest.FirstOrDefault() : null);
+    response.Headers.TryGetValues(CachedResponse.DockerContentDigestHeader, out var digest) ? digest.FirstOrDefault() : null,
+    (response.Content as RewrittenContent)?.ETag);
 
   /// <summary>One <c>Name: value</c> per line; absent values are omitted.</summary>
   public string Format()
@@ -47,6 +52,7 @@ public sealed record CacheEntryMetadata(
     Append(text, HeaderNames.ETag, ETag);
     Append(text, HeaderNames.LastModified, LastModified?.ToString("R", CultureInfo.InvariantCulture));
     Append(text, CachedResponse.DockerContentDigestHeader, Digest);
+    Append(text, RewrittenETagField, RewrittenETag);
     return text.ToString();
   }
 
@@ -67,7 +73,7 @@ public sealed record CacheEntryMetadata(
   public static CacheEntryMetadata? TryParse(string text)
   {
     DateTime? storedAt = null;
-    string? contentType = null, etag = null, digest = null;
+    string? contentType = null, etag = null, digest = null, rewrittenETag = null;
     DateTimeOffset? lastModified = null;
 
     foreach (var line in text.Split('\n'))
@@ -89,9 +95,10 @@ public sealed record CacheEntryMetadata(
         lastModified = DateTimeOffset.TryParseExact(value, "R", CultureInfo.InvariantCulture, DateTimeStyles.None, out var parsed) ?
           parsed : null;
       else if (Is(name, CachedResponse.DockerContentDigestHeader)) digest = value;
+      else if (Is(name, RewrittenETagField)) rewrittenETag = value;
     }
 
-    return storedAt is { } when ? new CacheEntryMetadata(when, contentType, etag, lastModified, digest) : null;
+    return storedAt is { } when ? new CacheEntryMetadata(when, contentType, etag, lastModified, digest, rewrittenETag) : null;
   }
 
   private static bool Is(string name, string field) => name.Equals(field, StringComparison.OrdinalIgnoreCase);

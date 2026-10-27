@@ -40,6 +40,8 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
   // Extra hosts spun up by individual tests (e.g. with a custom freshness profile), stopped on dispose.
   private readonly List<IHost> myExtraHosts = [];
 
+  private const string PublicNugetUrl = "https://cache-redirector.example/nuget/";
+
   public CachingProxyTest(ITestOutputHelper output, UpstreamTestServer upstreamServer)
   {
     myOutput = output;
@@ -88,6 +90,8 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
             new CachingRule { Pattern = @"\.nupkg$" },
             new CachingRule { Pattern = @"\.snupkg$" },
             new CachingRule { Pattern = @"\.nuspec$" },
+            new CachingRule { Pattern = "/v3/registration[^/]*/", RefreshAfter = TimeSpan.FromHours(1), RewriteUrls = true },
+            new CachingRule { Pattern = @"/v3/vulnerabilities/index\.json$", RefreshAfter = TimeSpan.FromHours(1), RewriteUrls = true },
             new CachingRule { Pattern = ".", RefreshAfter = TimeSpan.FromHours(1) },
           ]
         },
@@ -143,6 +147,7 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
         new CachingProxyPrefix($"/real-redirect={upstreamServer.Url}", Profile: "redirect-all"),
         new CachingProxyPrefix($"/real-npm={upstreamServer.Url}", Profile: "npm"),
         new CachingProxyPrefix($"/real-nuget={upstreamServer.Url}", Profile: "nuget"),
+        new CachingProxyPrefix($"/real-nuget-rewrite={upstreamServer.Url}", Profile: "nuget", PublicUrl: PublicNugetUrl),
         new CachingProxyPrefix($"/real-pypi={upstreamServer.Url}", Profile: "pypi"),
         // An OCI prefix carries the "/v2" on both sides, exactly as config-gen emits it: the client
         // inserts "/v2/" after the host itself, so the alias is "/v2/<name>" and the origin ends in /v2.
@@ -986,6 +991,160 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
         AssertStatusHeader(message, CachingProxyStatus.HIT);
         Assert.Equal("gzip", message.Content.Headers.ContentEncoding.SingleOrDefault());
       });
+  }
+
+  [Fact]
+  public async Task Nuget_Registration_Links_Are_Rewritten_To_The_Public_Url()
+  {
+    // MRI-4855: registration links lead clients to whatever host they name, so on a prefix with a PublicUrl
+    // they have to name the public route rather than the upstream.
+    ResetRegistrationUpstream();
+    const string path = "/real-nuget-rewrite/v3/registration5-semver1/newtonsoft.json/index.json";
+    var upstreamRoot = myUpstreamServer.Url.AbsoluteUri;
+
+    string? etag = null;
+    await AssertGetResponse(path, HttpStatusCode.OK,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.MISS);
+        AssertRewrittenRegistration(Encoding.UTF8.GetString(bytes), "registration5-semver1", "13.0.3", upstreamRoot);
+        Assert.Equal(bytes.Length, GetContentLength(message));
+        // The upstream's validators describe other bytes.
+        etag = message.Headers.ETag?.ToString();
+        Assert.NotNull(etag);
+        Assert.NotEqual(UpstreamTestServer.RegistrationETag, etag);
+        Assert.Null(message.Content.Headers.LastModified);
+      });
+
+    await AssertGetResponse(path, HttpStatusCode.OK,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.HIT);
+        AssertRewrittenRegistration(Encoding.UTF8.GetString(bytes), "registration5-semver1", "13.0.3", upstreamRoot);
+        Assert.Equal(etag, message.Headers.ETag?.ToString());
+        Assert.NotEqual(UpstreamTestServer.RegistrationLastModified, message.Content.Headers.LastModified?.ToString("R"));
+      });
+
+    // Our validator is the one a client revalidates with.
+    using var conditional = await myServer.CreateRequest(path).AddHeader("If-None-Match", etag!).GetAsync();
+    Assert.Equal(HttpStatusCode.NotModified, conditional.StatusCode);
+    Assert.Equal(1, myUpstreamServer.RegistrationRequestCount);
+  }
+
+  [Fact]
+  public async Task Nuget_Registration_Is_Served_Verbatim_Without_A_Public_Url()
+  {
+    ResetRegistrationUpstream();
+    await AssertGetResponse("/real-nuget/v3/registration5-semver1/newtonsoft.json/index.json", HttpStatusCode.OK,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.MISS);
+        Assert.Equal(myUpstreamServer.RegistrationJson("registration5-semver1"), Encoding.UTF8.GetString(bytes));
+        Assert.Equal(UpstreamTestServer.RegistrationETag, message.Headers.ETag?.ToString());
+      });
+  }
+
+  [Fact]
+  public async Task Nuget_Gzipped_Registration_Is_Rewritten_And_Stays_Gzipped()
+  {
+    // nuget.org's registration5-gz-* documents: decoded, rewritten and encoded again, because the cache
+    // keeps the gzip variant as sent.
+    ResetRegistrationUpstream();
+    const string path = "/real-nuget-rewrite/v3/registration5-gz-semver2/newtonsoft.json/index.json";
+    var upstreamRoot = myUpstreamServer.Url.AbsoluteUri;
+
+    foreach (var status in new[] { CachingProxyStatus.MISS, CachingProxyStatus.HIT })
+    {
+      await AssertGetResponse(path, HttpStatusCode.OK,
+        (message, bytes) =>
+        {
+          AssertStatusHeader(message, status);
+          Assert.Equal("gzip", message.Content.Headers.ContentEncoding.SingleOrDefault());
+          Assert.Equal(bytes.Length, GetContentLength(message));
+          AssertRewrittenRegistration(Gunzip(bytes), "registration5-gz-semver2", "13.0.3", upstreamRoot);
+        });
+    }
+  }
+
+  [Fact]
+  public async Task Nuget_Registration_Revalidates_On_The_Upstream_Validator_And_Rewrites_A_Replacement()
+  {
+    ResetRegistrationUpstream();
+    const string path = "/real-nuget-rewrite/v3/registration5-semver1/newtonsoft.json/index.json";
+    var upstreamRoot = myUpstreamServer.Url.AbsoluteUri;
+
+    string? firstETag = null;
+    await AssertGetResponse(path, HttpStatusCode.OK,
+      (message, bytes) => firstETag = message.Headers.ETag?.ToString());
+
+    // A 304 keeps the rewritten copy. The upstream is asked with its own ETag, never ours.
+    myTimeProvider.Advance(TimeSpan.FromMinutes(61));
+    myUpstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.NotModified;
+    await AssertGetResponse(path, HttpStatusCode.OK,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.REVALIDATED);
+        AssertRewrittenRegistration(Encoding.UTF8.GetString(bytes), "registration5-semver1", "13.0.3", upstreamRoot);
+        Assert.Equal(firstETag, message.Headers.ETag?.ToString());
+      });
+    Assert.Equal(UpstreamTestServer.RegistrationETag, myUpstreamServer.RegistrationIfNoneMatch);
+
+    // A 200 is rewritten before it replaces the stored copy.
+    myTimeProvider.Advance(TimeSpan.FromMinutes(61));
+    myUpstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.Ok;
+    myUpstreamServer.RegistrationVersion = "13.0.4";
+    await AssertGetResponse(path, HttpStatusCode.OK,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.REVALIDATED);
+        AssertRewrittenRegistration(Encoding.UTF8.GetString(bytes), "registration5-semver1", "13.0.4", upstreamRoot);
+        Assert.NotEqual(firstETag, message.Headers.ETag?.ToString());
+      });
+    await AssertGetResponse(path, HttpStatusCode.OK,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.HIT);
+        AssertRewrittenRegistration(Encoding.UTF8.GetString(bytes), "registration5-semver1", "13.0.4", upstreamRoot);
+      });
+  }
+
+  [Fact]
+  public async Task Nuget_Version_List_Is_Not_Rewritten()
+  {
+    // Only RewriteUrls rules rewrite, even on a prefix with a PublicUrl.
+    await AssertGetResponse("/real-nuget-rewrite/v3-flatcontainer/newtonsoft.json/index.json", HttpStatusCode.OK,
+      (message, bytes) =>
+      {
+        Assert.Equal("{\"versions\":[\"13.0.3\"]}", Encoding.UTF8.GetString(bytes));
+        Assert.Equal("Tue, 10 Jul 2018 04:58:42 GMT", message.Content.Headers.LastModified?.ToString("R"));
+      });
+  }
+
+  private void ResetRegistrationUpstream()
+  {
+    myUpstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.Ok;
+    myUpstreamServer.RegistrationVersion = "13.0.3";
+    myUpstreamServer.RegistrationIfNoneMatch = null;
+    myUpstreamServer.RegistrationRequestCount = 0;
+  }
+
+  private static void AssertRewrittenRegistration(string json, string registrationBase, string version, string upstreamRoot)
+  {
+    Assert.Contains($"\"@id\":\"{PublicNugetUrl}v3/{registrationBase}/newtonsoft.json/index.json\"", json);
+    Assert.Contains($"\"@id\":\"{PublicNugetUrl}v3/{registrationBase}/newtonsoft.json/{version}.json\"", json);
+    Assert.Contains($"\"packageContent\":\"{PublicNugetUrl}v3-flatcontainer/newtonsoft.json/{version}/newtonsoft.json.{version}.nupkg\"", json);
+    Assert.Contains($"\"iconUrl\":\"{PublicNugetUrl.Replace("/", "\\/")}icon\"", json);
+    // Text that merely quotes the upstream is not a link.
+    Assert.Contains($"\"description\":\"Mirrors {upstreamRoot}v3/ verbatim\"", json);
+    Assert.Contains("\"projectUrl\":\"https://www.newtonsoft.com/json\"", json);
+    Assert.DoesNotContain($"\"{upstreamRoot}", json);
+  }
+
+  private static string Gunzip(byte[] bytes)
+  {
+    using var input = new System.IO.Compression.GZipStream(new MemoryStream(bytes), System.IO.Compression.CompressionMode.Decompress);
+    using var reader = new StreamReader(input, Encoding.UTF8);
+    return reader.ReadToEnd();
   }
 
   [Fact]

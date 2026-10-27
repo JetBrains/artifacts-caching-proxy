@@ -45,6 +45,10 @@ public partial class RemoteProxy(
   private readonly Regex? myBlacklistRegex = !string.IsNullOrWhiteSpace(config.BlacklistUrlRegex) ?
     new Regex(config.BlacklistUrlRegex, RegexOptions.Compiled) : null;
 
+  private TimeSpan IdleReadTimeout => config.IdleReadTimeoutSec > 0
+    ? TimeSpan.FromSeconds(config.IdleReadTimeoutSec)
+    : Timeout.InfiniteTimeSpan;
+
   /// <summary>
   /// Validates the request method (only GET/HEAD are allowed), the path (no traversal, only safe
   /// characters) and that the path resolves to a target inside the prefix's configured upstream. On a
@@ -92,8 +96,15 @@ public partial class RemoteProxy(
   /// <para>Callers must fold it into every derived key — the in-memory key, the stored file name and the
   /// S3 object key — via the <c>variant</c> argument of <c>Uri.ManglePath</c>, or a client that asked for
   /// one representation could be served another's cached copy.</para>
+  /// <para>A rewritten endpoint (see <see cref="UpstreamUrlRewrite.FoldIntoVariant"/>) gets one too.</para>
   /// </summary>
   public static string? GetCacheVariant(HttpContext context, CachingRule? rule)
+  {
+    var accept = GetAcceptVariant(context, rule);
+    return RemoteServers.GetRemoteServer(context)?.UrlRewriteFor(rule) is { } rewrite ? rewrite.FoldIntoVariant(accept) : accept;
+  }
+
+  private static string? GetAcceptVariant(HttpContext context, CachingRule? rule)
   {
     if (rule is not { VaryByAccept: true }) return null;
 
@@ -288,10 +299,35 @@ public partial class RemoteProxy(
             $"{upstreamUri} returned Content-Encoding '{contentEncoding}' which is not supported");
       }
 
+      var rewrite = RemoteServers.GetRemoteServer(context)?.UrlRewriteFor(rule);
+      if (rewrite != null && !isHead)
+      {
+        try
+        {
+          await rewrite.ApplyAsync(response, IdleReadTimeout, context.RequestAborted);
+        }
+        catch (Exception e) when (!context.RequestAborted.IsCancellationRequested)
+        {
+          // The head is not written yet, so this is still a transport failure like the ones above.
+          logger.LogWarning(e, "Exception reading {UpstreamUri} to rewrite it: {Message}", upstreamUri, e.Message);
+          var entry = await responseCache.PutStatusCode(cacheKey, HttpStatusCode.ServiceUnavailable, cacheDuration, context.RequestAborted, maxCacheDuration);
+          await SetStatusAsync(context, CachingProxyStatus.NEGATIVE_MISS, entry with { StatusCode = HttpStatusCode.NotFound }, rule);
+          return null;
+        }
+      }
+
       var responseEntry = BodyHead(response);
 
       if (isHead)
       {
+        // The upstream's length and validators describe the body before rewriting.
+        if (rewrite != null)
+        {
+          responseEntry.Headers.ContentLength = null;
+          responseEntry.Headers.ETag = default;
+          responseEntry.Headers.LastModified = default;
+        }
+
         await SetStatusAsync(context, CachingProxyStatus.MISS,
           await responseCache.PutStatusCode(cacheKey, responseEntry, cacheDuration, context.RequestAborted, maxCacheDuration), rule);
         return null;
@@ -383,6 +419,19 @@ public partial class RemoteProxy(
         logger.LogWarning(Event.NotSupportedContentType,
           "Unsupported Content-Encoding '{ContentEncoding}' revalidating {UpstreamUri}; serving stale", contentEncoding, upstreamUri);
         return new RevalidationResult(RevalidationOutcome.UpstreamError);
+      }
+
+      if (RemoteServers.GetRemoteServer(context)?.UrlRewriteFor(rule) is { } rewrite)
+      {
+        try
+        {
+          await rewrite.ApplyAsync(response, IdleReadTimeout, cancellationToken);
+        }
+        catch (Exception e) when (!cancellationToken.IsCancellationRequested)
+        {
+          logger.LogWarning(e, "Exception reading {UpstreamUri} to rewrite it: {Message}; serving stale", upstreamUri, e.Message);
+          return new RevalidationResult(RevalidationOutcome.UpstreamError);
+        }
       }
 
       transferOwnership = true;

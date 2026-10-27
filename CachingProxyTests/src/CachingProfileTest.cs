@@ -202,6 +202,16 @@ public class CachingProfileTest
     Assert.NotNull(vulnerabilities);
     Assert.Equal(TimeSpan.FromHours(1), vulnerabilities!.RefreshAfter);
 
+    // MRI-4855: the documents whose links a client follows are rewritten, under nuget.org's registration
+    // shapes and Space's registration1 alike. The version list and package content are not.
+    Assert.True(registration.RewriteUrls);
+    Assert.True(page.RewriteUrls);
+    Assert.True(vulnerabilities.RewriteUrls);
+    Assert.True(profile.Match("/nuget-build/v3/registration1/jetbrains.build/index.json")!.RewriteUrls);
+    Assert.True(profile.Match("/api.nuget.org/v3/registration5-semver1/newtonsoft.json/index.json")!.RewriteUrls);
+    Assert.False(versions.RewriteUrls);
+    Assert.False(nupkg.RewriteUrls);
+
     // Nothing here redirects: search and autocomplete live on hosts of their own and are handled by
     // cache-redirector, so no query-carrying endpoint reaches this prefix.
     Assert.DoesNotContain(profile.Rules, rule => rule.Redirect);
@@ -516,6 +526,8 @@ public class CachingProfileTest
       new CachingRule { Pattern = @"\.nupkg$" },
       new CachingRule { Pattern = @"\.snupkg$" },
       new CachingRule { Pattern = @"\.nuspec$" },
+      new CachingRule { Pattern = "/v3/registration[^/]*/", RefreshAfter = TimeSpan.FromHours(1), RewriteUrls = true },
+      new CachingRule { Pattern = @"/v3/vulnerabilities/index\.json$", RefreshAfter = TimeSpan.FromHours(1), RewriteUrls = true },
       new CachingRule { Pattern = ".", RefreshAfter = TimeSpan.FromHours(1) },
     ]
   };

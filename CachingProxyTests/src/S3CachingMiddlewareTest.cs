@@ -57,19 +57,20 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
 
   private TestServer CreateServer(bool signedLinks, TimeSpan? signedLinkTTL = null, int inlineThresholdBytes = TestInlineThresholdBytes,
     CacheDuration? distributedCacheDuration = null, TimeSpan? refreshAfter = null, CacheDuration? prefixCacheDuration = null,
-    bool varyByAccept = false, long? multipartThresholdBytes = null, int? multipartPartSizeBytes = null)
+    bool varyByAccept = false, long? multipartThresholdBytes = null, int? multipartPartSizeBytes = null,
+    string? publicUrl = null)
   {
     // When a freshness window is requested, drive it through a profile with a catch-all rule (so every
     // /real path is revalidated after the window) — mirroring how the disk tests exercise revalidation.
     var profiles = new Dictionary<string, CachingProfile>();
     CachingProxyPrefix prefix = new($"/real={upstreamServer.Url}", prefixCacheDuration);
-    if (refreshAfter != null || varyByAccept)
+    if (refreshAfter != null || varyByAccept || publicUrl != null)
     {
       profiles["fresh"] = new CachingProfile
       {
-        Rules = [new CachingRule { Pattern = ".", RefreshAfter = refreshAfter, VaryByAccept = varyByAccept }]
+        Rules = [new CachingRule { Pattern = ".", RefreshAfter = refreshAfter, VaryByAccept = varyByAccept, RewriteUrls = publicUrl != null }]
       };
-      prefix = new CachingProxyPrefix($"/real={upstreamServer.Url}", prefixCacheDuration, Profile: "fresh");
+      prefix = new CachingProxyPrefix($"/real={upstreamServer.Url}", prefixCacheDuration, Profile: "fresh", PublicUrl: publicUrl);
     }
 
     var config = new CachingProxyConfig
@@ -1393,6 +1394,40 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     Assert.False(myS3.Objects.ContainsKey(key)); // removed
   }
 
+  [Fact]
+  public async Task Registration_Is_Stored_Rewritten_Under_Its_Own_Key()
+  {
+    // MRI-4855: the bucket serves a large object itself, so the rewrite has to land in what is stored.
+    const string publicUrl = "https://cache-redirector.example/nuget/";
+    const string path = "/real/v3/registration5-semver1/newtonsoft.json/index.json";
+    upstreamServer.RegistrationVersion = "13.0.3";
+    var server = CreateServer(signedLinks: true, publicUrl: publicUrl, refreshAfter: TimeSpan.FromHours(1));
+
+    using var miss = await server.CreateRequest(path).GetAsync();
+    Assert.Equal(HttpStatusCode.RedirectKeepVerb, miss.StatusCode);
+
+    // Keyed apart from a verbatim copy of the same upstream path.
+    var upstream = myRemoteServer.GetUpstreamUri(path["/real".Length..])!;
+    var key = upstream.ManglePath(new UpstreamUrlRewrite(upstreamServer.Url, new Uri(publicUrl)).FoldIntoVariant(null));
+    Assert.False(myS3.Objects.ContainsKey(GetPathKey(path)));
+    Assert.True(myS3.Objects.TryGetValue(key, out var stored));
+
+    var json = Encoding.UTF8.GetString(stored.Body);
+    Assert.Contains($"\"packageContent\":\"{publicUrl}v3-flatcontainer/", json);
+    Assert.DoesNotContain($"\"{upstreamServer.Url.AbsoluteUri}", json);
+    // The upstream's validators stay recorded for revalidation.
+    Assert.Equal(UpstreamTestServer.RegistrationETag, myS3.UpstreamETags[key]);
+    Assert.NotNull(myS3.UpstreamLastModified[key]);
+    Assert.Equal("1", myS3.Rewritten[key]);
+
+    // Small enough to inline once a fresh instance probes the bucket: served under S3's date, not the upstream's.
+    using var hit = await CreateServer(signedLinks: true, publicUrl: publicUrl, refreshAfter: TimeSpan.FromHours(1))
+      .CreateRequest(path).GetAsync();
+    Assert.Equal(HttpStatusCode.OK, hit.StatusCode);
+    Assert.Equal(json, await hit.Content.ReadAsStringAsync());
+    Assert.NotEqual(UpstreamTestServer.RegistrationLastModified, hit.Content.Headers.LastModified?.ToString("R"));
+  }
+
   private string GetPathKey(string path)
   {
     Assert.StartsWith(myRemoteServer.Prefix, path);
@@ -1445,6 +1480,8 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     // The "upstream-last-modified" user-metadata (the upstream's date for the stored bytes), keyed by
     // object key. Distinct from the response's LastModified below, which is S3's own store time.
     public readonly Dictionary<string, DateTimeOffset?> UpstreamLastModified = new();
+    // The "rewritten" user-metadata, keyed by object key.
+    public readonly Dictionary<string, string?> Rewritten = new();
     // S3 existence probes via the ranged GetObject prefetch.
     public int GetObjectCalls;
     public int PutObjectCalls;
@@ -1532,6 +1569,8 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
         response.Metadata["upstream-etag"] = upstreamETag;
       if (UpstreamLastModified.GetValueOrDefault(request.Key) is { } upstreamLastModified)
         response.Metadata["upstream-last-modified"] = upstreamLastModified.ToString("O");
+      if (Rewritten.GetValueOrDefault(request.Key) is { } rewritten)
+        response.Metadata[CachedResponse.RewrittenMetadataKey] = rewritten;
       return response;
     }
 
@@ -1614,6 +1653,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
       Digests[key] = metadata[CachedResponse.DockerContentDigestMetadataKey];
       UpstreamETags[key] = metadata["upstream-etag"];
       UpstreamLastModified[key] = ParseMetadataDate(metadata["upstream-last-modified"]);
+      Rewritten[key] = metadata[CachedResponse.RewrittenMetadataKey];
       if (metadata["created-at"] is { } createdAt)
         CreatedAt[key] = DateTimeOffset.Parse(createdAt);
     }
@@ -1626,6 +1666,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
       // read back as dropped rather than as its stale value.
       UpstreamETags[request.DestinationKey] = request.Metadata["upstream-etag"];
       UpstreamLastModified[request.DestinationKey] = ParseMetadataDate(request.Metadata["upstream-last-modified"]);
+      Rewritten[request.DestinationKey] = request.Metadata[CachedResponse.RewrittenMetadataKey];
       if (request.Metadata["created-at"] is { } createdAt)
         CreatedAt[request.DestinationKey] = DateTimeOffset.Parse(createdAt);
       return Task.FromResult(new CopyObjectResponse { HttpStatusCode = HttpStatusCode.OK });

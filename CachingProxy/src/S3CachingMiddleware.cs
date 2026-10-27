@@ -665,6 +665,9 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
     if (response.Content.Headers.LastModified is { } upstreamLastModified)
       metadata[CachedResponse.UpstreamLastModifiedMetadataKey] =
         upstreamLastModified.ToString("O", CultureInfo.InvariantCulture);
+
+    if (response.Content is RewrittenContent)
+      metadata[CachedResponse.RewrittenMetadataKey] = "1";
   }
 
   /// <summary>

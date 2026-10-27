@@ -151,8 +151,10 @@ public class CachingProxy
       .PhysicalFile(cachedFile.FullName,
         // Octet-stream only for an upstream that sent no media type at all, matching what MISS emitted.
         metadata.ContentType ?? MediaTypeNames.Application.Octet,
-        lastModified: metadata.LastModified,
-        entityTag: ParseETag(metadata.ETag),
+        // A rewritten body is served under our own validators (see RewrittenContent): null makes the result
+        // fall back to the file's write time, which DownloadToDiskAsync left as our store time.
+        lastModified: metadata.RewrittenETag == null ? metadata.LastModified : null,
+        entityTag: ParseETag(metadata.RewrittenETag ?? metadata.ETag),
         enableRangeProcessing: true)
       .ExecuteAsync(context);
 
@@ -265,7 +267,8 @@ public class CachingProxy
         return null;
       }
 
-      if (contentLastModified.HasValue)
+      // A rewritten body keeps our write time: ServeFileAsync falls back to it as the served Last-Modified.
+      if (contentLastModified.HasValue && response.Content is not RewrittenContent)
         File.SetLastWriteTimeUtc(tempFile, contentLastModified.Value.UtcDateTime);
 
       // A concurrent request for the same artifact downloads to its own temp file and then moves it onto

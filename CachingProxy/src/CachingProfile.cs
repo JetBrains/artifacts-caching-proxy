@@ -77,6 +77,14 @@ public class CachingRule
   /// </summary>
   public bool VaryByAccept { get; init; }
 
+  /// <summary>
+  /// When true a JSON body from this endpoint has its upstream root URLs rewritten to the prefix's
+  /// <see cref="CachingProxyPrefix.PublicUrl"/> before it is stored (see <see cref="UpstreamUrlRewrite"/>).
+  /// Inert on a prefix without one. Marks the endpoints whose documents link to further upstream URLs a
+  /// client follows, such as NuGet registration.
+  /// </summary>
+  public bool RewriteUrls { get; init; }
+
   // Compiled lazily and cached; warmed up by CachingProfile.Compile at startup. RegexOptions.Compiled
   // matches the other request-path regexes in this codebase (see RemoteProxy).
   private Regex? myRegex;

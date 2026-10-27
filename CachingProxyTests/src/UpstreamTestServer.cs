@@ -78,6 +78,18 @@ public class UpstreamTestServer : IAsyncLifetime
   public int NugetVersionListRequestCount;
   public int NugetPackageRequestCount;
 
+  // The NuGet registration routes: documents full of absolute URLs under this server's own root, which is
+  // what the rewrite tests swap. Conditional-aware like the version list; RegistrationVersion changes the
+  // body a 200 serves, RegistrationIfNoneMatch records the validator the last request carried.
+  public const string RegistrationETag = "\"reg-upstream\"";
+  public const string RegistrationLastModified = "Tue, 10 Jul 2018 04:58:42 GMT";
+  public int RegistrationRequestCount;
+  public volatile string RegistrationVersion = "13.0.3";
+  public volatile string? RegistrationIfNoneMatch;
+
+  public string RegistrationJson(string registrationBase) =>
+    $$"""{"@id":"{{Url.AbsoluteUri}}v3/{{registrationBase}}/newtonsoft.json/index.json","items":[{"@id":"{{Url.AbsoluteUri}}v3/{{registrationBase}}/newtonsoft.json/{{RegistrationVersion}}.json","packageContent":"{{Url.AbsoluteUri}}v3-flatcontainer/newtonsoft.json/{{RegistrationVersion}}/newtonsoft.json.{{RegistrationVersion}}.nupkg","iconUrl":"{{Url.AbsoluteUri.Replace("/", "\\/")}}icon","description":"Mirrors {{Url.AbsoluteUri}}v3/ verbatim","projectUrl":"https://www.newtonsoft.com/json"}]}""";
+
   // How long the /slow.txt route stalls before answering, so a test can put RequestTimeoutSec on either
   // side of the upstream's own latency. The stall precedes the response head, which is the only phase
   // that budget covers.
@@ -435,6 +447,10 @@ public class UpstreamTestServer : IAsyncLifetime
         res.Headers.LastModified = "Tue, 10 Jul 2018 04:58:42 GMT"; // as api.nuget.org sends
         return res.WriteAsync("{\"versions\":[\"13.0.3\"]}");
       })
+      .MapGet("v3/registration5-semver1/newtonsoft.json/index.json", (req, res, data) =>
+        RegistrationAsync(req, res, gzip: false))
+      .MapGet("v3/registration5-gz-semver2/newtonsoft.json/index.json", (req, res, data) =>
+        RegistrationAsync(req, res, gzip: true))
       .MapGet("v3-flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg", (req, res, data) =>
       {
         Interlocked.Increment(ref NugetPackageRequestCount);
@@ -524,6 +540,37 @@ public class UpstreamTestServer : IAsyncLifetime
       })
       .MapGet("artifact.pom", (req, res, data) => res.WriteAsync("<project/>"))
     );
+  }
+
+  private Task RegistrationAsync(HttpRequest req, HttpResponse res, bool gzip)
+  {
+    Interlocked.Increment(ref RegistrationRequestCount);
+    RegistrationIfNoneMatch = req.Headers.IfNoneMatch.ToString() is { Length: > 0 } ifNoneMatch ? ifNoneMatch : null;
+    if (req.Headers.ContainsKey("If-Modified-Since") || req.Headers.ContainsKey("If-None-Match"))
+    {
+      switch (Revalidate)
+      {
+        case RevalidateBehavior.NotModified:
+          res.StatusCode = StatusCodes.Status304NotModified;
+          return Task.CompletedTask;
+        case RevalidateBehavior.ServerError:
+          res.StatusCode = StatusCodes.Status500InternalServerError;
+          return res.WriteAsync("boom");
+      }
+    }
+
+    res.ContentType = MediaTypeNames.Application.Json;
+    res.Headers.ETag = RegistrationETag;
+    res.Headers.LastModified = RegistrationLastModified;
+    var json = System.Text.Encoding.UTF8.GetBytes(RegistrationJson(gzip ? "registration5-gz-semver2" : "registration5-semver1"));
+    if (!gzip)
+      return res.Body.WriteAsync(json).AsTask();
+
+    res.Headers.ContentEncoding = "gzip";
+    using var encoded = new MemoryStream();
+    using (var gs = new GZipStream(encoded, CompressionMode.Compress))
+      gs.Write(json);
+    return res.Body.WriteAsync(encoded.ToArray()).AsTask();
   }
 
   public Task InitializeAsync() => myWebApp.StartAsync();

@@ -115,7 +115,8 @@ public class CacheFileProviderTest
       "application/vnd.oci.image.index.v1+json",
       "\"a1b2c3\"",
       new DateTimeOffset(2026, 8, 7, 1, 2, 3, TimeSpan.Zero),
-      "sha256:" + new string('a', 64));
+      "sha256:" + new string('a', 64),
+      "\"rw-0123456789abcdef\"");
 
     var parsed = CacheEntryMetadata.TryParse(original.Format());
 

@@ -39,6 +39,9 @@ public sealed record CachedResponse(HttpStatusCode StatusCode, IHeaderDictionary
   /// </summary>
   public const string UpstreamLastModifiedMetadataKey = "upstream-last-modified";
 
+  /// <summary>S3 user-metadata key marking an object whose body <see cref="UpstreamUrlRewrite"/> changed.</summary>
+  public const string RewrittenMetadataKey = "rewritten";
+
   /// <summary>
   /// The upstream's recorded date for a stored object's bytes, or null when none was recorded - an
   /// upstream that sends none, or an object stored before this was recorded.
@@ -65,6 +68,11 @@ public sealed record CachedResponse(HttpStatusCode StatusCode, IHeaderDictionary
     Headers.ContentType = response.Content.Headers.ContentType?.ToString();
     Headers.ContentEncoding = new StringValues([..response.Content.Headers.ContentEncoding]);
     Headers.ETag = response.Headers.ETag?.ToString();
+    if (response.Content is RewrittenContent rewritten)
+    {
+      Headers.LastModified = default;
+      Headers.ETag = rewritten.ETag;
+    }
     foreach (var name in ourRegistryHeaders)
     {
       if (response.Headers.TryGetValues(name, out var values))
@@ -78,7 +86,10 @@ public sealed record CachedResponse(HttpStatusCode StatusCode, IHeaderDictionary
     // that stored it did; S3's store time only stands in when nothing was recorded. Note the ETag above
     // stays the bucket's: it is not the upstream's to begin with, and a client sent to the bucket by a
     // 307 is answered by S3 matching that one.
-    Headers.LastModified = UpstreamLastModified(response)?.ToString("R") ?? response.LastModified?.ToString("R");
+    // A rewritten object gets S3's store time: the upstream's date describes other bytes (see RewrittenContent).
+    Headers.LastModified = response.Metadata[RewrittenMetadataKey] is { Length: > 0 }
+      ? response.LastModified?.ToString("R")
+      : UpstreamLastModified(response)?.ToString("R") ?? response.LastModified?.ToString("R");
     Headers.ContentLength = response.ContentLength;
     Headers.ContentType = response.Headers.ContentType;
     Headers.ContentEncoding = response.Headers.ContentEncoding;
