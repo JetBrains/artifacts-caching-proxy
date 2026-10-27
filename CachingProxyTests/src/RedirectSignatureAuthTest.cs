@@ -73,8 +73,71 @@ public class RedirectSignatureAuthTest : IAsyncLifetime
       });
     });
 
-    myUpstreamServer = BuildKestrel(router => router.MapGet("{*path}", (_, res, _) =>
-      res.WriteAsync("artifact-body")));
+    myUpstreamServer = BuildKestrel(router => router.MapGet("{*path}", (req, res, _) =>
+    {
+      if (!req.Path.StartsWithSegments("/secure/v3/registration1"))
+        return res.WriteAsync("artifact-body");
+      // A registration document, whose links name the upstream itself.
+      res.ContentType = "application/json";
+      return res.WriteAsync($"{{\"@id\":\"{UrlOf(myUpstreamServer!)}{req.Path.Value![1..]}\"}}");
+    }));
+  }
+
+  // MRI-4855: Sandbox and Production share the proxy, so a signed request names the redirector it came
+  // through (cr_host) and the links rewritten for it lead back there.
+  private const string ConfiguredPublicUrl = "https://cache-redirector.example.test/";
+  private const string RegistrationPath = "/private-nuget/v3/registration1/a/index.json";
+
+  private static string RegistrationOn(string host) =>
+    $"{{\"@id\":\"https://{host}/private-nuget/v3/registration1/a/index.json\"}}";
+
+  [Fact]
+  public async Task Signed_Public_Host_Moves_Rewritten_Links_In_A_Cache_Entry_Of_Its_Own()
+  {
+    using var client = myProxyHost!.GetTestServer().CreateClient();
+
+    // Alternated, so each answer also proves the other host's stored copy did not leak into it.
+    foreach (var _ in new[] { 1, 2 })
+    {
+      Assert.Equal(RegistrationOn("sandbox.example.test"),
+        await client.GetStringAsync(Sign($"{RegistrationPath}?cr_host=sandbox.example.test")));
+      Assert.Equal(RegistrationOn("cache-redirector.example.test"), await client.GetStringAsync(Sign(RegistrationPath)));
+    }
+  }
+
+  [Fact]
+  public async Task Public_Host_Is_Honoured_Only_When_Signed()
+  {
+    using var client = myProxyHost!.GetTestServer().CreateClient();
+
+    // Appended after signing: the signature no longer covers the query.
+    var forged = await client.GetAsync(Sign(RegistrationPath) + "&cr_host=evil.example.test");
+    Assert.Equal(HttpStatusCode.Unauthorized, forged.StatusCode);
+
+    // A JWT client is not a redirector deployment.
+    client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", MintToken());
+    Assert.Equal(RegistrationOn("cache-redirector.example.test"),
+      await client.GetStringAsync($"{RegistrationPath}?cr_host=evil.example.test"));
+  }
+
+  [Fact]
+  public async Task Signed_Public_Host_That_Is_Not_A_Host_Name_Is_Ignored()
+  {
+    using var client = myProxyHost!.GetTestServer().CreateClient();
+
+    Assert.Equal(RegistrationOn("cache-redirector.example.test"),
+      await client.GetStringAsync(Sign($"{RegistrationPath}?cr_host=evil.example.test%2Fpath")));
+  }
+
+  [Fact]
+  public async Task Redirect_Location_Drops_The_Public_Host()
+  {
+    using var client = myProxyHost!.GetTestServer().CreateClient();
+
+    var response = await client.GetAsync(Sign("/private-redirect/-/v1/search?text=express&cr_host=sandbox.example.test"));
+
+    Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
+    Assert.Equal($"{UrlOf(myUpstreamServer)}secure/-/v1/search?text=express", response.Headers.Location?.ToString());
   }
 
   [Fact]
@@ -571,8 +634,14 @@ public class RedirectSignatureAuthTest : IAsyncLifetime
       [
         $"/private={upstreamUrl}secure",
         new CachingProxyPrefix($"/private-redirect={upstreamUrl}secure", Profile: "redirect-all"),
+        new CachingProxyPrefix($"/private-nuget={upstreamUrl}secure", Profile: "rewrite"),
       ],
-      CachingProfiles = { ["redirect-all"] = new() { Rules = [new CachingRule { Pattern = ".", Redirect = true }] } },
+      PublicUrl = ConfiguredPublicUrl,
+      CachingProfiles =
+      {
+        ["redirect-all"] = new() { Rules = [new CachingRule { Pattern = ".", Redirect = true }] },
+        ["rewrite"] = new() { Rules = [new CachingRule { Pattern = "/v3/registration", RewriteUrls = true }] },
+      },
       UpstreamAuth =
       {
         ["test"] = new UpstreamAuth

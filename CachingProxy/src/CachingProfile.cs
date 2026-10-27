@@ -78,9 +78,9 @@ public class CachingRule
   public bool VaryByAccept { get; init; }
 
   /// <summary>
-  /// When true a JSON body from this endpoint has its upstream root URLs rewritten to the prefix's
-  /// <see cref="CachingProxyPrefix.PublicUrl"/> before it is stored (see <see cref="UpstreamUrlRewrite"/>).
-  /// Inert on a prefix without one. Marks the endpoints whose documents link to further upstream URLs a
+  /// When true a JSON body from this endpoint has its upstream root URLs rewritten to the prefix's public root
+  /// (<see cref="CachingProxyConfig.PublicUrl"/> plus the prefix path) before it is stored (see
+  /// <see cref="UpstreamUrlRewrite"/>). Inert without a PublicUrl. Marks the endpoints whose documents link to further upstream URLs a
   /// client follows, such as NuGet registration.
   /// </summary>
   public bool RewriteUrls { get; init; }

@@ -182,6 +182,10 @@ public class CachingProxyConfig
 
   public string? UserAgentComment { get; init; }
 
+  // The redirector URL the prefixes are served under (MRI-4855): a prefix's public root is this plus its
+  // path, which is what a RewriteUrls endpoint's JSON links are rewritten to. Null - no rewriting - by default.
+  public string? PublicUrl { get; init; }
+
   public string? CleanupInterval { get; init; }
   public TimeSpan CleanupPeriod { get; init; } = TimeSpan.FromDays(7);
 

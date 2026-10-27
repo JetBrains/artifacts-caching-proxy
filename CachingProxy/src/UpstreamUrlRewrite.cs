@@ -1,5 +1,6 @@
 using System;
 using System.Buffers;
+using System.Collections.Concurrent;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
@@ -46,6 +47,20 @@ public sealed class UpstreamUrlRewrite
 
   public Uri UpstreamRoot { get; }
   public Uri PublicRoot { get; }
+
+  // One per host a signed request has named (see RedirectSignatureAuthenticationHandler.PublicHostQueryParam),
+  // which is one per redirector deployment.
+  private readonly ConcurrentDictionary<string, UpstreamUrlRewrite> myOnHost = new(StringComparer.Ordinal);
+
+  /// <summary>
+  /// This rewrite with <see cref="PublicRoot"/> moved to <paramref name="host"/>: the same path on the redirector
+  /// deployment the request came through. <see cref="FoldIntoVariant"/> follows, so each host has its own entry.
+  /// </summary>
+  public UpstreamUrlRewrite OnHost(string host) =>
+    string.Equals(host, PublicRoot.Host, StringComparison.OrdinalIgnoreCase)
+      ? this
+      : myOnHost.GetOrAdd(host, static (h, self) =>
+        new UpstreamUrlRewrite(self.UpstreamRoot, new UriBuilder(self.PublicRoot) { Host = h }.Uri), this);
 
   /// <summary>
   /// Folds this rewrite into a cache variant (see <see cref="RemoteProxy.GetCacheVariant"/>). A rewritten

@@ -12,6 +12,10 @@ namespace JetBrains.CachingProxy
     // instead of the eternal 365-day default (see CachedResponse.GetCachingHeader).
     public const string RefreshAfterItemKey = "X-Artifact-Caching-Proxy-RefreshAfter";
 
+    // HttpContext.Items key holding the redirector host a signed request named in cr_host (string), set by
+    // RedirectSignatureAuthenticationHandler once the signature verifies. See RemoteServer.UrlRewriteFor.
+    public const string PublicHostItemKey = "X-Artifact-Caching-Proxy-PublicHost";
+
     // How an OCI client learns it is talking to a distribution v2 registry: sent on our own /v2/ ping and
     // relayed from an upstream registry through the cache (see CachedResponse).
     public const string DockerApiVersionHeader = "Docker-Distribution-API-Version";

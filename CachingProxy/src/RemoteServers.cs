@@ -18,6 +18,7 @@ public partial class RemoteServers : EndpointDataSource
   public RemoteServers(CachingProxyConfig config, ILogger<RemoteServers> logger)
   {
     ValidateUpstreamAuth(config.UpstreamAuth);
+    var publicUrl = ParsePublicUrl(config.PublicUrl);
 
     var endpoints = new Endpoint[config.Prefixes.Length];
     var hasGatedOciPrefix = false;
@@ -50,7 +51,11 @@ public partial class RemoteServers : EndpointDataSource
           $"Authenticated upstream '{remoteUri}' must use HTTPS except on loopback.");
       var profile = ResolveProfile(prefix.Profile, config.CachingProfiles);
       ValidateDefaultNamespace(prefix, profile);
-      var publicUri = ParsePublicUrl(prefix);
+      // A prefix is the redirector alias it serves, so the redirector serves this upstream root at the public
+      // URL plus the prefix path. Only where the profile rewrites anything.
+      var publicUri = publicUrl != null && profile?.Rules.Any(static rule => rule.RewriteUrls) == true
+        ? new Uri(publicUrl.AbsoluteUri + trimmedPrefix.TrimStart('/') + '/', UriKind.Absolute)
+        : null;
       var remoteServer = new RemoteServer(trimmedPrefix, remoteUri,
         config.CacheDuration.Union(prefix.CacheDuration), matchedAuth, profile)
       {
@@ -63,11 +68,6 @@ public partial class RemoteServers : EndpointDataSource
 
       logger.LogInformation("RemoteServer: {Prefix} -> {RemoteUri}, Auth: {Auth}, Profile: {Profile}, PublicUrl: {PublicUrl}",
         remoteServer.Prefix, remoteServer.RemoteUri, remoteServer.Auth, prefix.Profile, publicUri);
-      // A warning, not a startup failure: the env file comes from another repo, and a crash-looping proxy
-      // costs more than an inert setting.
-      if (publicUri != null && profile?.Rules.Any(static rule => rule.RewriteUrls) != true)
-        logger.LogWarning("Prefix {Prefix} sets PublicUrl, but its profile has no RewriteUrls rule, so nothing is rewritten",
-          remoteServer.Prefix);
       // A matched entry with no credential is what a half-configured secret looks like: the prefix is gated
       // inbound, so it looks configured, while the upstream is reached anonymously - and an OCI upstream
       // mints its registry token anonymously too, which a private repository answers with a bare 403.
@@ -140,14 +140,14 @@ public partial class RemoteServers : EndpointDataSource
         $"Prefix '{prefix}' has a DefaultNamespace that is not a single OCI path component.");
   }
 
-  // Normalized to end in '/', like the upstream root it replaces, so the swap keeps every path below it.
-  private static Uri? ParsePublicUrl(CachingProxyPrefix prefix)
+  // Normalized to end in '/', so a prefix path appends to it.
+  private static Uri? ParsePublicUrl(string? publicUrl)
   {
-    if (string.IsNullOrWhiteSpace(prefix.PublicUrl)) return null;
-    if (!Uri.TryCreate(prefix.PublicUrl.TrimEnd('/') + '/', UriKind.Absolute, out var uri) ||
+    if (string.IsNullOrWhiteSpace(publicUrl)) return null;
+    if (!Uri.TryCreate(publicUrl.TrimEnd('/') + '/', UriKind.Absolute, out var uri) ||
         uri.Scheme != Uri.UriSchemeHttps && uri.Scheme != Uri.UriSchemeHttp ||
         uri.Query.Length > 0 || uri.Fragment.Length > 0)
-      throw new ArgumentException($"Prefix '{prefix}' has a PublicUrl that is not an absolute http(s) URL without query or fragment.");
+      throw new ArgumentException($"PublicUrl '{publicUrl}' is not an absolute http(s) URL without query or fragment.");
     return uri;
   }
 
@@ -227,8 +227,14 @@ public partial class RemoteServers : EndpointDataSource
     /// <summary>The rewrite of this prefix's upstream root to its public URL, or null for a prefix without one.</summary>
     public UpstreamUrlRewrite? UrlRewrite { get; init; }
 
-    /// <summary>The rewrite to apply to a body under <paramref name="rule"/>, or null for none.</summary>
-    public UpstreamUrlRewrite? UrlRewriteFor(CachingRule? rule) => rule is { RewriteUrls: true } ? UrlRewrite : null;
+    /// <summary>
+    /// The rewrite to apply to a body under <paramref name="rule"/>, or null for none. On the host of the
+    /// redirector deployment a signed request came through, if it named one (MRI-4855).
+    /// </summary>
+    public UpstreamUrlRewrite? UrlRewriteFor(CachingRule? rule, HttpContext context) =>
+      rule is not { RewriteUrls: true } || UrlRewrite is not { } rewrite ? null
+      : context.Items[CachingProxyConstants.PublicHostItemKey] is string host ? rewrite.OnHost(host)
+      : rewrite;
 
     /// <summary>
     /// The upstream URI for a request's <c>{**path}</c> remainder, or <c>null</c> when that remainder names

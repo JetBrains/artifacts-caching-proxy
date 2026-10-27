@@ -70,7 +70,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
       {
         Rules = [new CachingRule { Pattern = ".", RefreshAfter = refreshAfter, VaryByAccept = varyByAccept, RewriteUrls = publicUrl != null }]
       };
-      prefix = new CachingProxyPrefix($"/real={upstreamServer.Url}", prefixCacheDuration, Profile: "fresh", PublicUrl: publicUrl);
+      prefix = new CachingProxyPrefix($"/real={upstreamServer.Url}", prefixCacheDuration, Profile: "fresh");
     }
 
     var config = new CachingProxyConfig
@@ -87,6 +87,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
       DistributedCacheDuration = distributedCacheDuration ?? new CacheDuration(),
       CachingProfiles = profiles,
       Prefixes = [prefix],
+      PublicUrl = publicUrl,
     };
 
     var host = new HostBuilder()
@@ -1398,7 +1399,8 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   public async Task Registration_Is_Stored_Rewritten_Under_Its_Own_Key()
   {
     // MRI-4855: the bucket serves a large object itself, so the rewrite has to land in what is stored.
-    const string publicUrl = "https://cache-redirector.example/nuget/";
+    const string publicUrl = "https://cache-redirector.example/";
+    const string publicRoot = publicUrl + "real/";
     const string path = "/real/v3/registration5-semver1/newtonsoft.json/index.json";
     upstreamServer.RegistrationVersion = "13.0.3";
     var server = CreateServer(signedLinks: true, publicUrl: publicUrl, refreshAfter: TimeSpan.FromHours(1));
@@ -1408,12 +1410,12 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
 
     // Keyed apart from a verbatim copy of the same upstream path.
     var upstream = myRemoteServer.GetUpstreamUri(path["/real".Length..])!;
-    var key = upstream.ManglePath(new UpstreamUrlRewrite(upstreamServer.Url, new Uri(publicUrl)).FoldIntoVariant(null));
+    var key = upstream.ManglePath(new UpstreamUrlRewrite(upstreamServer.Url, new Uri(publicRoot)).FoldIntoVariant(null));
     Assert.False(myS3.Objects.ContainsKey(GetPathKey(path)));
     Assert.True(myS3.Objects.TryGetValue(key, out var stored));
 
     var json = Encoding.UTF8.GetString(stored.Body);
-    Assert.Contains($"\"packageContent\":\"{publicUrl}v3-flatcontainer/", json);
+    Assert.Contains($"\"packageContent\":\"{publicRoot}v3-flatcontainer/", json);
     Assert.DoesNotContain($"\"{upstreamServer.Url.AbsoluteUri}", json);
     // The upstream's validators stay recorded for revalidation.
     Assert.Equal(UpstreamTestServer.RegistrationETag, myS3.UpstreamETags[key]);

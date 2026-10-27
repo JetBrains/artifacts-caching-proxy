@@ -52,6 +52,14 @@ public sealed class RedirectSignatureAuthenticationHandler(
   public const string ExpiryQueryParam = "cr_exp";
   public const string SignatureQueryParam = "cr_sig";
 
+  /// <summary>
+  /// MRI-4855: the host of the redirector deployment that signed the request, when it is not the one
+  /// <see cref="CachingProxyConfig.PublicUrl"/> names. Sandbox and Production share this proxy, so this is how a link it
+  /// rewrites leads back to Sandbox. Unlike the other two it is covered by the signature, and it is honoured
+  /// only on a request whose signature verified.
+  /// </summary>
+  public const string PublicHostQueryParam = "cr_host";
+
   protected override Task<AuthenticateResult> HandleAuthenticateAsync()
   {
     var result = Verify();
@@ -111,6 +119,17 @@ public sealed class RedirectSignatureAuthenticationHandler(
       // Counted, not logged: a retiring-key match is a successful request on every artifact fetch.
       metrics.IncrementRedirectSignatureVerification(i == 0 ? "active" : "retiring", keys[i].Fingerprint);
 
+      // Only a DNS name: it becomes the authority of the links we store. A signed bad value is a redirector
+      // bug, so the request is still served, with the configured host.
+      var publicHost = Request.Query[PublicHostQueryParam].ToString();
+      if (publicHost.Length > 0)
+      {
+        if (Uri.CheckHostName(publicHost) == UriHostNameType.Dns)
+          Context.Items[CachingProxyConstants.PublicHostItemKey] = publicHost.ToLowerInvariant();
+        else
+          Logger.LogWarning("Ignoring signed {Param} that is not a host name: {Value}", PublicHostQueryParam, publicHost);
+      }
+
       // Establish an authenticated (but claim-less) principal: it satisfies the prefix's [Authorize] and,
       // just like a JWT-authenticated request, marks the response Cache-Control: private so the private
       // artifact is not stored by shared caches.
@@ -138,7 +157,7 @@ public sealed class RedirectSignatureAuthenticationHandler(
       return rawTarget;
 
     var path = rawTarget[..queryStart];
-    var kept = KeepNonSignatureParams(rawTarget[(queryStart + 1)..]);
+    var kept = KeepNonSignatureParams(rawTarget[(queryStart + 1)..], dropPublicHost: false);
     return kept.Length > 0 ? $"{path}?{kept}" : path;
   }
 
@@ -147,7 +166,8 @@ public sealed class RedirectSignatureAuthenticationHandler(
   /// <c>cr_exp</c>/<c>cr_sig</c> pair removed. Those two are a credential for <i>this</i> proxy, minted
   /// for one path and one expiry, so anything that forwards a query somewhere else - a Redirect rule's
   /// <c>Location</c>, see <see cref="RemoteProxy"/> - has to drop them first: sent on they would both
-  /// disclose our signature to the origin and leave it replayable here until it expires.
+  /// disclose our signature to the origin and leave it replayable here until it expires. <c>cr_host</c> goes
+  /// too: it is ours, and means nothing to an origin.
   /// </summary>
   public static string QueryWithoutSignatureParams(HttpRequest request)
   {
@@ -155,20 +175,20 @@ public sealed class RedirectSignatureAuthenticationHandler(
     if (string.IsNullOrEmpty(query))
       return "";
 
-    var kept = KeepNonSignatureParams(query.TrimStart('?'));
+    var kept = KeepNonSignatureParams(query.TrimStart('?'), dropPublicHost: true);
     return kept.Length > 0 ? $"?{kept}" : "";
   }
 
-  // The query segments, verbatim and in order, minus the two cr_* parameters. Takes and returns a query
-  // without its leading '?'.
-  private static string KeepNonSignatureParams(string query)
+  // The query segments, verbatim and in order, minus the two cr_* parameters, and minus cr_host when
+  // dropPublicHost (it is signed, so the payload keeps it). Takes and returns a query without its leading '?'.
+  private static string KeepNonSignatureParams(string query, bool dropPublicHost)
   {
     var kept = new StringBuilder();
     foreach (var segment in query.Split('&'))
     {
       var eq = segment.IndexOf('=');
       var name = eq < 0 ? segment : segment[..eq];
-      if (name is ExpiryQueryParam or SignatureQueryParam)
+      if (name is ExpiryQueryParam or SignatureQueryParam || (dropPublicHost && name == PublicHostQueryParam))
         continue;
       if (kept.Length > 0)
         kept.Append('&');

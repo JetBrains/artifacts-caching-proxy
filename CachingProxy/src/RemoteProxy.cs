@@ -101,7 +101,7 @@ public partial class RemoteProxy(
   public static string? GetCacheVariant(HttpContext context, CachingRule? rule)
   {
     var accept = GetAcceptVariant(context, rule);
-    return RemoteServers.GetRemoteServer(context)?.UrlRewriteFor(rule) is { } rewrite ? rewrite.FoldIntoVariant(accept) : accept;
+    return RemoteServers.GetRemoteServer(context)?.UrlRewriteFor(rule, context) is { } rewrite ? rewrite.FoldIntoVariant(accept) : accept;
   }
 
   private static string? GetAcceptVariant(HttpContext context, CachingRule? rule)
@@ -299,7 +299,7 @@ public partial class RemoteProxy(
             $"{upstreamUri} returned Content-Encoding '{contentEncoding}' which is not supported");
       }
 
-      var rewrite = RemoteServers.GetRemoteServer(context)?.UrlRewriteFor(rule);
+      var rewrite = RemoteServers.GetRemoteServer(context)?.UrlRewriteFor(rule, context);
       if (rewrite != null && !isHead)
       {
         try
@@ -421,7 +421,7 @@ public partial class RemoteProxy(
         return new RevalidationResult(RevalidationOutcome.UpstreamError);
       }
 
-      if (RemoteServers.GetRemoteServer(context)?.UrlRewriteFor(rule) is { } rewrite)
+      if (RemoteServers.GetRemoteServer(context)?.UrlRewriteFor(rule, context) is { } rewrite)
       {
         try
         {

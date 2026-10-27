@@ -40,7 +40,8 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
   // Extra hosts spun up by individual tests (e.g. with a custom freshness profile), stopped on dispose.
   private readonly List<IHost> myExtraHosts = [];
 
-  private const string PublicNugetUrl = "https://cache-redirector.example/nuget/";
+  private const string PublicUrl = "https://cache-redirector.example/";
+  private const string PublicNugetUrl = PublicUrl + "real-nuget-rewrite/";
 
   public CachingProxyTest(ITestOutputHelper output, UpstreamTestServer upstreamServer)
   {
@@ -147,7 +148,7 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
         new CachingProxyPrefix($"/real-redirect={upstreamServer.Url}", Profile: "redirect-all"),
         new CachingProxyPrefix($"/real-npm={upstreamServer.Url}", Profile: "npm"),
         new CachingProxyPrefix($"/real-nuget={upstreamServer.Url}", Profile: "nuget"),
-        new CachingProxyPrefix($"/real-nuget-rewrite={upstreamServer.Url}", Profile: "nuget", PublicUrl: PublicNugetUrl),
+        new CachingProxyPrefix($"/real-nuget-rewrite={upstreamServer.Url}", Profile: "nuget"),
         new CachingProxyPrefix($"/real-pypi={upstreamServer.Url}", Profile: "pypi"),
         // An OCI prefix carries the "/v2" on both sides, exactly as config-gen emits it: the client
         // inserts "/v2/" after the host itself, so the alias is "/v2/<name>" and the origin ends in /v2.
@@ -160,6 +161,7 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
       ],
       MinimumFreeDiskSpaceMb = 2,
       UserAgentComment = "(+mailto:cache-redirector@jetbrains.com)",
+      PublicUrl = PublicUrl,
       CleanupInterval = "* 0 * * *",
       CleanupPeriod =  TimeSpan.FromDays(1)
     };
@@ -1032,16 +1034,14 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
   }
 
   [Fact]
-  public async Task Nuget_Registration_Is_Served_Verbatim_Without_A_Public_Url()
+  public async Task Nuget_Registration_Links_Lead_To_The_Prefix_They_Were_Fetched_Through()
   {
+    // One PublicUrl for the whole proxy: each prefix's links go to it plus that prefix's own path.
     ResetRegistrationUpstream();
     await AssertGetResponse("/real-nuget/v3/registration5-semver1/newtonsoft.json/index.json", HttpStatusCode.OK,
-      (message, bytes) =>
-      {
-        AssertStatusHeader(message, CachingProxyStatus.MISS);
-        Assert.Equal(myUpstreamServer.RegistrationJson("registration5-semver1"), Encoding.UTF8.GetString(bytes));
-        Assert.Equal(UpstreamTestServer.RegistrationETag, message.Headers.ETag?.ToString());
-      });
+      (message, bytes) => Assert.Contains(
+        $"\"@id\":\"{PublicUrl}real-nuget/v3/registration5-semver1/newtonsoft.json/index.json\"",
+        Encoding.UTF8.GetString(bytes)));
   }
 
   [Fact]
