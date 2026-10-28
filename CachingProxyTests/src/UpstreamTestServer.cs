@@ -120,6 +120,14 @@ public class UpstreamTestServer : IAsyncLifetime
 
   public const string SimpleJsonMediaType = "application/vnd.pypi.simple.v1+json";
 
+  // A simple index under pypi-index/ that links its files absolutely, as pypi.org (on another host) and Space
+  // (on its own /download/, fragment percent-encoded) do.
+  public string RewriteSimpleHtml =>
+    $"""<a href="{Url.AbsoluteUri}pypi-files/packages/aa/rewritepkg-1.0-py3-none-any.whl#sha256=abc">w</a><a href="{Url.AbsoluteUri}pypi-index/download/rewritepkg-1.0.tar.gz#sha256%3Ddef">s</a><a href="https://elsewhere.example/x.whl">x</a>""";
+
+  public string RewriteSimpleJson =>
+    $$$"""{"files":[{"url":"{{{Url.AbsoluteUri}}}pypi-files/packages/aa/rewritepkg-1.0-py3-none-any.whl","hashes":{"sha256":"abc"}}]}""";
+
   // Set to make every OCI route answer 401 + a Bearer challenge unless the request carries
   // "Authorization: Bearer <TokenToIssue>", so a test can drive the full challenge/token/retry dance.
   // The realm points back at this server's own /oauth/token route.
@@ -301,6 +309,12 @@ public class UpstreamTestServer : IAsyncLifetime
         return res.WriteAsync(wantsJson
           ? "{\"name\":\"testpkg\",\"files\":[]}"
           : "<!DOCTYPE html><html><body></body></html>");
+      })
+      .MapGet("pypi-index/simple/rewritepkg/", (req, res, data) =>
+      {
+        var wantsJson = req.Headers.Accept.ToString().Contains(SimpleJsonMediaType, StringComparison.OrdinalIgnoreCase);
+        res.ContentType = wantsJson ? SimpleJsonMediaType : MediaTypeNames.Text.Html;
+        return res.WriteAsync(wantsJson ? RewriteSimpleJson : RewriteSimpleHtml);
       })
       .MapGet("conditional-500.txt", (req, res, data) =>
       {

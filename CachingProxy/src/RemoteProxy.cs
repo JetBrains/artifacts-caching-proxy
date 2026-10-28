@@ -49,6 +49,13 @@ public partial class RemoteProxy(
     ? TimeSpan.FromSeconds(config.IdleReadTimeoutSec)
     : Timeout.InfiniteTimeSpan;
 
+  // Stored unrewritten, so its clients go to the upstream directly. No index is near the cap today (MRI-5318:
+  // the largest pypi.org one is ~3 MB), so this means the cap needs raising.
+  private void LogRewriteTooLarge(Uri upstreamUri) =>
+    logger.LogWarning(Event.RewriteTooLarge,
+      "{UpstreamUri} is over the {MaxBodyBytes}-byte rewrite cap; stored with its upstream links", upstreamUri,
+      UpstreamUrlRewrite.MaxBodyBytes);
+
   /// <summary>
   /// Validates the request method (only GET/HEAD are allowed), the path (no traversal, only safe
   /// characters) and that the path resolves to a target inside the prefix's configured upstream. On a
@@ -304,7 +311,8 @@ public partial class RemoteProxy(
       {
         try
         {
-          await rewrite.ApplyAsync(response, IdleReadTimeout, context.RequestAborted);
+          if (!await rewrite.ApplyAsync(response, IdleReadTimeout, context.RequestAborted))
+            LogRewriteTooLarge(upstreamUri);
         }
         catch (Exception e) when (!context.RequestAborted.IsCancellationRequested)
         {
@@ -425,7 +433,8 @@ public partial class RemoteProxy(
       {
         try
         {
-          await rewrite.ApplyAsync(response, IdleReadTimeout, cancellationToken);
+          if (!await rewrite.ApplyAsync(response, IdleReadTimeout, cancellationToken))
+            LogRewriteTooLarge(upstreamUri);
         }
         catch (Exception e) when (!cancellationToken.IsCancellationRequested)
         {

@@ -123,7 +123,7 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
         {
           Rules =
           [
-            new CachingRule { Pattern = "/simple(/|$)", RefreshAfter = TimeSpan.FromMinutes(10), VaryByAccept = true },
+            new CachingRule { Pattern = "/simple(/|$)", RefreshAfter = TimeSpan.FromMinutes(10), VaryByAccept = true, RewriteUrls = true },
             new CachingRule { Pattern = "/packages/" },
             new CachingRule { Pattern = @"\.(?:whl|egg|tgz|zip|exe|msi)$" },
             new CachingRule { Pattern = @"\.tar\.(?:gz|bz2|xz|Z)$" },
@@ -150,6 +150,9 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
         new CachingProxyPrefix($"/real-nuget={upstreamServer.Url}", Profile: "nuget"),
         new CachingProxyPrefix($"/real-nuget-rewrite={upstreamServer.Url}", Profile: "nuget"),
         new CachingProxyPrefix($"/real-pypi={upstreamServer.Url}", Profile: "pypi"),
+        // pypi.org and files.pythonhosted.org in miniature: an index prefix whose files sit under another one.
+        new CachingProxyPrefix($"/real-pypi-index={upstreamServer.Url}pypi-index", Profile: "pypi"),
+        new CachingProxyPrefix($"/real-pypi-files={upstreamServer.Url}pypi-files", Profile: "pypi"),
         // An OCI prefix carries the "/v2" on both sides, exactly as config-gen emits it: the client
         // inserts "/v2/" after the host itself, so the alias is "/v2/<name>" and the origin ends in /v2.
         new CachingProxyPrefix($"/v2/real-docker={upstreamServer.Url}v2", Profile: "docker"),
@@ -1465,6 +1468,37 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
     Assert.Equal(
       [UpstreamTestServer.SimpleJsonMediaType, MediaTypeNames.Text.Html],
       myUpstreamServer.SimpleAcceptHeaders.ToArray());
+  }
+
+  [Fact]
+  public async Task Pypi_Simple_Index_Links_Are_Rewritten_To_The_Public_Url()
+  {
+    // MRI-5318: a native pip or uv follows the file links the index names, so they have to name the redirector -
+    // the files prefix for another host's files, this prefix for its own - with the #sha256= fragment as sent.
+    const string path = "/real-pypi-index/simple/rewritepkg/";
+
+    foreach (var status in new[] { CachingProxyStatus.MISS, CachingProxyStatus.HIT })
+    {
+      await AssertGetResponse(path, HttpStatusCode.OK,
+        (message, bytes) =>
+        {
+          AssertStatusHeader(message, status);
+          Assert.Equal(
+            $"""<a href="{PublicUrl}real-pypi-files/packages/aa/rewritepkg-1.0-py3-none-any.whl#sha256=abc">w</a><a href="{PublicUrl}real-pypi-index/download/rewritepkg-1.0.tar.gz#sha256%3Ddef">s</a><a href="https://elsewhere.example/x.whl">x</a>""",
+            Encoding.UTF8.GetString(bytes));
+        },
+        MediaTypeNames.Text.Html);
+
+      await AssertGetResponse(path, HttpStatusCode.OK,
+        (message, bytes) =>
+        {
+          AssertStatusHeader(message, status);
+          Assert.Equal(
+            $$$"""{"files":[{"url":"{{{PublicUrl}}}real-pypi-files/packages/aa/rewritepkg-1.0-py3-none-any.whl","hashes":{"sha256":"abc"}}]}""",
+            Encoding.UTF8.GetString(bytes));
+        },
+        UpstreamTestServer.SimpleJsonMediaType);
+    }
   }
 
   [Fact]
