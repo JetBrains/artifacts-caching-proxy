@@ -251,6 +251,42 @@ public class RemoteServersTest
     Assert.Throws<ArgumentException>(() => BuildHub(defaultNamespace));
 
   [Fact]
+  public void A_Rewrite_Maps_The_Roots_Of_Other_Prefixes_With_Its_Profile()
+  {
+    // MRI-5318: a pypi.org simple index links its files on files.pythonhosted.org. Mapped: a public prefix of the
+    // same profile, by the alias named after its root. Not mapped: a gated one, which an anonymous client of
+    // pypi.org could not follow, nor one of another profile.
+    var profiles = new Dictionary<string, CachingProfile>
+    {
+      ["pypi"] = new() { Rules = [new CachingRule { Pattern = "/simple(/|$)", RewriteUrls = true }] },
+      ["other"] = new() { Rules = [new CachingRule { Pattern = "." }] },
+    };
+    var servers = Build(new CachingProxyConfig
+    {
+      PublicUrl = "https://cr.example",
+      CachingProfiles = profiles,
+      Prefixes =
+      [
+        new CachingProxyPrefix("/pypi.org/simple", Profile: "pypi", IsPrivate: false),
+        new CachingProxyPrefix("/fph=files.pythonhosted.org/packages", Profile: "pypi", IsPrivate: false),
+        new CachingProxyPrefix("/files.pythonhosted.org/packages", Profile: "pypi", IsPrivate: false),
+        new CachingProxyPrefix("/pypi/p=packages.jetbrains.team/pypi/p", Profile: "pypi", IsPrivate: true),
+        new CachingProxyPrefix("/elsewhere.example", Profile: "other", IsPrivate: false),
+      ],
+    }).ToDictionary(s => s.Prefix.Value!);
+
+    var pypi = servers["/pypi.org/simple"].UrlRewrite!;
+    Assert.Equal("https://cr.example/pypi.org/simple/", pypi.PublicRoot.AbsoluteUri);
+    var other = Assert.Single(pypi.OtherRoots);
+    Assert.Equal("https://files.pythonhosted.org/packages/", other.Upstream.AbsoluteUri);
+    Assert.Equal("https://cr.example/files.pythonhosted.org/packages/", other.Public.AbsoluteUri);
+
+    // A gated prefix may map public ones.
+    Assert.Contains(servers["/pypi/p"].UrlRewrite!.OtherRoots, root => root.Upstream.AbsoluteUri == "https://pypi.org/simple/");
+    Assert.Null(servers["/elsewhere.example"].UrlRewrite);
+  }
+
+  [Fact]
   public void An_Upstream_Auth_Entry_Without_UrlPrefixes_Is_Rejected_At_Startup()
   {
     // Such an entry matches no upstream, so the prefixes it was meant to gate would serve their cached

@@ -20,31 +20,16 @@ public partial class RemoteServers : EndpointDataSource
     ValidateUpstreamAuth(config.UpstreamAuth);
     var publicUrl = ParsePublicUrl(config.PublicUrl);
 
+    // Parsed up front, so a prefix's rewrite can map the other prefixes' roots too.
+    var parsed = config.Prefixes.Select(prefix => ParsePrefix(prefix, config.UpstreamAuth)).ToArray();
+
     var endpoints = new Endpoint[config.Prefixes.Length];
     var hasGatedOciPrefix = false;
     logger.LogInformation("Creating {Count} endpoints", config.Prefixes.Length);
     for (var i = 0; i < config.Prefixes.Length; i++)
     {
       var prefix = config.Prefixes[i];
-      var trimmed = prefix.Prefix.Trim('/');
-      if (trimmed.Length == 0) throw new ArgumentException("Prefix is empty: " + prefix);
-
-      var index = trimmed.IndexOf('=');
-      var trimmedPrefix = index < 0 ? $"/{trimmed}" : $"/{trimmed[..index]}";
-
-      var target = index < 0 ? trimmed : trimmed[(index + 1)..];
-      target = target.TrimEnd('/') + '/';
-      var remoteUri = Uri.TryCreate(target, UriKind.Absolute, out var targetUri) ? targetUri :
-        new Uri(Uri.UriSchemeHttps + Uri.SchemeDelimiter + target, UriKind.Absolute);
-      // A query or a fragment leaves the base with no trailing-slash path to resolve a request against
-      // ("host/p?x=1" parses as path "/p" plus query), so every request to such a prefix would resolve
-      // outside it and be rejected. Fail at startup rather than on every request.
-      if (remoteUri.Query.Length > 0 || remoteUri.Fragment.Length > 0)
-        throw new ArgumentException($"Prefix target must have no query or fragment: {prefix}");
-      // The credential is a property of the upstream, not of the inbound gate: a repository that is
-      // individually public can still sit inside a private origin we may only fetch with our service
-      // account. So match regardless of IsPrivate - that flag only decides gating below.
-      var matched = MatchAuth(remoteUri, config.UpstreamAuth);
+      var (trimmedPrefix, remoteUri, matched, isGated) = parsed[i];
       var matchedAuth = matched?.Value;
       if (matchedAuth != null && !remoteUri.IsSecureOrLoopback())
         throw new ArgumentException(
@@ -54,7 +39,7 @@ public partial class RemoteServers : EndpointDataSource
       // A prefix is the redirector alias it serves, so the redirector serves this upstream root at the public
       // URL plus the prefix path. Only where the profile rewrites anything.
       var publicUri = publicUrl != null && profile?.Rules.Any(static rule => rule.RewriteUrls) == true
-        ? new Uri(publicUrl.AbsoluteUri + trimmedPrefix.TrimStart('/') + '/', UriKind.Absolute)
+        ? PublicRootOf(publicUrl, trimmedPrefix)
         : null;
       var remoteServer = new RemoteServer(trimmedPrefix, remoteUri,
         config.CacheDuration.Union(prefix.CacheDuration), matchedAuth, profile)
@@ -63,7 +48,8 @@ public partial class RemoteServers : EndpointDataSource
         // label - which Prometheus reads as no label at all, forking a series off the "none" bucket.
         ProfileName = profile == null ? null : prefix.Profile,
         DefaultNamespace = prefix.DefaultNamespace,
-        UrlRewrite = publicUri == null ? null : new UpstreamUrlRewrite(remoteUri, publicUri),
+        UrlRewrite = publicUri == null ? null
+          : new UpstreamUrlRewrite(remoteUri, publicUri, OtherRoots(config.Prefixes, parsed, i, publicUrl!)),
       };
 
       logger.LogInformation("RemoteServer: {Prefix} -> {RemoteUri}, Auth: {Auth}, Profile: {Profile}, PublicUrl: {PublicUrl}",
@@ -81,7 +67,6 @@ public partial class RemoteServers : EndpointDataSource
       // public registry - what an upstream grants for it is not visible from here, and the expensive
       // mistake is serving private artifacts to anyone. A prefix with no matched auth is fetched
       // anonymously and stays un-gated.
-      var isGated = prefix.IsPrivate ?? remoteServer.Auth != null;
       var metadata = isGated ?
         new EndpointMetadataCollection(remoteServer, new AuthorizeAttribute()) :
         new EndpointMetadataCollection(remoteServer);
@@ -139,6 +124,53 @@ public partial class RemoteServers : EndpointDataSource
       throw new ArgumentException(
         $"Prefix '{prefix}' has a DefaultNamespace that is not a single OCI path component.");
   }
+
+  private readonly record struct ParsedPrefix(
+    string Path, Uri RemoteUri, KeyValuePair<string, UpstreamAuth>? MatchedAuth, bool IsGated);
+
+  private static ParsedPrefix ParsePrefix(CachingProxyPrefix prefix, IReadOnlyDictionary<string, UpstreamAuth> auths)
+  {
+    var trimmed = prefix.Prefix.Trim('/');
+    if (trimmed.Length == 0) throw new ArgumentException("Prefix is empty: " + prefix);
+
+    var index = trimmed.IndexOf('=');
+    var trimmedPrefix = index < 0 ? $"/{trimmed}" : $"/{trimmed[..index]}";
+
+    var target = index < 0 ? trimmed : trimmed[(index + 1)..];
+    target = target.TrimEnd('/') + '/';
+    var remoteUri = Uri.TryCreate(target, UriKind.Absolute, out var targetUri) ? targetUri :
+      new Uri(Uri.UriSchemeHttps + Uri.SchemeDelimiter + target, UriKind.Absolute);
+    // A query or a fragment leaves the base with no trailing-slash path to resolve a request against
+    // ("host/p?x=1" parses as path "/p" plus query), so every request to such a prefix would resolve
+    // outside it and be rejected. Fail at startup rather than on every request.
+    if (remoteUri.Query.Length > 0 || remoteUri.Fragment.Length > 0)
+      throw new ArgumentException($"Prefix target must have no query or fragment: {prefix}");
+    // The credential is a property of the upstream, not of the inbound gate: a repository that is
+    // individually public can still sit inside a private origin we may only fetch with our service
+    // account. So match regardless of IsPrivate - that flag only decides gating.
+    var matched = MatchAuth(remoteUri, auths);
+    return new ParsedPrefix(trimmedPrefix, remoteUri, matched, prefix.IsPrivate ?? matched?.Value != null);
+  }
+
+  private static Uri PublicRootOf(Uri publicUrl, string prefixPath) =>
+    new(publicUrl.AbsoluteUri + prefixPath.TrimStart('/') + '/', UriKind.Absolute);
+
+  /// <summary>
+  /// The roots of the other prefixes a document under prefix <paramref name="self"/> may link to (MRI-5318): those
+  /// with the same profile, as one ecosystem's documents link to its own hosts - a pypi.org simple index to
+  /// files.pythonhosted.org. Never a gated one from an ungated prefix, whose anonymous client the gate would
+  /// turn away. Of several prefixes on one root, the one named after it, else the first.
+  /// </summary>
+  private static IEnumerable<(Uri Upstream, Uri Public)> OtherRoots(
+    CachingProxyPrefix[] prefixes, ParsedPrefix[] parsed, int self, Uri publicUrl) =>
+    Enumerable.Range(0, prefixes.Length)
+      .Where(j => j != self && prefixes[j].Profile == prefixes[self].Profile && (!parsed[j].IsGated || parsed[self].IsGated))
+      .GroupBy(j => parsed[j].RemoteUri.AbsoluteUri, StringComparer.Ordinal)
+      .Select(group =>
+      {
+        var chosen = group.FirstOrDefault(j => parsed[j].Path.TrimStart('/') + '/' == parsed[j].RemoteUri.GetHostPortPath(), group.First());
+        return (parsed[chosen].RemoteUri, PublicRootOf(publicUrl, parsed[chosen].Path));
+      });
 
   // Normalized to end in '/', so a prefix path appends to it.
   private static Uri? ParsePublicUrl(string? publicUrl)

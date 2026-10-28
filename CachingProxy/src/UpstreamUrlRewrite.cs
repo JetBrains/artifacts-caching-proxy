@@ -1,6 +1,7 @@
 using System;
 using System.Buffers;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
@@ -16,60 +17,85 @@ namespace JetBrains.CachingProxy;
 /// MRI-4855: swaps a prefix's upstream root for its public URL in a JSON body, so the links an upstream
 /// document carries (NuGet registration's <c>packageContent</c>, <c>@id</c>, dependency <c>registration</c>)
 /// lead back through the public route instead of straight to the upstream.
+/// <para>MRI-5318: also an HTML body, and the roots of other prefixes (<see cref="OtherRoots"/>): a PyPI simple
+/// index on pypi.org links its files on files.pythonhosted.org, which is another prefix.</para>
 /// <para>Applied to a body before it is stored, never on serve: a stored object over the S3 inline threshold
 /// is served by the bucket and its bytes never pass through the proxy again.</para>
-/// <para>Only a JSON string that starts with the root is touched (the match is anchored on its opening quote),
-/// so a URL quoted inside a description stays as written. Both the plain and the <c>\/</c>-escaped spelling
-/// are matched.</para>
+/// <para>Only a string that starts with a root is touched (the match is anchored on its opening double quote:
+/// a JSON string or an HTML attribute value), so a URL quoted inside a description stays as written. Both the
+/// plain and the <c>\/</c>-escaped spelling are matched. Whatever follows the root, a <c>#sha256=</c> fragment
+/// included, is kept byte for byte.</para>
 /// </summary>
 public sealed class UpstreamUrlRewrite
 {
   // Registration documents run to a few hundred KB. A body over this is stored as the upstream sent it.
   public const int MaxBodyBytes = 16 * 1024 * 1024;
 
-  private readonly byte[] myAnchor;
+  // Every root is http(s).
+  private static readonly byte[] ourAnchor = "\"http"u8.ToArray();
   private readonly (byte[] From, byte[] To)[] myReplacements;
 
-  public UpstreamUrlRewrite(Uri upstreamRoot, Uri publicRoot)
+  /// <param name="otherRoots">Other prefixes' upstream and public roots. Ones under <paramref name="upstreamRoot"/>
+  /// are dropped, so a link the prefix itself serves keeps its alias; the rest match longest first.</param>
+  public UpstreamUrlRewrite(Uri upstreamRoot, Uri publicRoot, IEnumerable<(Uri Upstream, Uri Public)>? otherRoots = null)
   {
     UpstreamRoot = upstreamRoot;
     PublicRoot = publicRoot;
+    OtherRoots =
+    [
+      .. (otherRoots ?? [])
+        .Where(root => !root.Upstream.AbsoluteUri.StartsWith(upstreamRoot.AbsoluteUri, StringComparison.Ordinal))
+        .OrderByDescending(root => root.Upstream.AbsoluteUri.Length)
+        .ThenBy(root => root.Upstream.AbsoluteUri, StringComparer.Ordinal)
+    ];
 
-    var from = upstreamRoot.AbsoluteUri;
-    var to = publicRoot.AbsoluteUri;
-    myAnchor = Encoding.UTF8.GetBytes($"\"{upstreamRoot.Scheme}:");
     myReplacements =
     [
-      (Encoding.UTF8.GetBytes($"\"{from}"), Encoding.UTF8.GetBytes($"\"{to}")),
-      (Encoding.UTF8.GetBytes($"\"{from.Replace("/", "\\/")}"), Encoding.UTF8.GetBytes($"\"{to.Replace("/", "\\/")}")),
+      .. new[] { (Upstream: upstreamRoot, Public: publicRoot) }.Concat(OtherRoots).SelectMany(static root =>
+      {
+        var from = root.Upstream.AbsoluteUri;
+        var to = root.Public.AbsoluteUri;
+        return new[]
+        {
+          (Encoding.UTF8.GetBytes($"\"{from}"), Encoding.UTF8.GetBytes($"\"{to}")),
+          (Encoding.UTF8.GetBytes($"\"{from.Replace("/", "\\/")}"), Encoding.UTF8.GetBytes($"\"{to.Replace("/", "\\/")}")),
+        };
+      })
     ];
   }
 
   public Uri UpstreamRoot { get; }
   public Uri PublicRoot { get; }
+  public IReadOnlyList<(Uri Upstream, Uri Public)> OtherRoots { get; }
 
   // One per host a signed request has named (see RedirectSignatureAuthenticationHandler.PublicHostQueryParam),
   // which is one per redirector deployment.
   private readonly ConcurrentDictionary<string, UpstreamUrlRewrite> myOnHost = new(StringComparer.Ordinal);
 
   /// <summary>
-  /// This rewrite with <see cref="PublicRoot"/> moved to <paramref name="host"/>: the same path on the redirector
+  /// This rewrite with every public root moved to <paramref name="host"/>: the same path on the redirector
   /// deployment the request came through. <see cref="FoldIntoVariant"/> follows, so each host has its own entry.
   /// </summary>
   public UpstreamUrlRewrite OnHost(string host) =>
     string.Equals(host, PublicRoot.Host, StringComparison.OrdinalIgnoreCase)
       ? this
       : myOnHost.GetOrAdd(host, static (h, self) =>
-        new UpstreamUrlRewrite(self.UpstreamRoot, new UriBuilder(self.PublicRoot) { Host = h }.Uri), this);
+        new UpstreamUrlRewrite(self.UpstreamRoot, Move(self.PublicRoot, h),
+          self.OtherRoots.Select(root => (root.Upstream, Move(root.Public, h)))), this);
+
+  private static Uri Move(Uri uri, string host) => new UriBuilder(uri) { Host = host }.Uri;
 
   /// <summary>
   /// Folds this rewrite into a cache variant (see <see cref="RemoteProxy.GetCacheVariant"/>). A rewritten
-  /// body depends on the public URL, and an entry stored before rewriting was enabled must not be kept alive
+  /// body depends on every root it maps, and an entry stored before a mapping existed must not be kept alive
   /// by a 304. A leading newline cannot start an Accept-derived variant, so the two never collide.
   /// </summary>
-  public string FoldIntoVariant(string? variant) => $"\nrewrite {PublicRoot.AbsoluteUri}\n{variant}";
+  public string FoldIntoVariant(string? variant) =>
+    $"\nrewrite {PublicRoot.AbsoluteUri}\n" +
+    string.Concat(OtherRoots.Select(static root => $"rewrite {root.Upstream.AbsoluteUri} {root.Public.AbsoluteUri}\n")) +
+    variant;
 
-  /// <summary>The rewritten body, or null when it holds no URL under the upstream root.</summary>
+  /// <summary>The rewritten body, or null when it holds no URL under any root.</summary>
   public byte[]? Rewrite(ReadOnlySpan<byte> json)
   {
     ArrayBufferWriter<byte>? output = null;
@@ -77,7 +103,7 @@ public sealed class UpstreamUrlRewrite
     var scanned = 0;
     while (true)
     {
-      var anchor = rest[scanned..].IndexOf(myAnchor);
+      var anchor = rest[scanned..].IndexOf(ourAnchor);
       if (anchor < 0) break;
       anchor += scanned;
 
@@ -94,7 +120,7 @@ public sealed class UpstreamUrlRewrite
         break;
       }
 
-      if (!matched) scanned = anchor + myAnchor.Length;
+      if (!matched) scanned = anchor + ourAnchor.Length;
     }
 
     if (output == null) return null;
@@ -104,17 +130,19 @@ public sealed class UpstreamUrlRewrite
 
   /// <summary>
   /// Replaces <paramref name="response"/>'s content with the rewritten body: a <see cref="RewrittenContent"/>
-  /// when anything changed, the same bytes otherwise. Leaves anything that is not JSON, or larger than
+  /// when anything changed, the same bytes otherwise. Leaves anything that is not JSON or HTML, or larger than
   /// <see cref="MaxBodyBytes"/>, unread. A gzip body is decoded, rewritten and encoded again, since that is
   /// how the cache stores it.
   /// </summary>
   /// <param name="idleReadTimeout">Real time, as in <c>CachingProxy.CopyToTwoStreamsAsync</c>: the body is read
   /// here, before that loop would have bounded it.</param>
-  public async Task ApplyAsync(HttpResponseMessage response, TimeSpan idleReadTimeout, CancellationToken cancellationToken)
+  /// <returns>False for a body past <see cref="MaxBodyBytes"/>: stored as sent, so its links still lead to the
+  /// upstream. The caller warns about it.</returns>
+  public async Task<bool> ApplyAsync(HttpResponseMessage response, TimeSpan idleReadTimeout, CancellationToken cancellationToken)
   {
     var original = response.Content;
-    if (!IsJson(original.Headers.ContentType?.MediaType) || original.Headers.ContentLength > MaxBodyBytes)
-      return;
+    if (!IsRewritable(original.Headers.ContentType?.MediaType)) return true;
+    if (original.Headers.ContentLength > MaxBodyBytes) return false;
 
     var stream = await original.ReadAsStreamAsync(cancellationToken);
     var (raw, complete) = await ReadUpToAsync(stream, MaxBodyBytes, idleReadTimeout, cancellationToken);
@@ -122,21 +150,24 @@ public sealed class UpstreamUrlRewrite
     {
       // A chunked body past the cap: hand on what was read plus the rest, untouched.
       response.Content = CopyHeaders(original, new StreamContent(new PrefixedStream(raw, stream)), rewritten: false);
-      return;
+      return false;
     }
 
     var gzip = original.Headers.ContentEncoding.Count == 1 &&
                string.Equals(original.Headers.ContentEncoding.First(), "gzip", StringComparison.OrdinalIgnoreCase);
-    var rewritten = gzip ? RewriteGzip(raw) : Rewrite(raw);
+    var tooLarge = false;
+    var rewritten = gzip ? RewriteGzip(raw, out tooLarge) : Rewrite(raw);
     response.Content = rewritten != null
       ? CopyHeaders(original, new RewrittenContent(rewritten), rewritten: true)
       : CopyHeaders(original, new ByteArrayContent(raw), rewritten: false);
     original.Dispose();
+    return !tooLarge;
   }
 
   // Null for a body that does not decode, decodes past the cap, or needs no change: each is stored as sent.
-  private byte[]? RewriteGzip(byte[] raw)
+  private byte[]? RewriteGzip(byte[] raw, out bool tooLarge)
   {
+    tooLarge = false;
     byte[] decoded;
     try
     {
@@ -146,7 +177,11 @@ public sealed class UpstreamUrlRewrite
       int read;
       while ((read = input.Read(buffer)) > 0)
       {
-        if (output.Length + read > MaxBodyBytes) return null;
+        if (output.Length + read > MaxBodyBytes)
+        {
+          tooLarge = true;
+          return null;
+        }
         output.Write(buffer, 0, read);
       }
       decoded = output.ToArray();
@@ -164,11 +199,14 @@ public sealed class UpstreamUrlRewrite
     return encoded.ToArray();
   }
 
-  private static bool IsJson(string? mediaType) =>
+  // HTML for a PEP 503 simple index: text/html, or PEP 691's application/vnd.pypi.simple.v1+html.
+  private static bool IsRewritable(string? mediaType) =>
     mediaType != null &&
     (mediaType.Equals("application/json", StringComparison.OrdinalIgnoreCase) ||
      mediaType.Equals("text/json", StringComparison.OrdinalIgnoreCase) ||
-     mediaType.EndsWith("+json", StringComparison.OrdinalIgnoreCase));
+     mediaType.EndsWith("+json", StringComparison.OrdinalIgnoreCase) ||
+     mediaType.Equals("text/html", StringComparison.OrdinalIgnoreCase) ||
+     mediaType.EndsWith("+html", StringComparison.OrdinalIgnoreCase));
 
   // Content-Length comes from the new content itself. Content-MD5 (Azure blob storage, i.e. nuget.org, sends
   // one) describes the upstream's bytes, not ours.
