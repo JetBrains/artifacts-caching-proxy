@@ -101,14 +101,10 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
     // the 307's or 200's status TTL rather than its 5 minutes. Null for an immutable path: no window, no cap.
     var maxCacheDuration = rule?.RefreshAfter;
 
-    // MRI-5689: an entry holding a link to the object - a GET's redirect, a large object's HEAD - must not
-    // outlive the object, and S3 lifecycle deletes it without telling us: only the client following the
-    // link sees the 404. So such an entry expires a buffer ahead of the lifecycle date, which is the
-    // prefix's retention, or the bucket's default for an untagged prefix. linkTimeLeft is what remains of
-    // that for the object this request serves; a request that (re)writes it restarts the full lifetime.
+    // MRI-5689: the prefix's retention, applied as an object tag on every write so the bucket lifecycle
+    // rule for it expires the object. A link handed out is signed for SignedLinkTTL at most, far less than
+    // any retention, so cached link entries need no extra cap for it.
     var retention = remoteServer.Retention;
-    var linkLifetime = (retention ?? RetentionPolicy.S3Default).LinkLifetime;
-    var linkTimeLeft = linkLifetime;
 
     // A content-negotiated endpoint keeps one object per requested representation (see GetCacheVariant),
     // so the variant is folded into the object key — and thereby into the in-memory keys derived from it.
@@ -155,15 +151,10 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
       // Nothing known yet for this object: probe S3 with the ranged prefetch (HEAD and GET alike).
       // The shared-key check also serves as the post-lock re-check for the verb-agnostic values (a
       // leader's inlined small object or negative result), so waiters serve those without re-probing.
-      //
-      // An object that S3 lifecycle may delete soon reads as missing (see ProbeAsync), so the upstream fetch
-      // below stores it afresh and restarts its lifecycle instead of handing out a link to something that is
-      // about to go.
       if (await responseCache.GetCachedStatusCode(s3Key, context.RequestAborted) == null &&
-          await ProbeAsync(s3Key, linkLifetime, context.RequestAborted) is { } probed)
+          await ProbeAsync(s3Key, context.RequestAborted) is { } probed)
       {
         using var s3Object = probed;
-        linkTimeLeft = LinkTimeLeft(s3Object, linkLifetime);
 
         // Past its freshness window? Revalidate against the upstream (a conditional GET on the
         // validators recorded for the stored bytes - see UpstreamETag and UpstreamLastModified) before
@@ -191,13 +182,12 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
               {
                 context.Response.Clear();
                 var freshContentLength = await StoreInBucketAsync(s3Key, upstreamUri, fresh, retention, context.RequestAborted);
-                linkTimeLeft = linkLifetime;
                 // A HEAD is answered with the object's metadata and no body, so this re-upload delivered
                 // nothing to the client, however much it moved.
                 if (isHead)
                   await remoteProxy.SetStatusAsync(context, CachingProxyStatus.REVALIDATED,
                     await responseCache.PutStatusCode(verbKey, new CachedResponse(fresh) { StatusCode = HttpStatusCode.OK },
-                      remoteServer.CacheDuration, context.RequestAborted, LinkEntryCap()), rule);
+                      remoteServer.CacheDuration, context.RequestAborted, maxCacheDuration), rule);
                 else
                   await RedirectToBucket(CachingProxyStatus.REVALIDATED, freshContentLength);
               }
@@ -212,9 +202,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
             case RevalidationOutcome.NotModified:
               // Still valid: bump the stored date (a metadata-only self-copy) so the window restarts,
               // then serve the object we already probed.
-              // The copy is a new object to S3 lifecycle as well, so the link lifetime restarts with it.
               await TouchStoredDateAsync(s3Key, s3Object, retention, context.RequestAborted);
-              linkTimeLeft = linkLifetime;
               probeStatus = CachingProxyStatus.REVALIDATED;
               break;
 
@@ -258,7 +246,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
             }
           };
           await remoteProxy.SetStatusAsync(context, probeStatus,
-            await responseCache.PutStatusCode(verbKey, head, remoteServer.CacheDuration, context.RequestAborted, LinkEntryCap()), rule);
+            await responseCache.PutStatusCode(verbKey, head, remoteServer.CacheDuration, context.RequestAborted, maxCacheDuration), rule);
           return;
         }
 
@@ -297,7 +285,6 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
       }
 
       var contentLength = await StoreInBucketAsync(s3Key, upstreamUri, response, retention, context.RequestAborted);
-      linkTimeLeft = linkLifetime;
 
       await RedirectToBucket(CachingProxyStatus.MISS, contentLength);
     }
@@ -397,26 +384,18 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
       // Only a GET redirects (a HEAD is served from memory), so the redirect always belongs under the
       // verb-specific key and is never replayed to a HEAD.
       await remoteProxy.SetStatusAsync(context, status,
-        await responseCache.PutStatusCode(verbKey, cachingResponse, remoteServer.CacheDuration, context.RequestAborted, LinkEntryCap()), rule);
+        await responseCache.PutStatusCode(verbKey, cachingResponse, remoteServer.CacheDuration, context.RequestAborted, maxCacheDuration), rule);
     }
-
-    // The cap for an entry that hands out a link: the freshness window or the object's remaining link
-    // lifetime, whichever ends first.
-    TimeSpan LinkEntryCap() => maxCacheDuration is { } max && max < linkTimeLeft ? max : linkTimeLeft;
   }
 
   /// <summary>
-  /// The ranged prefetch of an object, or null when there is no object to serve: none in the bucket, or
-  /// one whose link lifetime (see <see cref='RetentionPolicy.LinkLifetime'/>) is used up, so S3 lifecycle
-  /// may delete it before a client follows a link to it. The caller then fetches it from the upstream like
-  /// a missing one, and the re-store restarts its lifecycle.
+  /// The ranged prefetch of an object, or null when there is none in the bucket.
   /// </summary>
-  private async Task<GetObjectResponse?> ProbeAsync(string s3Key, TimeSpan linkLifetime, CancellationToken cancellationToken)
+  private async Task<GetObjectResponse?> ProbeAsync(string s3Key, CancellationToken cancellationToken)
   {
-    GetObjectResponse s3Object;
     try
     {
-      s3Object = await amazonS3.GetObjectAsync(new GetObjectRequest
+      return await amazonS3.GetObjectAsync(new GetObjectRequest
       {
         BucketName = config.S3!.BucketName,
         Key = s3Key,
@@ -427,29 +406,6 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
     {
       return null;
     }
-
-    if (LinkTimeLeft(s3Object, linkLifetime) > TimeSpan.Zero)
-      return s3Object;
-
-    logger.LogInformation("Object {S3Key} is due for lifecycle expiry, refetching it", s3Key);
-    s3Object.Dispose();
-    return null;
-  }
-
-  /// <summary>
-  /// How much of a link lifetime a probed object has left, counted from our own "created-at" - written
-  /// with every PutObject and CopyObject, which are also what start S3's lifecycle clock - or from S3's
-  /// LastModified for an object that predates the key.
-  /// </summary>
-  private TimeSpan LinkTimeLeft(GetObjectResponse s3Object, TimeSpan linkLifetime)
-  {
-    DateTimeOffset? storedAt = DateTimeOffset.TryParse(s3Object.Metadata[CreatedAtMetadataKey],
-      CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var createdAt)
-      ? createdAt
-      : s3Object.LastModified is { } lastModified ? new DateTimeOffset(DateTime.SpecifyKind(lastModified, DateTimeKind.Utc)) : null;
-    // Neither recorded: nothing to measure against, so leave the cap to the status TTLs as before.
-    if (storedAt is not { } anchor) return linkLifetime;
-    return anchor + linkLifetime - timeProvider.GetUtcNow();
   }
 
   /// <summary>
