@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Diagnostics.Metrics;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Cronos;
@@ -96,7 +97,12 @@ public class CleanupService(TimeProvider timeProvider, CachingProxyConfig config
       return Task.CompletedTask;
     }
 
-    var cutoffUtc = timeProvider.GetUtcNow() - config.CleanupPeriod;
+    var nowUtc = timeProvider.GetUtcNow();
+    var cutoffUtc = nowUtc - config.CleanupPeriod;
+    // A file accessed more recently than the shortest period any policy can set is kept whatever its
+    // metadata says, so the steady-state walk reads no metadata for the hot part of the cache.
+    var shortestPeriod = RetentionPolicy.All.Min(static p => p.Period);
+    var keepAllAfterUtc = nowUtc - (config.CleanupPeriod < shortestPeriod ? config.CleanupPeriod : shortestPeriod);
     logger.LogInformation("File cleanup started. Deleted files older than {Cutoff}", cutoffUtc);
 
     var stopwatch = Stopwatch.StartNew();
@@ -128,7 +134,8 @@ public class CleanupService(TimeProvider timeProvider, CachingProxyConfig config
         continue;
       }
 
-      if (fileInfo.LastAccessTimeUtc < cutoffUtc && TryDelete(fileInfo))
+      var lastAccessUtc = fileInfo.LastAccessTimeUtc;
+      if (lastAccessUtc < keepAllAfterUtc && lastAccessUtc < CutoffFor(filePath) && TryDelete(fileInfo))
         continue;
 
       CountKept(fileInfo);
@@ -160,6 +167,11 @@ public class CleanupService(TimeProvider timeProvider, CachingProxyConfig config
     }
 
     return Task.CompletedTask;
+
+    // The prefix's retention recorded in the file's metadata (MRI-5689) replaces CleanupPeriod; a file
+    // whose metadata has none - or that has no readable metadata at all - keeps the global period.
+    DateTimeOffset CutoffFor(string filePath) =>
+      ReadRetention(filePath) is { } retention ? nowUtc - retention.Period : cutoffUtc;
 
     bool TryDelete(FileInfo file)
     {
@@ -200,6 +212,19 @@ public class CleanupService(TimeProvider timeProvider, CachingProxyConfig config
 
       keptCount++;
       keptBytes += size;
+    }
+  }
+
+  private RetentionPolicy? ReadRetention(string cacheFilePath)
+  {
+    try
+    {
+      return CacheEntryMetadata.TryParse(File.ReadAllText(CacheFileProvider.GetMetadataPath(cacheFilePath)))?.Retention;
+    }
+    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+    {
+      logger.LogDebug(ex, "No readable metadata for {Path}", cacheFilePath);
+      return null;
     }
   }
 }

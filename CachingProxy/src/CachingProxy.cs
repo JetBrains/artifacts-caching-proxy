@@ -122,7 +122,7 @@ public class CachingProxy
 
       // Unconditional, unlike the freshness stamp this replaced: a stored copy needs its head back
       // whether or not its rule sets a window, and it is the same single write either way.
-      await WriteMetadataAsync(storedPath, CacheEntryMetadata.FromResponse(UtcNow, response));
+      await WriteMetadataAsync(storedPath, CacheEntryMetadata.FromResponse(UtcNow, response, remoteServer.Retention));
     }
     catch (OperationCanceledException)
     {
@@ -186,8 +186,9 @@ public class CachingProxy
     switch (result.Outcome)
     {
       case RevalidationOutcome.NotModified:
-        // Still valid: restart the window, keeping the head the stored bytes were fetched under.
-        await WriteMetadataAsync(cachedFile.FullName, metadata with { StoredAtUtc = UtcNow });
+        // Still valid: restart the window, keeping the head the stored bytes were fetched under. The
+        // retention is the prefix's current one, so a policy change reaches copies as they are touched.
+        await WriteMetadataAsync(cachedFile.FullName, metadata with { StoredAtUtc = UtcNow, Retention = remoteServer.Retention });
         await ServeFileAsync(context, cachedFile, metadata, contentEncoding, CachingProxyStatus.REVALIDATED, rule);
         return;
 
@@ -224,7 +225,7 @@ public class CachingProxy
             DeleteMetadata(cachedFile.FullName);
           }
 
-          await WriteMetadataAsync(newPath, CacheEntryMetadata.FromResponse(UtcNow, response));
+          await WriteMetadataAsync(newPath, CacheEntryMetadata.FromResponse(UtcNow, response, remoteServer.Retention));
         }
         return;
     }

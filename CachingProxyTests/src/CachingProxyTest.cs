@@ -1939,7 +1939,7 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
   // Builds a second proxy host over the same cache directory and fake clock, with a profile whose
   // catch-all rule gives every path the requested freshness window — so the freshness/revalidation
   // behavior can be exercised on /real/revalidate.txt without touching the other tests.
-  private TestServer CreateRefreshAfterServer(TimeSpan refreshAfter)
+  private TestServer CreateRefreshAfterServer(TimeSpan refreshAfter, string? retention = null)
   {
     var config = new CachingProxyConfig
     {
@@ -1948,7 +1948,7 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
       {
         ["fresh"] = new() { Rules = [new CachingRule { Pattern = ".", RefreshAfter = refreshAfter }] }
       },
-      Prefixes = [new CachingProxyPrefix($"/real={myUpstreamServer.Url}", Profile: "fresh")],
+      Prefixes = [new CachingProxyPrefix($"/real={myUpstreamServer.Url}", Profile: "fresh", Retention: retention)],
       MinimumFreeDiskSpaceMb = 2,
     };
 
@@ -1967,6 +1967,31 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
     myExtraHosts.Add(host);
     host.Start();
     return host.GetTestServer();
+  }
+
+  [Fact]
+  public async Task Prefix_Retention_Is_Recorded_In_The_Metadata_File()
+  {
+    // MRI-5689: the policy goes into the companion metadata file CleanupService reads, so the cache layout
+    // stays as it is; a prefix without one records none and stays on the global CleanupPeriod.
+    myUpstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.Ok;
+    myUpstreamServer.RevalidateContent = "v1";
+
+    using (var response = await CreateRefreshAfterServer(TimeSpan.FromHours(1), retention: "3d")
+             .CreateRequest("/real/revalidate.txt").GetAsync())
+      Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    using (var response = await myServer.CreateRequest("/real/a.jar").GetAsync())
+      Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+    var revalidateFile = Path.Combine(myTempDirectory,
+      new Uri(myUpstreamServer.Url, "revalidate.txt").GetFutureCacheFileLocation());
+    var jarFile = Path.Combine(myTempDirectory, new Uri(myUpstreamServer.Url, "a.jar").GetFutureCacheFileLocation());
+
+    Assert.Same(RetentionPolicy.ThreeDays, CacheEntryMetadata.TryParse(
+      await File.ReadAllTextAsync(CacheFileProvider.GetMetadataPath(revalidateFile)))?.Retention);
+    var jarMetadata = CacheEntryMetadata.TryParse(await File.ReadAllTextAsync(CacheFileProvider.GetMetadataPath(jarFile)));
+    Assert.NotNull(jarMetadata);
+    Assert.Null(jarMetadata.Retention);
   }
 
   private IEnumerable<string> CacheFiles() =>

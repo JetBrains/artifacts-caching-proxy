@@ -22,26 +22,32 @@ namespace JetBrains.CachingProxy;
 /// </summary>
 /// <param name="RewrittenETag">Our ETag for a body <see cref="UpstreamUrlRewrite"/> changed, served in place of
 /// the upstream's validators; <see cref="ETag"/> and <see cref="LastModified"/> then serve revalidation only.</param>
+/// <param name="Retention">The prefix's <see cref="RetentionPolicy"/> when the copy was stored (MRI-5689), which
+/// <see cref="CleanupService"/> keeps the file for in place of the global CleanupPeriod. Null - absent from the
+/// file, as in every file written before it existed - keeps that global period.</param>
 public sealed record CacheEntryMetadata(
   DateTime StoredAtUtc,
   string? ContentType = null,
   string? ETag = null,
   DateTimeOffset? LastModified = null,
   string? Digest = null,
-  string? RewrittenETag = null)
+  string? RewrittenETag = null,
+  RetentionPolicy? Retention = null)
 {
   // Our own fields, so they get names no HTTP header has.
   private const string StoredAtField = "StoredAt";
   private const string RewrittenETagField = "RewrittenETag";
+  private const string RetentionField = "Retention";
 
   /// <summary>The metadata to record for a body just fetched from the upstream.</summary>
-  public static CacheEntryMetadata FromResponse(DateTime storedAtUtc, HttpResponseMessage response) => new(
+  public static CacheEntryMetadata FromResponse(DateTime storedAtUtc, HttpResponseMessage response, RetentionPolicy? retention = null) => new(
     storedAtUtc,
     response.Content.Headers.ContentType?.ToString(),
     response.Headers.ETag?.ToString(),
     response.Content.Headers.LastModified,
     response.Headers.TryGetValues(CachedResponse.DockerContentDigestHeader, out var digest) ? digest.FirstOrDefault() : null,
-    (response.Content as RewrittenContent)?.ETag);
+    (response.Content as RewrittenContent)?.ETag,
+    retention);
 
   /// <summary>One <c>Name: value</c> per line; absent values are omitted.</summary>
   public string Format()
@@ -53,6 +59,7 @@ public sealed record CacheEntryMetadata(
     Append(text, HeaderNames.LastModified, LastModified?.ToString("R", CultureInfo.InvariantCulture));
     Append(text, CachedResponse.DockerContentDigestHeader, Digest);
     Append(text, RewrittenETagField, RewrittenETag);
+    Append(text, RetentionField, Retention?.Name);
     return text.ToString();
   }
 
@@ -75,6 +82,7 @@ public sealed record CacheEntryMetadata(
     DateTime? storedAt = null;
     string? contentType = null, etag = null, digest = null, rewrittenETag = null;
     DateTimeOffset? lastModified = null;
+    RetentionPolicy? retention = null;
 
     foreach (var line in text.Split('\n'))
     {
@@ -96,9 +104,12 @@ public sealed record CacheEntryMetadata(
           parsed : null;
       else if (Is(name, CachedResponse.DockerContentDigestHeader)) digest = value;
       else if (Is(name, RewrittenETagField)) rewrittenETag = value;
+      // A value this version does not know (one a later version added, say) reads as no policy, so the
+      // file falls back to the global CleanupPeriod rather than to whatever a guess would make of it.
+      else if (Is(name, RetentionField)) retention = RetentionPolicy.TryParse(value, out var policy) ? policy : null;
     }
 
-    return storedAt is { } when ? new CacheEntryMetadata(when, contentType, etag, lastModified, digest, rewrittenETag) : null;
+    return storedAt is { } when ? new CacheEntryMetadata(when, contentType, etag, lastModified, digest, rewrittenETag, retention) : null;
   }
 
   private static bool Is(string name, string field) => name.Equals(field, StringComparison.OrdinalIgnoreCase);
