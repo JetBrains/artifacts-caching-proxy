@@ -101,6 +101,15 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
     // the 307's or 200's status TTL rather than its 5 minutes. Null for an immutable path: no window, no cap.
     var maxCacheDuration = rule?.RefreshAfter;
 
+    // MRI-5689: an entry holding a link to the object - a GET's redirect, a large object's HEAD - must not
+    // outlive the object, and S3 lifecycle deletes it without telling us: only the client following the
+    // link sees the 404. So such an entry expires a buffer ahead of the lifecycle date, which is the
+    // prefix's retention, or the bucket's default for an untagged prefix. linkTimeLeft is what remains of
+    // that for the object this request serves; a request that (re)writes it restarts the full lifetime.
+    var retention = remoteServer.Retention;
+    var linkLifetime = (retention ?? RetentionPolicy.S3Default).LinkLifetime;
+    var linkTimeLeft = linkLifetime;
+
     // A content-negotiated endpoint keeps one object per requested representation (see GetCacheVariant),
     // so the variant is folded into the object key — and thereby into the in-memory keys derived from it.
     var s3Key = upstreamUri.ManglePath(RemoteProxy.GetCacheVariant(context, rule));
@@ -146,118 +155,118 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
       // Nothing known yet for this object: probe S3 with the ranged prefetch (HEAD and GET alike).
       // The shared-key check also serves as the post-lock re-check for the verb-agnostic values (a
       // leader's inlined small object or negative result), so waiters serve those without re-probing.
-      if (await responseCache.GetCachedStatusCode(s3Key, context.RequestAborted) == null)
+      //
+      // An object that S3 lifecycle may delete soon reads as missing (see ProbeAsync), so the upstream fetch
+      // below stores it afresh and restarts its lifecycle instead of handing out a link to something that is
+      // about to go.
+      if (await responseCache.GetCachedStatusCode(s3Key, context.RequestAborted) == null &&
+          await ProbeAsync(s3Key, linkLifetime, context.RequestAborted) is { } probed)
       {
-        try
+        using var s3Object = probed;
+        linkTimeLeft = LinkTimeLeft(s3Object, linkLifetime);
+
+        // Past its freshness window? Revalidate against the upstream (a conditional GET on the
+        // validators recorded for the stored bytes - see UpstreamETag and UpstreamLastModified) before
+        // serving. The freshness clock is our own "created-at" metadata, and it also stands in for a
+        // date the upstream never sent; neither is S3's LastModified, which we don't control.
+        // probeStatus records the
+        // verdict so the serve-from-probe paths below report REVALIDATED (kept after a 304) or STALE
+        // (upstream unreachable) instead of MISS. A 200 re-stores and serves fresh; a 404 deletes it.
+        var probeStatus = CachingProxyStatus.MISS;
+        if (rule?.RefreshAfter is { } refreshAfter && IsPastRefreshWindow(s3Object, refreshAfter))
         {
-          using var s3Object = await amazonS3.GetObjectAsync(new GetObjectRequest
+          // Only the upstream's own validators, never our "created-at" in place of a missing date. Ours
+          // is our clock: a 304 touch moves it past a change the upstream (or a lagging replica of it)
+          // had not shown us yet, and from then on that change draws a 304 too - stale for good. That
+          // froze objects stored before validators were recorded: eu-central-1 served a July
+          // maven-metadata.xml in October. With neither recorded the request is unconditional, and the
+          // 200 re-store records them.
+          var result = await remoteProxy.RevalidateAsync(context, upstreamUri, UpstreamETag(s3Object),
+            CachedResponse.UpstreamLastModified(s3Object),
+            remoteServer.Auth, rule, remoteServer.Profile, context.RequestAborted);
+          switch (result.Outcome)
           {
-            BucketName = config.S3!.BucketName,
-            Key = s3Key,
-            ByteRange = myPrefetchSize
-          }, context.RequestAborted);
-
-          // Past its freshness window? Revalidate against the upstream (a conditional GET on the
-          // validators recorded for the stored bytes - see UpstreamETag and UpstreamLastModified) before
-          // serving. The freshness clock is our own "created-at" metadata, and it also stands in for a
-          // date the upstream never sent; neither is S3's LastModified, which we don't control.
-          // probeStatus records the
-          // verdict so the serve-from-probe paths below report REVALIDATED (kept after a 304) or STALE
-          // (upstream unreachable) instead of MISS. A 200 re-stores and serves fresh; a 404 deletes it.
-          var probeStatus = CachingProxyStatus.MISS;
-          if (rule?.RefreshAfter is { } refreshAfter && IsPastRefreshWindow(s3Object, refreshAfter))
-          {
-            // Only the upstream's own validators, never our "created-at" in place of a missing date. Ours
-            // is our clock: a 304 touch moves it past a change the upstream (or a lagging replica of it)
-            // had not shown us yet, and from then on that change draws a 304 too - stale for good. That
-            // froze objects stored before validators were recorded: eu-central-1 served a July
-            // maven-metadata.xml in October. With neither recorded the request is unconditional, and the
-            // 200 re-store records them.
-            var result = await remoteProxy.RevalidateAsync(context, upstreamUri, UpstreamETag(s3Object),
-              CachedResponse.UpstreamLastModified(s3Object),
-              remoteServer.Auth, rule, remoteServer.Profile, context.RequestAborted);
-            switch (result.Outcome)
-            {
-              case RevalidationOutcome.Replaced:
-                using (var fresh = result.Response!)
-                {
-                  context.Response.Clear();
-                  var freshContentLength = await StoreInBucketAsync(s3Key, upstreamUri, fresh, context.RequestAborted);
-                  // A HEAD is answered with the object's metadata and no body, so this re-upload delivered
-                  // nothing to the client, however much it moved.
-                  if (isHead)
-                    await remoteProxy.SetStatusAsync(context, CachingProxyStatus.REVALIDATED,
-                      await responseCache.PutStatusCode(verbKey, new CachedResponse(fresh) { StatusCode = HttpStatusCode.OK },
-                        remoteServer.CacheDuration, context.RequestAborted, maxCacheDuration), rule);
-                  else
-                    await RedirectToBucket(CachingProxyStatus.REVALIDATED, freshContentLength);
-                }
-                return;
-
-              case RevalidationOutcome.Gone:
-                await amazonS3.DeleteObjectAsync(new DeleteObjectRequest { BucketName = config.S3!.BucketName, Key = s3Key }, context.RequestAborted);
-                await remoteProxy.SetStatusAsync(context, CachingProxyStatus.NEGATIVE_MISS,
-                  await responseCache.PutStatusCode(s3Key, HttpStatusCode.NotFound, remoteServer.CacheDuration, context.RequestAborted, maxCacheDuration), rule);
-                return;
-
-              case RevalidationOutcome.NotModified:
-                // Still valid: bump the stored date (a metadata-only self-copy) so the window restarts,
-                // then serve the object we already probed.
-                await TouchStoredDateAsync(s3Key, s3Object, context.RequestAborted);
-                probeStatus = CachingProxyStatus.REVALIDATED;
-                break;
-
-              case RevalidationOutcome.UpstreamError:
-                // Could not reach/validate the upstream: serve the stale object as-is.
-                probeStatus = CachingProxyStatus.STALE;
-                break;
-            }
-          }
-
-          // Did the probe return the whole object, or only the first slice? Decide purely from
-          // Content-Range ("bytes <from>-<to>/<total>"), whose semantics are unambiguous: the bytes
-          // returned are (to - from + 1) and the object's full size is the total.
-          // When the returned range spans the whole object it fit the window, so
-          // inline it (shared by both verbs); otherwise we only got a slice and must redirect.
-          if (ContentRangeHeaderValue.TryParse(s3Object.ContentRange, out var contentRange)
-              && contentRange is { HasRange: true, HasLength: true }
-              && contentRange.To - contentRange.From + 1 == contentRange.Length)
-          {
-            var body = new byte[contentRange.To!.Value - contentRange.From!.Value + 1];
-            await s3Object.ResponseStream.ReadExactlyAsync(body, 0, body.Length, context.RequestAborted);
-
-            var cachingResponse = new CachedResponse(s3Object) { StatusCode = HttpStatusCode.OK, Body = body };
-
-            await remoteProxy.SetStatusAsync(context, probeStatus,
-              await responseCache.PutStatusCode(s3Key, cachingResponse, remoteServer.CacheDuration, context.RequestAborted, maxCacheDuration), rule);
-            return;
-          }
-
-          // Too large to inline. A HEAD is answered from memory with the object's metadata: the body
-          // is omitted but Content-Length is the full object size from Content-Range (not the
-          // prefetched slice). A GET is redirected to S3.
-          if (isHead && contentRange is { HasLength: true })
-          {
-            var head = new CachedResponse(s3Object)
-            {
-              StatusCode = HttpStatusCode.OK,
-              Headers =
+            case RevalidationOutcome.Replaced:
+              using (var fresh = result.Response!)
               {
-                ContentLength = contentRange.Length
+                context.Response.Clear();
+                var freshContentLength = await StoreInBucketAsync(s3Key, upstreamUri, fresh, retention, context.RequestAborted);
+                linkTimeLeft = linkLifetime;
+                // A HEAD is answered with the object's metadata and no body, so this re-upload delivered
+                // nothing to the client, however much it moved.
+                if (isHead)
+                  await remoteProxy.SetStatusAsync(context, CachingProxyStatus.REVALIDATED,
+                    await responseCache.PutStatusCode(verbKey, new CachedResponse(fresh) { StatusCode = HttpStatusCode.OK },
+                      remoteServer.CacheDuration, context.RequestAborted, LinkEntryCap()), rule);
+                else
+                  await RedirectToBucket(CachingProxyStatus.REVALIDATED, freshContentLength);
               }
-            };
-            await remoteProxy.SetStatusAsync(context, probeStatus,
-              await responseCache.PutStatusCode(verbKey, head, remoteServer.CacheDuration, context.RequestAborted, maxCacheDuration), rule);
-            return;
-          }
+              return;
 
-          // The object's own size comes from Content-Range's total, like the HEAD above: the response's
-          // Content-Length is the prefetched slice, which would report every large object as one inline
-          // window's worth of bytes.
-          await RedirectToBucket(probeStatus, contentRange?.Length);
+            case RevalidationOutcome.Gone:
+              await amazonS3.DeleteObjectAsync(new DeleteObjectRequest { BucketName = config.S3!.BucketName, Key = s3Key }, context.RequestAborted);
+              await remoteProxy.SetStatusAsync(context, CachingProxyStatus.NEGATIVE_MISS,
+                await responseCache.PutStatusCode(s3Key, HttpStatusCode.NotFound, remoteServer.CacheDuration, context.RequestAborted, maxCacheDuration), rule);
+              return;
+
+            case RevalidationOutcome.NotModified:
+              // Still valid: bump the stored date (a metadata-only self-copy) so the window restarts,
+              // then serve the object we already probed.
+              // The copy is a new object to S3 lifecycle as well, so the link lifetime restarts with it.
+              await TouchStoredDateAsync(s3Key, s3Object, retention, context.RequestAborted);
+              linkTimeLeft = linkLifetime;
+              probeStatus = CachingProxyStatus.REVALIDATED;
+              break;
+
+            case RevalidationOutcome.UpstreamError:
+              // Could not reach/validate the upstream: serve the stale object as-is.
+              probeStatus = CachingProxyStatus.STALE;
+              break;
+          }
+        }
+
+        // Did the probe return the whole object, or only the first slice? Decide purely from
+        // Content-Range ("bytes <from>-<to>/<total>"), whose semantics are unambiguous: the bytes
+        // returned are (to - from + 1) and the object's full size is the total.
+        // When the returned range spans the whole object it fit the window, so
+        // inline it (shared by both verbs); otherwise we only got a slice and must redirect.
+        if (ContentRangeHeaderValue.TryParse(s3Object.ContentRange, out var contentRange)
+            && contentRange is { HasRange: true, HasLength: true }
+            && contentRange.To - contentRange.From + 1 == contentRange.Length)
+        {
+          var body = new byte[contentRange.To!.Value - contentRange.From!.Value + 1];
+          await s3Object.ResponseStream.ReadExactlyAsync(body, 0, body.Length, context.RequestAborted);
+
+          var cachingResponse = new CachedResponse(s3Object) { StatusCode = HttpStatusCode.OK, Body = body };
+
+          await remoteProxy.SetStatusAsync(context, probeStatus,
+            await responseCache.PutStatusCode(s3Key, cachingResponse, remoteServer.CacheDuration, context.RequestAborted, maxCacheDuration), rule);
           return;
         }
-        catch (AmazonServiceException ex) when (ex.StatusCode is HttpStatusCode.NotFound) { }
+
+        // Too large to inline. A HEAD is answered from memory with the object's metadata: the body
+        // is omitted but Content-Length is the full object size from Content-Range (not the
+        // prefetched slice). A GET is redirected to S3.
+        if (isHead && contentRange is { HasLength: true })
+        {
+          var head = new CachedResponse(s3Object)
+          {
+            StatusCode = HttpStatusCode.OK,
+            Headers =
+            {
+              ContentLength = contentRange.Length
+            }
+          };
+          await remoteProxy.SetStatusAsync(context, probeStatus,
+            await responseCache.PutStatusCode(verbKey, head, remoteServer.CacheDuration, context.RequestAborted, LinkEntryCap()), rule);
+          return;
+        }
+
+        // The object's own size comes from Content-Range's total, like the HEAD above: the response's
+        // Content-Length is the prefetched slice, which would report every large object as one inline
+        // window's worth of bytes.
+        await RedirectToBucket(probeStatus, contentRange?.Length);
+        return;
       }
 
       // No head yet for the body: whether this request streams it or replaces the response with a
@@ -283,11 +292,12 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
       // size the parts.
       if (response.Content.Headers.ContentLength >= config.S3!.MultipartThresholdBytes)
       {
-        await StreamAndStoreAsync(context, s3Key, upstreamUri, response, rule);
+        await StreamAndStoreAsync(context, s3Key, upstreamUri, response, rule, retention);
         return;
       }
 
-      var contentLength = await StoreInBucketAsync(s3Key, upstreamUri, response, context.RequestAborted);
+      var contentLength = await StoreInBucketAsync(s3Key, upstreamUri, response, retention, context.RequestAborted);
+      linkTimeLeft = linkLifetime;
 
       await RedirectToBucket(CachingProxyStatus.MISS, contentLength);
     }
@@ -387,9 +397,68 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
       // Only a GET redirects (a HEAD is served from memory), so the redirect always belongs under the
       // verb-specific key and is never replayed to a HEAD.
       await remoteProxy.SetStatusAsync(context, status,
-        await responseCache.PutStatusCode(verbKey, cachingResponse, remoteServer.CacheDuration, context.RequestAborted, maxCacheDuration), rule);
+        await responseCache.PutStatusCode(verbKey, cachingResponse, remoteServer.CacheDuration, context.RequestAborted, LinkEntryCap()), rule);
     }
+
+    // The cap for an entry that hands out a link: the freshness window or the object's remaining link
+    // lifetime, whichever ends first.
+    TimeSpan LinkEntryCap() => maxCacheDuration is { } max && max < linkTimeLeft ? max : linkTimeLeft;
   }
+
+  /// <summary>
+  /// The ranged prefetch of an object, or null when there is no object to serve: none in the bucket, or
+  /// one whose link lifetime (see <see cref='RetentionPolicy.LinkLifetime'/>) is used up, so S3 lifecycle
+  /// may delete it before a client follows a link to it. The caller then fetches it from the upstream like
+  /// a missing one, and the re-store restarts its lifecycle.
+  /// </summary>
+  private async Task<GetObjectResponse?> ProbeAsync(string s3Key, TimeSpan linkLifetime, CancellationToken cancellationToken)
+  {
+    GetObjectResponse s3Object;
+    try
+    {
+      s3Object = await amazonS3.GetObjectAsync(new GetObjectRequest
+      {
+        BucketName = config.S3!.BucketName,
+        Key = s3Key,
+        ByteRange = myPrefetchSize
+      }, cancellationToken);
+    }
+    catch (AmazonServiceException ex) when (ex.StatusCode is HttpStatusCode.NotFound)
+    {
+      return null;
+    }
+
+    if (LinkTimeLeft(s3Object, linkLifetime) > TimeSpan.Zero)
+      return s3Object;
+
+    logger.LogInformation("Object {S3Key} is due for lifecycle expiry, refetching it", s3Key);
+    s3Object.Dispose();
+    return null;
+  }
+
+  /// <summary>
+  /// How much of a link lifetime a probed object has left, counted from our own "created-at" - written
+  /// with every PutObject and CopyObject, which are also what start S3's lifecycle clock - or from S3's
+  /// LastModified for an object that predates the key.
+  /// </summary>
+  private TimeSpan LinkTimeLeft(GetObjectResponse s3Object, TimeSpan linkLifetime)
+  {
+    DateTimeOffset? storedAt = DateTimeOffset.TryParse(s3Object.Metadata[CreatedAtMetadataKey],
+      CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var createdAt)
+      ? createdAt
+      : s3Object.LastModified is { } lastModified ? new DateTimeOffset(DateTime.SpecifyKind(lastModified, DateTimeKind.Utc)) : null;
+    // Neither recorded: nothing to measure against, so leave the cap to the status TTLs as before.
+    if (storedAt is not { } anchor) return linkLifetime;
+    return anchor + linkLifetime - timeProvider.GetUtcNow();
+  }
+
+  /// <summary>
+  /// The object tags for a prefix's retention, which the bucket lifecycle rules filter on - or null for
+  /// none, leaving the object untagged under the bucket's default rule like every object stored before
+  /// retention existed.
+  /// </summary>
+  private static List<Tag>? RetentionTags(RetentionPolicy? retention) =>
+    retention == null ? null : [new Tag { Key = RetentionPolicy.TagKey, Value = retention.Name }];
 
   /// <summary>
   /// The upstream's own ETag for a probed object's bytes, or null when none was recorded - an upstream
@@ -428,9 +497,11 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
   /// via a metadata-only self-copy. CopyObject onto the same key is only legal with
   /// <see cref="S3MetadataDirective.REPLACE"/>, so the existing content type, content encoding and
   /// user metadata (read off the probe response) are re-applied to preserve them; only "created-at"
-  /// is bumped to now.
+  /// is bumped to now. With a retention the tag is re-applied too, so a prefix whose policy changed
+  /// moves its objects to the new lifecycle rule as they are revalidated; without one the copy keeps
+  /// whatever tags the object has (the default COPY directive), exactly as before.
   /// </summary>
-  private async Task TouchStoredDateAsync(string s3Key, GetObjectResponse probe, CancellationToken cancellationToken)
+  private async Task TouchStoredDateAsync(string s3Key, GetObjectResponse probe, RetentionPolicy? retention, CancellationToken cancellationToken)
   {
     var copy = new CopyObjectRequest
     {
@@ -448,6 +519,11 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
     foreach (var key in probe.Metadata.Keys)
       copy.Metadata[key] = probe.Metadata[key];
     copy.Metadata[CreatedAtMetadataKey] = timeProvider.GetUtcNow().ToString("O", CultureInfo.InvariantCulture);
+    if (RetentionTags(retention) is { } tags)
+    {
+      copy.TaggingDirective = TaggingDirective.REPLACE;
+      copy.TagSet = tags;
+    }
 
     await amazonS3.CopyObjectAsync(copy, cancellationToken);
   }
@@ -459,7 +535,8 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
   /// SDK gets a real length and does not buffer the whole body in memory. An object too big for a
   /// single PUT goes out as a multipart upload instead (S3Config.MultipartThresholdBytes).
   /// </summary>
-  private async Task<long> StoreInBucketAsync(string s3Key, Uri requestUri, HttpResponseMessage response, CancellationToken cancellationToken)
+  private async Task<long> StoreInBucketAsync(string s3Key, Uri requestUri, HttpResponseMessage response,
+    RetentionPolicy? retention, CancellationToken cancellationToken)
   {
     await using var body = await response.Content.ReadAsStreamAsync(cancellationToken);
     var contentLength = response.Content.Headers.ContentLength;
@@ -483,7 +560,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
       if (contentLength.Value >= config.S3!.MultipartThresholdBytes)
       {
         await StoreInBucketMultipartAsync(s3Key, requestUri, response, uploadStream, contentLength.Value,
-          relayTo: null, cancellationToken);
+          relayTo: null, retention, cancellationToken);
         return contentLength.Value;
       }
 
@@ -493,6 +570,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
         Key = s3Key,
         Headers = { ContentLength = contentLength.Value },
         InputStream = uploadStream,
+        TagSet = RetentionTags(retention),
       };
       ApplyObjectMetadata(put.Headers, put.Metadata, requestUri, response);
 
@@ -521,7 +599,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
   /// a new problem, but decoupling the relay from the upload is the follow-up.
   /// </summary>
   private async Task StreamAndStoreAsync(HttpContext context, string s3Key, Uri requestUri,
-    HttpResponseMessage response, CachingRule? rule)
+    HttpResponseMessage response, CachingRule? rule, RetentionPolicy? retention)
   {
     var contentLength = response.Content.Headers.ContentLength!.Value;
 
@@ -531,7 +609,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
 
     await using var body = await response.Content.ReadAsStreamAsync(context.RequestAborted);
     await StoreInBucketMultipartAsync(s3Key, requestUri, response, body, contentLength,
-      relayTo: context.Response.Body, context.RequestAborted);
+      relayTo: context.Response.Body, retention, context.RequestAborted);
 
     // Exactly contentLength bytes reached the client: the parts loop reads with ReadExactlyAsync, so an
     // upstream that ends early throws there rather than completing a short body. The head declared that
@@ -546,12 +624,15 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
   /// <paramref name="relayTo"/> is set, each part is also written there as it is uploaded.
   /// </summary>
   private async Task StoreInBucketMultipartAsync(string s3Key, Uri requestUri, HttpResponseMessage response,
-    Stream body, long contentLength, Stream? relayTo, CancellationToken cancellationToken)
+    Stream body, long contentLength, Stream? relayTo, RetentionPolicy? retention, CancellationToken cancellationToken)
   {
+    // Tags go on the initiate request: CompleteMultipartUpload takes none, and the object it assembles
+    // carries what the upload was initiated with.
     var initiate = new InitiateMultipartUploadRequest
     {
       BucketName = config.S3!.BucketName,
       Key = s3Key,
+      TagSet = RetentionTags(retention),
     };
     ApplyObjectMetadata(initiate.Headers, initiate.Metadata, requestUri, response);
 

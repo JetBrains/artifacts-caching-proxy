@@ -58,19 +58,19 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   private TestServer CreateServer(bool signedLinks, TimeSpan? signedLinkTTL = null, int inlineThresholdBytes = TestInlineThresholdBytes,
     CacheDuration? distributedCacheDuration = null, TimeSpan? refreshAfter = null, CacheDuration? prefixCacheDuration = null,
     bool varyByAccept = false, long? multipartThresholdBytes = null, int? multipartPartSizeBytes = null,
-    string? publicUrl = null)
+    string? publicUrl = null, string? retention = null)
   {
     // When a freshness window is requested, drive it through a profile with a catch-all rule (so every
     // /real path is revalidated after the window) — mirroring how the disk tests exercise revalidation.
     var profiles = new Dictionary<string, CachingProfile>();
-    CachingProxyPrefix prefix = new($"/real={upstreamServer.Url}", prefixCacheDuration);
+    CachingProxyPrefix prefix = new($"/real={upstreamServer.Url}", prefixCacheDuration, Retention: retention);
     if (refreshAfter != null || varyByAccept || publicUrl != null)
     {
       profiles["fresh"] = new CachingProfile
       {
         Rules = [new CachingRule { Pattern = ".", RefreshAfter = refreshAfter, VaryByAccept = varyByAccept, RewriteUrls = publicUrl != null }]
       };
-      prefix = new CachingProxyPrefix($"/real={upstreamServer.Url}", prefixCacheDuration, Profile: "fresh");
+      prefix = new CachingProxyPrefix($"/real={upstreamServer.Url}", prefixCacheDuration, Profile: "fresh", Retention: retention);
     }
 
     var config = new CachingProxyConfig
@@ -320,6 +320,144 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
       response.Headers.GetValues(CachingProxyConstants.CachedUntilHeader).Single(), "R", CultureInfo.InvariantCulture);
     // "R" truncates to the second, so the reported instant can sit just under the window's start.
     Assert.InRange(until, before + window - TimeSpan.FromSeconds(1), after + window);
+  }
+
+  [Theory]
+  [InlineData("1d")]
+  [InlineData("3d")]
+  [InlineData("30d")]
+  [InlineData("180d")]
+  [InlineData("1y")]
+  public async Task Upload_Is_Tagged_With_The_Prefix_Retention(string retention)
+  {
+    // MRI-5689: the bucket's lifecycle rules filter on this tag, so it is what makes the object expire.
+    var server = CreateServer(signedLinks: false, retention: retention);
+
+    using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
+
+    Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
+    Assert.Equal(new Dictionary<string, string> { ["retention"] = retention }, myS3.Tags[GetPathKey("/real/a.jar")]);
+  }
+
+  [Fact]
+  public async Task Upload_Without_A_Retention_Is_Untagged()
+  {
+    // Left to the bucket's default rule, like every object stored before retention existed.
+    var server = CreateServer(signedLinks: false);
+
+    using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
+
+    Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
+    Assert.Empty(myS3.Tags[GetPathKey("/real/a.jar")]);
+  }
+
+  [Fact]
+  public async Task Multipart_Upload_Is_Tagged_At_Initiate()
+  {
+    // CompleteMultipartUpload takes no tags: the object gets the ones the upload was initiated with.
+    var server = CreateServer(signedLinks: false, multipartThresholdBytes: 9, multipartPartSizeBytes: 4, retention: "3d");
+
+    using var response = await server.CreateRequest("/real/sized.jar").SendAsync(HttpMethod.Get.Method);
+
+    Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    Assert.Equal(3, myS3.UploadPartCalls);
+    Assert.Equal(new Dictionary<string, string> { ["retention"] = "3d" }, myS3.Tags[GetPathKey("/real/sized.jar")]);
+  }
+
+  [Fact]
+  public async Task Revalidated_Object_Is_Retagged_With_The_Current_Retention()
+  {
+    // The 304 touch is a self-copy, which restarts the object's lifecycle: it carries the prefix's current tag.
+    var server = CreateServer(signedLinks: false, refreshAfter: TimeSpan.FromMinutes(1), retention: "30d");
+    var key = GetPathKey("/real/revalidate.txt");
+    myS3.Objects[key] = (ourLargeBody, "text/plain", "\"v1\"");
+    myS3.CreatedAt[key] = DateTimeOffset.UtcNow - TimeSpan.FromHours(1);
+    myS3.Tags[key] = new Dictionary<string, string> { ["retention"] = "3d" };
+    upstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.NotModified;
+
+    using var response = await server.CreateRequest("/real/revalidate.txt").SendAsync(HttpMethod.Get.Method);
+
+    AssertStatusHeader(response, CachingProxyStatus.REVALIDATED);
+    Assert.Equal(1, myS3.CopyObjectCalls);
+    Assert.Equal(new Dictionary<string, string> { ["retention"] = "30d" }, myS3.Tags[key]);
+  }
+
+  [Fact]
+  public async Task Cached_Redirect_Does_Not_Outlive_The_Object()
+  {
+    // A 3d object is linked to for 2 days after it was stored (a day's buffer ahead of lifecycle). With 30s of
+    // that left, the redirect is cached for 30s, not for the hour its status TTL allows: the proxy never sees
+    // the 404 a client gets for a deleted object, so the entry has to expire on its own.
+    var server = CreateServer(signedLinks: true, retention: "3d",
+      prefixCacheDuration: new CacheDuration { [HttpStatusCode.RedirectKeepVerb] = TimeSpan.FromHours(1) });
+    var key = GetPathKey("/real/a.jar");
+    myS3.Objects[key] = (ourLargeBody, "application/java-archive", null);
+    var timeLeft = TimeSpan.FromSeconds(30);
+    myS3.CreatedAt[key] = DateTimeOffset.UtcNow - TimeSpan.FromDays(2) + timeLeft;
+
+    var before = DateTimeOffset.UtcNow;
+    using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
+    var after = DateTimeOffset.UtcNow;
+
+    Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
+    AssertStatusHeader(response, CachingProxyStatus.MISS);
+    Assert.Equal(0, myS3.PutObjectCalls);
+    var until = DateTimeOffset.ParseExact(
+      response.Headers.GetValues(CachingProxyConstants.CachedUntilHeader).Single(), "R", CultureInfo.InvariantCulture);
+    Assert.InRange(until, before + timeLeft - TimeSpan.FromSeconds(2), after + timeLeft);
+  }
+
+  [Fact]
+  public async Task Fresh_Redirect_Is_Capped_At_The_Link_Lifetime()
+  {
+    // A 1d object gets a half-day buffer instead of a whole day, which would leave no time to link to it at all.
+    var server = CreateServer(signedLinks: true, retention: "1d",
+      prefixCacheDuration: new CacheDuration { [HttpStatusCode.RedirectKeepVerb] = TimeSpan.FromDays(7) });
+
+    var before = DateTimeOffset.UtcNow;
+    using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
+    var after = DateTimeOffset.UtcNow;
+
+    Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
+    var until = DateTimeOffset.ParseExact(
+      response.Headers.GetValues(CachingProxyConstants.CachedUntilHeader).Single(), "R", CultureInfo.InvariantCulture);
+    Assert.InRange(until, before + TimeSpan.FromHours(12) - TimeSpan.FromSeconds(1), after + TimeSpan.FromHours(12));
+  }
+
+  [Fact]
+  public async Task Object_Due_For_Lifecycle_Expiry_Is_Refetched_Instead_Of_Linked()
+  {
+    // Past its link lifetime S3 may delete the object before the client follows the redirect, so it reads as
+    // missing: fetched from the upstream and stored again, which restarts its lifecycle and keeps its tag.
+    var server = CreateServer(signedLinks: false, retention: "3d");
+    var key = GetPathKey("/real/a.jar");
+    myS3.Objects[key] = (ourLargeBody, "application/java-archive", null);
+    myS3.CreatedAt[key] = DateTimeOffset.UtcNow - TimeSpan.FromDays(2) - TimeSpan.FromMinutes(1);
+
+    using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
+
+    Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
+    AssertStatusHeader(response, CachingProxyStatus.MISS);
+    Assert.Equal(1, myS3.PutObjectCalls);
+    Assert.Equal("a.jar".Length, myS3.Objects[key].Body.Length);
+    Assert.InRange(myS3.CreatedAt[key], DateTimeOffset.UtcNow - TimeSpan.FromMinutes(1), DateTimeOffset.UtcNow);
+    Assert.Equal(new Dictionary<string, string> { ["retention"] = "3d" }, myS3.Tags[key]);
+  }
+
+  [Theory]
+  [InlineData(2, 0)]   // well inside the bucket's default 365 days: linked as before
+  [InlineData(365, 1)] // due under the default rule: refetched
+  public async Task Object_Without_A_Retention_Expires_On_The_Bucket_Default(int ageDays, int expectedPuts)
+  {
+    var server = CreateServer(signedLinks: false);
+    var key = GetPathKey("/real/a.jar");
+    myS3.Objects[key] = (ourLargeBody, "application/java-archive", null);
+    myS3.CreatedAt[key] = DateTimeOffset.UtcNow - TimeSpan.FromDays(ageDays);
+
+    using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
+
+    Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
+    Assert.Equal(expectedPuts, myS3.PutObjectCalls);
   }
 
   [Fact]
@@ -1484,6 +1622,9 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     public readonly Dictionary<string, DateTimeOffset?> UpstreamLastModified = new();
     // The "rewritten" user-metadata, keyed by object key.
     public readonly Dictionary<string, string?> Rewritten = new();
+    // The object tags, keyed by object key: written by PutObject, by the multipart initiate (through its
+    // completion) and by a CopyObject that replaces them; an untagged object has an empty set.
+    public readonly Dictionary<string, Dictionary<string, string>> Tags = new();
     // S3 existence probes via the ranged GetObject prefetch.
     public int GetObjectCalls;
     public int PutObjectCalls;
@@ -1589,7 +1730,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
 
       using var ms = new MemoryStream();
       await request.InputStream.CopyToAsync(ms, cancellationToken);
-      Store(request.Key, ms.ToArray(), request.Headers, request.Metadata);
+      Store(request.Key, ms.ToArray(), request.Headers, request.Metadata, request.TagSet);
       return new PutObjectResponse { HttpStatusCode = HttpStatusCode.OK };
     }
 
@@ -1634,7 +1775,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
       // lists them out of order has to show up as a wrong body rather than as a silent success.
       var ordered = request.PartETags.Select(tag => upload.Parts[tag.PartNumber!.Value]).ToList();
       CompletedPartSizes = ordered.Select(static part => part.Length).ToList();
-      Store(request.Key, ordered.SelectMany(static part => part).ToArray(), upload.Request.Headers, upload.Request.Metadata);
+      Store(request.Key, ordered.SelectMany(static part => part).ToArray(), upload.Request.Headers, upload.Request.Metadata, upload.Request.TagSet);
       myMultipartUploads.Remove(request.UploadId);
       return Task.FromResult(new CompleteMultipartUploadResponse { HttpStatusCode = HttpStatusCode.OK });
     }
@@ -1648,9 +1789,10 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
 
     // Shared by the single-PUT and the multipart completion, so a test cannot tell the two apart by the
     // object they leave behind - which is the point of the multipart path.
-    private void Store(string key, byte[] body, HeadersCollection headers, MetadataCollection metadata)
+    private void Store(string key, byte[] body, HeadersCollection headers, MetadataCollection metadata, List<Tag>? tags)
     {
       Objects[key] = (body, headers.ContentType, null);
+      Tags[key] = (tags ?? []).ToDictionary(static tag => tag.Key, static tag => tag.Value);
       PutObjectUris[key] = metadata["uri"];
       Digests[key] = metadata[CachedResponse.DockerContentDigestMetadataKey];
       UpstreamETags[key] = metadata["upstream-etag"];
@@ -1669,6 +1811,8 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
       UpstreamETags[request.DestinationKey] = request.Metadata["upstream-etag"];
       UpstreamLastModified[request.DestinationKey] = ParseMetadataDate(request.Metadata["upstream-last-modified"]);
       Rewritten[request.DestinationKey] = request.Metadata[CachedResponse.RewrittenMetadataKey];
+      if (request.TaggingDirective == TaggingDirective.REPLACE)
+        Tags[request.DestinationKey] = (request.TagSet ?? []).ToDictionary(static tag => tag.Key, static tag => tag.Value);
       if (request.Metadata["created-at"] is { } createdAt)
         CreatedAt[request.DestinationKey] = DateTimeOffset.Parse(createdAt);
       return Task.FromResult(new CopyObjectResponse { HttpStatusCode = HttpStatusCode.OK });
