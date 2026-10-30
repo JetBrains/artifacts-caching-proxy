@@ -1165,6 +1165,34 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   }
 
   [Fact]
+  public async Task Stale_Object_Expired_During_Revalidation_Is_Fetched_And_Re_Stored()
+  {
+    // The probe finds the object and the upstream answers 304, but the lifecycle rule expires it while that
+    // round-trip is in flight, so the touch finds no source (404). The artifact is still upstream: fetch
+    // and re-store it like any miss instead of answering 503.
+    var server = CreateServer(signedLinks: false, refreshAfter: TimeSpan.FromMinutes(1));
+    var key = GetPathKey("/real/revalidate.txt");
+    myS3.Objects[key] = ([.. "v1"u8], "text/plain", "\"v1\"");
+    myS3.CreatedAt[key] = DateTimeOffset.UtcNow - TimeSpan.FromHours(1); // stale
+    upstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.NotModified;
+    upstreamServer.RevalidateContent = "v1";
+    myS3.BeforeCopyObject = () =>
+    {
+      myS3.Objects.Remove(key);
+      // The route answers 304 to any request in this mode; the re-fetch that follows is unconditional.
+      upstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.Ok;
+    };
+
+    using var response = await server.CreateRequest("/real/revalidate.txt").SendAsync(HttpMethod.Get.Method);
+
+    Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
+    AssertStatusHeader(response, CachingProxyStatus.MISS);
+    Assert.Equal(1, myS3.CopyObjectCalls);
+    Assert.Equal(1, myS3.PutObjectCalls);
+    Assert.Equal("v1", Encoding.UTF8.GetString(myS3.Objects[key].Body));
+  }
+
+  [Fact]
   public async Task Stored_Object_Records_The_Upstream_ETag()
   {
     // A MISS records the upstream's validator as user metadata. S3 assigns the object its own ETag (a
@@ -1568,6 +1596,8 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     public int GetObjectCalls;
     public int PutObjectCalls;
     public int CopyObjectCalls;
+    // Runs at the start of CopyObjectAsync: lets a test have the lifecycle rule expire the source mid-request.
+    public Action? BeforeCopyObject;
     public int DeleteObjectCalls;
     public int UploadPartCalls;
     public int AbortMultipartUploadCalls;
@@ -1745,6 +1775,13 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     public override Task<CopyObjectResponse> CopyObjectAsync(CopyObjectRequest request, CancellationToken cancellationToken = default)
     {
       Interlocked.Increment(ref CopyObjectCalls);
+      BeforeCopyObject?.Invoke();
+      // As S3 answers a copy whose source is gone.
+      if (!Objects.ContainsKey(request.SourceKey))
+        throw new AmazonS3Exception("The specified key does not exist.")
+        {
+          ErrorCode = "NoSuchKey", StatusCode = HttpStatusCode.NotFound,
+        };
       // Assigned unconditionally: the copy re-applies the whole metadata set, so a key it drops must
       // read back as dropped rather than as its stale value.
       UpstreamETags[request.DestinationKey] = request.Metadata["upstream-etag"];
