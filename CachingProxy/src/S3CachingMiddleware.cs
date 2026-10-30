@@ -201,8 +201,11 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
 
             case RevalidationOutcome.NotModified:
               // Still valid: bump the stored date (a metadata-only self-copy) so the window restarts,
-              // then serve the object we already probed.
-              await TouchStoredDateAsync(s3Key, s3Object, retention, context.RequestAborted);
+              // then serve the object we already probed. Unless it is gone by now: the lifecycle rule can
+              // expire it while the revalidation is in flight, and the copy then finds no source. The
+              // artifact is still upstream, so fetch and re-store it like any miss rather than answer 503.
+              if (!await TouchStoredDateAsync(s3Key, s3Object, retention, context.RequestAborted))
+                goto fetchUpstream;
               probeStatus = CachingProxyStatus.REVALIDATED;
               break;
 
@@ -260,6 +263,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
       // No head yet for the body: whether this request streams it or replaces the response with a
       // redirect is decided below, from a size only the upstream head can tell us, and the head has to
       // match that decision.
+      fetchUpstream:
       using var response = await remoteProxy.ProcessAsync(context, s3Key, remoteServer.CacheDuration, upstreamUri,
         auth: remoteServer.Auth, rule: rule, profile: remoteServer.Profile, writeBodyHead: false);
 
@@ -456,8 +460,9 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
   /// is bumped to now. With a retention the tag is re-applied too, so a prefix whose policy changed
   /// moves its objects to the new lifecycle rule as they are revalidated; without one the copy keeps
   /// whatever tags the object has (the default COPY directive), exactly as before.
+  /// Returns false when the object is no longer in the bucket (the copy source answered 404).
   /// </summary>
-  private async Task TouchStoredDateAsync(string s3Key, GetObjectResponse probe, RetentionPolicy? retention, CancellationToken cancellationToken)
+  private async Task<bool> TouchStoredDateAsync(string s3Key, GetObjectResponse probe, RetentionPolicy? retention, CancellationToken cancellationToken)
   {
     var copy = new CopyObjectRequest
     {
@@ -481,7 +486,15 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
       copy.TagSet = tags;
     }
 
-    await amazonS3.CopyObjectAsync(copy, cancellationToken);
+    try
+    {
+      await amazonS3.CopyObjectAsync(copy, cancellationToken);
+      return true;
+    }
+    catch (AmazonServiceException ex) when (ex.StatusCode is HttpStatusCode.NotFound)
+    {
+      return false;
+    }
   }
 
   /// <summary>
