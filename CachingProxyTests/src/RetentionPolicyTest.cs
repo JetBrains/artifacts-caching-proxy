@@ -40,14 +40,6 @@ public class RetentionPolicyTest : IDisposable
   public void No_Value_Is_No_Policy(string? value) => Assert.Null(RetentionPolicy.Parse(value));
 
   [Theory]
-  [InlineData("1d", 12)]     // half the period: a whole day's buffer would leave nothing
-  [InlineData("3d", 48)]
-  [InlineData("30d", 29 * 24)]
-  [InlineData("1y", 364 * 24)]
-  public void Link_Lifetime_Leaves_A_Buffer_Before_Lifecycle_Expiry(string value, int hours) =>
-    Assert.Equal(TimeSpan.FromHours(hours), RetentionPolicy.Parse(value)!.LinkLifetime);
-
-  [Theory]
   [InlineData("2d")]
   [InlineData("7d")]
   [InlineData("365d")]

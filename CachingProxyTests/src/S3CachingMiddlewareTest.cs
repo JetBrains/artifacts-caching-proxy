@@ -383,81 +383,20 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   }
 
   [Fact]
-  public async Task Cached_Redirect_Does_Not_Outlive_The_Object()
+  public async Task Object_Near_Its_Retention_Is_Still_Linked()
   {
-    // A 3d object is linked to for 2 days after it was stored (a day's buffer ahead of lifecycle). With 30s of
-    // that left, the redirect is cached for 30s, not for the hour its status TTL allows: the proxy never sees
-    // the 404 a client gets for a deleted object, so the entry has to expire on its own.
-    var server = CreateServer(signedLinks: true, retention: "3d",
-      prefixCacheDuration: new CacheDuration { [HttpStatusCode.RedirectKeepVerb] = TimeSpan.FromHours(1) });
+    // The proxy does not expire links ahead of S3 lifecycle: a signed link lives SignedLinkTTL (an hour at
+    // most) while lifecycle deletes a day or more after the retention date, so the object is linked as is.
+    var server = CreateServer(signedLinks: false, retention: "3d");
     var key = GetPathKey("/real/a.jar");
     myS3.Objects[key] = (ourLargeBody, "application/java-archive", null);
-    var timeLeft = TimeSpan.FromSeconds(30);
-    myS3.CreatedAt[key] = DateTimeOffset.UtcNow - TimeSpan.FromDays(2) + timeLeft;
+    myS3.CreatedAt[key] = DateTimeOffset.UtcNow - TimeSpan.FromDays(3) + TimeSpan.FromMinutes(1);
 
-    var before = DateTimeOffset.UtcNow;
     using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
-    var after = DateTimeOffset.UtcNow;
 
     Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
     AssertStatusHeader(response, CachingProxyStatus.MISS);
     Assert.Equal(0, myS3.PutObjectCalls);
-    var until = DateTimeOffset.ParseExact(
-      response.Headers.GetValues(CachingProxyConstants.CachedUntilHeader).Single(), "R", CultureInfo.InvariantCulture);
-    Assert.InRange(until, before + timeLeft - TimeSpan.FromSeconds(2), after + timeLeft);
-  }
-
-  [Fact]
-  public async Task Fresh_Redirect_Is_Capped_At_The_Link_Lifetime()
-  {
-    // A 1d object gets a half-day buffer instead of a whole day, which would leave no time to link to it at all.
-    var server = CreateServer(signedLinks: true, retention: "1d",
-      prefixCacheDuration: new CacheDuration { [HttpStatusCode.RedirectKeepVerb] = TimeSpan.FromDays(7) });
-
-    var before = DateTimeOffset.UtcNow;
-    using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
-    var after = DateTimeOffset.UtcNow;
-
-    Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
-    var until = DateTimeOffset.ParseExact(
-      response.Headers.GetValues(CachingProxyConstants.CachedUntilHeader).Single(), "R", CultureInfo.InvariantCulture);
-    Assert.InRange(until, before + TimeSpan.FromHours(12) - TimeSpan.FromSeconds(1), after + TimeSpan.FromHours(12));
-  }
-
-  [Fact]
-  public async Task Object_Due_For_Lifecycle_Expiry_Is_Refetched_Instead_Of_Linked()
-  {
-    // Past its link lifetime S3 may delete the object before the client follows the redirect, so it reads as
-    // missing: fetched from the upstream and stored again, which restarts its lifecycle and keeps its tag.
-    var server = CreateServer(signedLinks: false, retention: "3d");
-    var key = GetPathKey("/real/a.jar");
-    myS3.Objects[key] = (ourLargeBody, "application/java-archive", null);
-    myS3.CreatedAt[key] = DateTimeOffset.UtcNow - TimeSpan.FromDays(2) - TimeSpan.FromMinutes(1);
-
-    using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
-
-    Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
-    AssertStatusHeader(response, CachingProxyStatus.MISS);
-    Assert.Equal(1, myS3.PutObjectCalls);
-    Assert.Equal("a.jar".Length, myS3.Objects[key].Body.Length);
-    Assert.InRange(myS3.CreatedAt[key], DateTimeOffset.UtcNow - TimeSpan.FromMinutes(1), DateTimeOffset.UtcNow);
-    Assert.Equal(new Dictionary<string, string> { ["retention"] = "3d" }, myS3.Tags[key]);
-  }
-
-  [Theory]
-  [InlineData(2, 0)]   // well inside the bucket's default 365 days: linked as before
-  [InlineData(365, 1)] // due under the default rule: refetched
-  public async Task Object_Without_A_Retention_Expires_On_The_Bucket_Default(int ageDays, int expectedPuts)
-  {
-    var server = CreateServer(signedLinks: false);
-    var key = GetPathKey("/real/a.jar");
-    myS3.Objects[key] = (ourLargeBody, "application/java-archive", null);
-    myS3.CreatedAt[key] = DateTimeOffset.UtcNow - TimeSpan.FromDays(ageDays);
-
-    using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
-
-    Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
-    Assert.Equal(expectedPuts, myS3.PutObjectCalls);
   }
 
   [Fact]

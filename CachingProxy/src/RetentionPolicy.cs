@@ -31,11 +31,6 @@ public sealed record RetentionPolicy
   /// </summary>
   public static RetentionPolicy S3Default => OneYear;
 
-  // How far ahead of a lifecycle deletion a redirect to the object stops being handed out: a day, as S3
-  // only promises to expire "on or after" the date and the proxy never sees the client's 404 to notice.
-  // Halved for the 1d policy, where a full day would leave no window in which a link is safe to cache.
-  private static readonly TimeSpan ourMaxLinkBuffer = TimeSpan.FromDays(1);
-
   private RetentionPolicy(string name, TimeSpan period)
   {
     Name = name;
@@ -46,12 +41,6 @@ public sealed record RetentionPolicy
   public string Name { get; }
 
   public TimeSpan Period { get; }
-
-  /// <summary>
-  /// How long after an object was stored a link to it may still be handed out: <see cref="Period"/>
-  /// less a buffer of one day (half the period for <see cref="OneDay"/>) before S3 lifecycle may delete it.
-  /// </summary>
-  public TimeSpan LinkLifetime => Period - (Period / 2 < ourMaxLinkBuffer ? Period / 2 : ourMaxLinkBuffer);
 
   /// <summary>Null for no value (no policy); throws for a value outside the fixed set, so startup fails.</summary>
   public static RetentionPolicy? Parse(string? value)
