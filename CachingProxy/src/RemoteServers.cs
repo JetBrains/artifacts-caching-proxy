@@ -48,12 +48,13 @@ public partial class RemoteServers : EndpointDataSource
         // label - which Prometheus reads as no label at all, forking a series off the "none" bucket.
         ProfileName = profile == null ? null : prefix.Profile,
         DefaultNamespace = prefix.DefaultNamespace,
+        Retention = ParseRetention(prefix),
         UrlRewrite = publicUri == null ? null
           : new UpstreamUrlRewrite(remoteUri, publicUri, OtherRoots(config.Prefixes, parsed, i, publicUrl!)),
       };
 
-      logger.LogInformation("RemoteServer: {Prefix} -> {RemoteUri}, Auth: {Auth}, Profile: {Profile}, PublicUrl: {PublicUrl}",
-        remoteServer.Prefix, remoteServer.RemoteUri, remoteServer.Auth, prefix.Profile, publicUri);
+      logger.LogInformation("RemoteServer: {Prefix} -> {RemoteUri}, Auth: {Auth}, Profile: {Profile}, PublicUrl: {PublicUrl}, Retention: {Retention}",
+        remoteServer.Prefix, remoteServer.RemoteUri, remoteServer.Auth, prefix.Profile, publicUri, remoteServer.Retention);
       // A matched entry with no credential is what a half-configured secret looks like: the prefix is gated
       // inbound, so it looks configured, while the upstream is reached anonymously - and an OCI upstream
       // mints its registry token anonymously too, which a private repository answers with a bare 403.
@@ -123,6 +124,19 @@ public partial class RemoteServers : EndpointDataSource
     if (!OurOciPathComponent.IsMatch(prefix.DefaultNamespace))
       throw new ArgumentException(
         $"Prefix '{prefix}' has a DefaultNamespace that is not a single OCI path component.");
+  }
+
+  // An unknown value has no lifecycle rule, so its objects would never expire.
+  private static RetentionPolicy? ParseRetention(CachingProxyPrefix prefix)
+  {
+    try
+    {
+      return RetentionPolicy.Parse(prefix.Retention);
+    }
+    catch (ArgumentException e)
+    {
+      throw new ArgumentException($"Prefix '{prefix}': {e.Message}", e);
+    }
   }
 
   private readonly record struct ParsedPrefix(
@@ -255,6 +269,9 @@ public partial class RemoteServers : EndpointDataSource
     /// for a prefix that declares none. See <see cref="WithDefaultNamespace"/>.
     /// </summary>
     public string? DefaultNamespace { get; init; }
+
+    /// <summary>Null keeps the global cleanup and leaves S3 objects untagged.</summary>
+    public RetentionPolicy? Retention { get; init; }
 
     /// <summary>The rewrite of this prefix's upstream root to its public URL, or null for a prefix without one.</summary>
     public UpstreamUrlRewrite? UrlRewrite { get; init; }
