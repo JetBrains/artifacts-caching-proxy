@@ -5,12 +5,8 @@ using System.Linq;
 namespace JetBrains.CachingProxy;
 
 /// <summary>
-/// How long a prefix's stored copies are kept (MRI-5689), set per prefix by <see cref="CachingProxyPrefix.Retention"/>.
-/// Only a fixed set, because on S3 every value is a bucket lifecycle rule filtered on the
-/// <see cref="TagKey"/> object tag: a value without a matching rule would be tagged and never expire.
-/// <para>A prefix without one keeps what it has today: on disk the global
-/// <see cref="CachingProxyConfig.CleanupPeriod"/>, on S3 no tag at all, so the bucket's own default rule
-/// (<see cref="S3Default"/>) covers it just like every object stored before the tag existed.</para>
+/// Per-prefix retention (MRI-5689). A fixed set: each value needs a matching S3 lifecycle rule on the
+/// <see cref="TagKey"/> tag, or tagged objects never expire.
 /// </summary>
 public sealed record RetentionPolicy
 {
@@ -25,10 +21,7 @@ public sealed record RetentionPolicy
 
   public static IReadOnlyList<RetentionPolicy> All { get; } = [OneDay, ThreeDays, ThirtyDays, HalfYear, OneYear];
 
-  /// <summary>
-  /// The bucket's untagged default expiration, which applies to every object without a
-  /// <see cref="TagKey"/> tag - including all objects stored before retention existed.
-  /// </summary>
+  /// <summary>The bucket's default expiration for untagged objects.</summary>
   public static RetentionPolicy S3Default => OneYear;
 
   private RetentionPolicy(string name, TimeSpan period)
@@ -37,12 +30,12 @@ public sealed record RetentionPolicy
     Period = period;
   }
 
-  /// <summary>The configured spelling, which is also the S3 tag value and the disk metadata value.</summary>
+  /// <summary>Config value, S3 tag value and disk metadata value.</summary>
   public string Name { get; }
 
   public TimeSpan Period { get; }
 
-  /// <summary>Null for no value (no policy); throws for a value outside the fixed set, so startup fails.</summary>
+  /// <summary>Null for no value; throws for an unknown one.</summary>
   public static RetentionPolicy? Parse(string? value)
   {
     if (string.IsNullOrWhiteSpace(value)) return null;

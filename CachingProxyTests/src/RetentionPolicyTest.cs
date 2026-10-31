@@ -13,7 +13,6 @@ using Xunit;
 
 namespace JetBrains.CachingProxy.Tests;
 
-/// <summary>MRI-5689: per-prefix retention - its configuration, the disk metadata field and the disk cleanup.</summary>
 public class RetentionPolicyTest : IDisposable
 {
   private readonly List<string> myTempDirectories = [];
@@ -109,7 +108,6 @@ public class RetentionPolicyTest : IDisposable
     var timeProvider = new FakeTimeProvider(DateTimeOffset.UtcNow);
     var now = timeProvider.GetUtcNow().UtcDateTime;
 
-    // CleanupPeriod is 7 days below.
     var shortPolicyExpired = Store(cachePath, "short-expired.zip", now - TimeSpan.FromDays(5), RetentionPolicy.ThreeDays);
     var shortPolicyKept = Store(cachePath, "short-kept.zip", now - TimeSpan.FromDays(2), RetentionPolicy.ThreeDays);
     var longPolicyKept = Store(cachePath, "long-kept.jar", now - TimeSpan.FromDays(30), RetentionPolicy.OneYear);
@@ -149,7 +147,6 @@ public class RetentionPolicyTest : IDisposable
     Assert.True(File.Exists(shortPolicyKept));
     Assert.True(File.Exists(longPolicyKept));
     Assert.True(File.Exists(noPolicyKept));
-    // The layout is unchanged: the policy lives in the companion metadata file next to the kept file.
     Assert.True(File.Exists(CacheFileProvider.GetMetadataPath(longPolicyKept)));
   }
 

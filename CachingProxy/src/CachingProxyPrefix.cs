@@ -7,9 +7,7 @@ namespace JetBrains.CachingProxy;
 /// left to do it. Null - no expansion - for every other prefix.
 /// </param>
 /// <param name="Retention">
-/// How long this prefix's stored copies are kept (MRI-5689): one of the <see cref="RetentionPolicy"/> names
-/// (1d, 3d, 30d, 180d, 1y); anything else fails startup. Null keeps the global behaviour - the disk's
-/// <see cref="CachingProxyConfig.CleanupPeriod"/>, and on S3 untagged objects under the bucket's default rule.
+/// A <see cref="RetentionPolicy"/> name; null keeps the global cleanup.
 /// </param>
 public record CachingProxyPrefix(
   string Prefix,
