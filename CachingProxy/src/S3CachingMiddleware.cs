@@ -101,9 +101,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
     // the 307's or 200's status TTL rather than its 5 minutes. Null for an immutable path: no window, no cap.
     var maxCacheDuration = rule?.RefreshAfter;
 
-    // MRI-5689: the prefix's retention, applied as an object tag on every write so the bucket lifecycle
-    // rule for it expires the object. A link handed out is signed for SignedLinkTTL at most, far less than
-    // any retention, so cached link entries need no extra cap for it.
+    // Tagged on every write; the bucket lifecycle rule for the tag expires the object.
     var retention = remoteServer.Retention;
 
     // A content-negotiated endpoint keeps one object per requested representation (see GetCacheVariant),
@@ -201,9 +199,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
 
             case RevalidationOutcome.NotModified:
               // Still valid: bump the stored date (a metadata-only self-copy) so the window restarts,
-              // then serve the object we already probed. Unless it is gone by now: the lifecycle rule can
-              // expire it while the revalidation is in flight, and the copy then finds no source. The
-              // artifact is still upstream, so fetch and re-store it like any miss rather than answer 503.
+              // then serve the object we already probed. If lifecycle expired it meanwhile, fetch it as a miss.
               if (!await TouchStoredDateAsync(s3Key, s3Object, retention, context.RequestAborted))
                 goto fetchUpstream;
               probeStatus = CachingProxyStatus.REVALIDATED;
@@ -412,11 +408,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
     }
   }
 
-  /// <summary>
-  /// The object tags for a prefix's retention, which the bucket lifecycle rules filter on - or null for
-  /// none, leaving the object untagged under the bucket's default rule like every object stored before
-  /// retention existed.
-  /// </summary>
+  /// <summary>Null leaves the object untagged, under the bucket's default rule.</summary>
   private static List<Tag>? RetentionTags(RetentionPolicy? retention) =>
     retention == null ? null : [new Tag { Key = RetentionPolicy.TagKey, Value = retention.Name }];
 
@@ -457,10 +449,8 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
   /// via a metadata-only self-copy. CopyObject onto the same key is only legal with
   /// <see cref="S3MetadataDirective.REPLACE"/>, so the existing content type, content encoding and
   /// user metadata (read off the probe response) are re-applied to preserve them; only "created-at"
-  /// is bumped to now. With a retention the tag is re-applied too, so a prefix whose policy changed
-  /// moves its objects to the new lifecycle rule as they are revalidated; without one the copy keeps
-  /// whatever tags the object has (the default COPY directive), exactly as before.
-  /// Returns false when the object is no longer in the bucket (the copy source answered 404).
+  /// is bumped to now. A retention re-applies its tag; without one the existing tags are kept.
+  /// Returns false when the object is gone.
   /// </summary>
   private async Task<bool> TouchStoredDateAsync(string s3Key, GetObjectResponse probe, RetentionPolicy? retention, CancellationToken cancellationToken)
   {
@@ -595,8 +585,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
   private async Task StoreInBucketMultipartAsync(string s3Key, Uri requestUri, HttpResponseMessage response,
     Stream body, long contentLength, Stream? relayTo, RetentionPolicy? retention, CancellationToken cancellationToken)
   {
-    // Tags go on the initiate request: CompleteMultipartUpload takes none, and the object it assembles
-    // carries what the upload was initiated with.
+    // CompleteMultipartUpload takes no tags.
     var initiate = new InitiateMultipartUploadRequest
     {
       BucketName = config.S3!.BucketName,

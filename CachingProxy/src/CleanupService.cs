@@ -99,8 +99,7 @@ public class CleanupService(TimeProvider timeProvider, CachingProxyConfig config
 
     var nowUtc = timeProvider.GetUtcNow();
     var cutoffUtc = nowUtc - config.CleanupPeriod;
-    // A file accessed more recently than the shortest period any policy can set is kept whatever its
-    // metadata says, so the steady-state walk reads no metadata for the hot part of the cache.
+    // Recently accessed files are kept under any policy: skip reading their metadata.
     var shortestPeriod = RetentionPolicy.All.Min(static p => p.Period);
     var keepAllAfterUtc = nowUtc - (config.CleanupPeriod < shortestPeriod ? config.CleanupPeriod : shortestPeriod);
     logger.LogInformation("File cleanup started. Deleted files older than {Cutoff}", cutoffUtc);
@@ -168,8 +167,6 @@ public class CleanupService(TimeProvider timeProvider, CachingProxyConfig config
 
     return Task.CompletedTask;
 
-    // The prefix's retention recorded in the file's metadata (MRI-5689) replaces CleanupPeriod; a file
-    // whose metadata has none - or that has no readable metadata at all - keeps the global period.
     DateTimeOffset CutoffFor(string filePath) =>
       ReadRetention(filePath) is { } retention ? nowUtc - retention.Period : cutoffUtc;
 

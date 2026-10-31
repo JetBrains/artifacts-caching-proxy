@@ -186,8 +186,8 @@ public class CachingProxy
     switch (result.Outcome)
     {
       case RevalidationOutcome.NotModified:
-        // Still valid: restart the window, keeping the head the stored bytes were fetched under. The
-        // retention is the prefix's current one, so a policy change reaches copies as they are touched.
+        // Still valid: restart the window, keeping the head the stored bytes were fetched under, with the
+        // prefix's current retention.
         await WriteMetadataAsync(cachedFile.FullName, metadata with { StoredAtUtc = UtcNow, Retention = remoteServer.Retention });
         await ServeFileAsync(context, cachedFile, metadata, contentEncoding, CachingProxyStatus.REVALIDATED, rule);
         return;

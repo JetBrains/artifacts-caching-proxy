@@ -22,9 +22,7 @@ namespace JetBrains.CachingProxy;
 /// </summary>
 /// <param name="RewrittenETag">Our ETag for a body <see cref="UpstreamUrlRewrite"/> changed, served in place of
 /// the upstream's validators; <see cref="ETag"/> and <see cref="LastModified"/> then serve revalidation only.</param>
-/// <param name="Retention">The prefix's <see cref="RetentionPolicy"/> when the copy was stored (MRI-5689), which
-/// <see cref="CleanupService"/> keeps the file for in place of the global CleanupPeriod. Null - absent from the
-/// file, as in every file written before it existed - keeps that global period.</param>
+/// <param name="Retention">Overrides the global CleanupPeriod for this file; null keeps it.</param>
 public sealed record CacheEntryMetadata(
   DateTime StoredAtUtc,
   string? ContentType = null,
@@ -104,8 +102,7 @@ public sealed record CacheEntryMetadata(
           parsed : null;
       else if (Is(name, CachedResponse.DockerContentDigestHeader)) digest = value;
       else if (Is(name, RewrittenETagField)) rewrittenETag = value;
-      // A value this version does not know (one a later version added, say) reads as no policy, so the
-      // file falls back to the global CleanupPeriod rather than to whatever a guess would make of it.
+      // An unknown value reads as none, i.e. the global CleanupPeriod.
       else if (Is(name, RetentionField)) retention = RetentionPolicy.TryParse(value, out var policy) ? policy : null;
     }
 

@@ -126,8 +126,7 @@ public partial class RemoteServers : EndpointDataSource
         $"Prefix '{prefix}' has a DefaultNamespace that is not a single OCI path component.");
   }
 
-  // Outside the fixed set there is no bucket lifecycle rule to match the tag, so the objects would never
-  // expire: refuse to start rather than discover that from the bill.
+  // An unknown value has no lifecycle rule, so its objects would never expire.
   private static RetentionPolicy? ParseRetention(CachingProxyPrefix prefix)
   {
     try
@@ -271,10 +270,7 @@ public partial class RemoteServers : EndpointDataSource
     /// </summary>
     public string? DefaultNamespace { get; init; }
 
-    /// <summary>
-    /// The prefix's explicit <see cref="CachingProxyPrefix.Retention"/>, or null for none - which keeps the
-    /// global cleanup on disk and leaves its S3 objects untagged, under the bucket's default rule.
-    /// </summary>
+    /// <summary>Null keeps the global cleanup and leaves S3 objects untagged.</summary>
     public RetentionPolicy? Retention { get; init; }
 
     /// <summary>The rewrite of this prefix's upstream root to its public URL, or null for a prefix without one.</summary>

@@ -330,7 +330,6 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   [InlineData("1y")]
   public async Task Upload_Is_Tagged_With_The_Prefix_Retention(string retention)
   {
-    // MRI-5689: the bucket's lifecycle rules filter on this tag, so it is what makes the object expire.
     var server = CreateServer(signedLinks: false, retention: retention);
 
     using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
@@ -342,7 +341,6 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   [Fact]
   public async Task Upload_Without_A_Retention_Is_Untagged()
   {
-    // Left to the bucket's default rule, like every object stored before retention existed.
     var server = CreateServer(signedLinks: false);
 
     using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
@@ -354,7 +352,6 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   [Fact]
   public async Task Multipart_Upload_Is_Tagged_At_Initiate()
   {
-    // CompleteMultipartUpload takes no tags: the object gets the ones the upload was initiated with.
     var server = CreateServer(signedLinks: false, multipartThresholdBytes: 9, multipartPartSizeBytes: 4, retention: "3d");
 
     using var response = await server.CreateRequest("/real/sized.jar").SendAsync(HttpMethod.Get.Method);
@@ -367,7 +364,6 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   [Fact]
   public async Task Revalidated_Object_Is_Retagged_With_The_Current_Retention()
   {
-    // The 304 touch is a self-copy, which restarts the object's lifecycle: it carries the prefix's current tag.
     var server = CreateServer(signedLinks: false, refreshAfter: TimeSpan.FromMinutes(1), retention: "30d");
     var key = GetPathKey("/real/revalidate.txt");
     myS3.Objects[key] = (ourLargeBody, "text/plain", "\"v1\"");
@@ -385,8 +381,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   [Fact]
   public async Task Object_Near_Its_Retention_Is_Still_Linked()
   {
-    // The proxy does not expire links ahead of S3 lifecycle: a signed link lives SignedLinkTTL (an hour at
-    // most) while lifecycle deletes a day or more after the retention date, so the object is linked as is.
+    // A signed link lives far shorter than lifecycle's grace, so no early expiry.
     var server = CreateServer(signedLinks: false, retention: "3d");
     var key = GetPathKey("/real/a.jar");
     myS3.Objects[key] = (ourLargeBody, "application/java-archive", null);
@@ -1167,9 +1162,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   [Fact]
   public async Task Stale_Object_Expired_During_Revalidation_Is_Fetched_And_Re_Stored()
   {
-    // The probe finds the object and the upstream answers 304, but the lifecycle rule expires it while that
-    // round-trip is in flight, so the touch finds no source (404). The artifact is still upstream: fetch
-    // and re-store it like any miss instead of answering 503.
+    // Lifecycle deletes the object between the 304 and the touch.
     var server = CreateServer(signedLinks: false, refreshAfter: TimeSpan.FromMinutes(1));
     var key = GetPathKey("/real/revalidate.txt");
     myS3.Objects[key] = ([.. "v1"u8], "text/plain", "\"v1\"");
@@ -1179,7 +1172,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     myS3.BeforeCopyObject = () =>
     {
       myS3.Objects.Remove(key);
-      // The route answers 304 to any request in this mode; the re-fetch that follows is unconditional.
+      // NotModified mode would answer 304 even to the unconditional re-fetch.
       upstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.Ok;
     };
 
@@ -1589,14 +1582,13 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     public readonly Dictionary<string, DateTimeOffset?> UpstreamLastModified = new();
     // The "rewritten" user-metadata, keyed by object key.
     public readonly Dictionary<string, string?> Rewritten = new();
-    // The object tags, keyed by object key: written by PutObject, by the multipart initiate (through its
-    // completion) and by a CopyObject that replaces them; an untagged object has an empty set.
+    // The object tags, keyed by object key; empty when untagged.
     public readonly Dictionary<string, Dictionary<string, string>> Tags = new();
     // S3 existence probes via the ranged GetObject prefetch.
     public int GetObjectCalls;
     public int PutObjectCalls;
     public int CopyObjectCalls;
-    // Runs at the start of CopyObjectAsync: lets a test have the lifecycle rule expire the source mid-request.
+    // Runs at the start of CopyObjectAsync.
     public Action? BeforeCopyObject;
     public int DeleteObjectCalls;
     public int UploadPartCalls;

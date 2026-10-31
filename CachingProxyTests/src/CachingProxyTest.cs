@@ -1972,8 +1972,6 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
   [Fact]
   public async Task Prefix_Retention_Is_Recorded_In_The_Metadata_File()
   {
-    // MRI-5689: the policy goes into the companion metadata file CleanupService reads, so the cache layout
-    // stays as it is; a prefix without one records none and stays on the global CleanupPeriod.
     myUpstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.Ok;
     myUpstreamServer.RevalidateContent = "v1";
 
