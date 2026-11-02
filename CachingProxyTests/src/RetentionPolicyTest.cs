@@ -32,6 +32,18 @@ public class RetentionPolicyTest : IDisposable
     Assert.Equal(TimeSpan.FromDays(days), policy.Period);
   }
 
+  [Fact]
+  public void Values_Match_Cache_Redirector()
+  {
+    // Copied in Cache-Redirector: the Kotlin `Retention` enum (config-gen) and the data bucket lifecycle
+    // rules (`data_bucket.tf`). A change here needs both.
+    Assert.Equal(
+      [("1d", 1), ("3d", 3), ("30d", 30), ("180d", 180), ("1y", 365)],
+      RetentionPolicy.All.Select(static p => (p.Name, (int)p.Period.TotalDays)));
+    // `data_bucket_default_expiration_days`.
+    Assert.Equal(TimeSpan.FromDays(365), RetentionPolicy.S3Default.Period);
+  }
+
   [Theory]
   [InlineData(null)]
   [InlineData("")]
