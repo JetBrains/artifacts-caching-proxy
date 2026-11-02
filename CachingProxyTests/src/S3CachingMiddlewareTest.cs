@@ -59,7 +59,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   private TestServer CreateServer(bool signedLinks, TimeSpan? signedLinkTTL = null, int inlineThresholdBytes = TestInlineThresholdBytes,
     CacheDuration? distributedCacheDuration = null, TimeSpan? refreshAfter = null, CacheDuration? prefixCacheDuration = null,
     bool varyByAccept = false, long? multipartThresholdBytes = null, int? multipartPartSizeBytes = null,
-    string? publicUrl = null, string? retention = null, TimeProvider? timeProvider = null)
+    string? publicUrl = null, string? retention = null, TimeProvider? timeProvider = null, string? storageClass = null)
   {
     // When a freshness window is requested, drive it through a profile with a catch-all rule (so every
     // /real path is revalidated after the window) — mirroring how the disk tests exercise revalidation.
@@ -84,6 +84,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
         // reachable in a test by lowering the threshold to the size of a test body.
         MultipartThresholdBytes = multipartThresholdBytes ?? DefaultS3Config.MultipartThresholdBytes,
         MultipartPartSizeBytes = multipartPartSizeBytes ?? DefaultS3Config.MultipartPartSizeBytes,
+        StorageClass = storageClass,
       },
       DistributedCacheDuration = distributedCacheDuration ?? new CacheDuration(),
       CachingProfiles = profiles,
@@ -351,6 +352,30 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
 
     Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
     Assert.Empty(myS3.Tags[GetPathKey("/real/a.jar")]);
+  }
+
+  [Theory]
+  [InlineData(null)]
+  [InlineData("INTELLIGENT_TIERING")]
+  public async Task Every_Write_Sets_The_Configured_Storage_Class(string? storageClass)
+  {
+    var server = CreateServer(signedLinks: false, multipartThresholdBytes: 9, multipartPartSizeBytes: 4,
+      refreshAfter: TimeSpan.FromMinutes(1), storageClass: storageClass);
+    var revalidated = GetPathKey("/real/revalidate.txt");
+    myS3.Objects[revalidated] = (ourLargeBody, "text/plain", "\"v1\"");
+    myS3.CreatedAt[revalidated] = DateTimeOffset.UtcNow - TimeSpan.FromHours(1);
+    upstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.NotModified;
+
+    using (await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method)) { }        // PutObject
+    using (await server.CreateRequest("/real/sized.jar").SendAsync(HttpMethod.Get.Method)) { }    // multipart
+    using (await server.CreateRequest("/real/revalidate.txt").SendAsync(HttpMethod.Get.Method)) { } // self-copy
+
+    Assert.Equal(1, myS3.PutObjectCalls);
+    Assert.True(myS3.UploadPartCalls > 0);
+    Assert.Equal(1, myS3.CopyObjectCalls);
+    Assert.Equal(storageClass, myS3.StorageClasses[GetPathKey("/real/a.jar")]);
+    Assert.Equal(storageClass, myS3.StorageClasses[GetPathKey("/real/sized.jar")]);
+    Assert.Equal(storageClass, myS3.StorageClasses[revalidated]);
   }
 
   [Fact]
@@ -1652,6 +1677,8 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     public readonly Dictionary<string, string?> Rewritten = new();
     // The object tags, keyed by object key; empty when untagged.
     public readonly Dictionary<string, Dictionary<string, string>> Tags = new();
+    // The storage class each write asked for, keyed by object key; null for none (STANDARD).
+    public readonly Dictionary<string, string?> StorageClasses = new();
     // S3 existence probes via the ranged GetObject prefetch.
     public int GetObjectCalls;
     public int PutObjectCalls;
@@ -1761,7 +1788,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
 
       using var ms = new MemoryStream();
       await request.InputStream.CopyToAsync(ms, cancellationToken);
-      Store(request.Key, ms.ToArray(), request.Headers, request.Metadata, request.TagSet);
+      Store(request.Key, ms.ToArray(), request.Headers, request.Metadata, request.TagSet, request.StorageClass);
       return new PutObjectResponse { HttpStatusCode = HttpStatusCode.OK };
     }
 
@@ -1806,7 +1833,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
       // lists them out of order has to show up as a wrong body rather than as a silent success.
       var ordered = request.PartETags.Select(tag => upload.Parts[tag.PartNumber!.Value]).ToList();
       CompletedPartSizes = ordered.Select(static part => part.Length).ToList();
-      Store(request.Key, ordered.SelectMany(static part => part).ToArray(), upload.Request.Headers, upload.Request.Metadata, upload.Request.TagSet);
+      Store(request.Key, ordered.SelectMany(static part => part).ToArray(), upload.Request.Headers, upload.Request.Metadata, upload.Request.TagSet, upload.Request.StorageClass);
       myMultipartUploads.Remove(request.UploadId);
       return Task.FromResult(new CompleteMultipartUploadResponse { HttpStatusCode = HttpStatusCode.OK });
     }
@@ -1820,10 +1847,12 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
 
     // Shared by the single-PUT and the multipart completion, so a test cannot tell the two apart by the
     // object they leave behind - which is the point of the multipart path.
-    private void Store(string key, byte[] body, HeadersCollection headers, MetadataCollection metadata, List<Tag>? tags)
+    private void Store(string key, byte[] body, HeadersCollection headers, MetadataCollection metadata, List<Tag>? tags,
+      S3StorageClass? storageClass)
     {
       Objects[key] = (body, headers.ContentType, null);
       Tags[key] = (tags ?? []).ToDictionary(static tag => tag.Key, static tag => tag.Value);
+      StorageClasses[key] = storageClass?.Value;
       PutObjectUris[key] = metadata["uri"];
       Digests[key] = metadata[CachedResponse.DockerContentDigestMetadataKey];
       UpstreamETags[key] = metadata["upstream-etag"];
@@ -1851,6 +1880,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
       Rewritten[request.DestinationKey] = request.Metadata[CachedResponse.RewrittenMetadataKey];
       if (request.TaggingDirective == TaggingDirective.REPLACE)
         Tags[request.DestinationKey] = (request.TagSet ?? []).ToDictionary(static tag => tag.Key, static tag => tag.Value);
+      StorageClasses[request.DestinationKey] = request.StorageClass?.Value;
       if (request.Metadata["created-at"] is { } createdAt)
         CreatedAt[request.DestinationKey] = DateTimeOffset.Parse(createdAt);
       return Task.FromResult(new CopyObjectResponse { HttpStatusCode = HttpStatusCode.OK });

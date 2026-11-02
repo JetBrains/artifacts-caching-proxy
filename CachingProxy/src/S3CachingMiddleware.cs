@@ -50,6 +50,10 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
   // when S3.BucketName is set (see Program.ConfigureOurApp).
   private readonly ByteRange myPrefetchSize = new(0, config.S3!.InlineThresholdBytes - 1);
 
+  // Null sends none.
+  private readonly S3StorageClass? myStorageClass =
+    config.S3!.StorageClass is { Length: > 0 } storageClass ? S3StorageClass.FindValue(storageClass) : null;
+
   // Single-flight coalescing of S3 misses, partitioned by the object key's "aa/bb" prefix (see
   // ManglePath) rather than by the full key. Each prefix-partition is a single-permit concurrency
   // limiter, so at most one request per prefix probes/fetches/uploads at a time while the rest wait
@@ -493,6 +497,8 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
       SourceKey = s3Key,
       DestinationBucket = config.S3!.BucketName,
       DestinationKey = s3Key,
+      // A copy without one lands in STANDARD, whatever the source's.
+      StorageClass = myStorageClass,
       MetadataDirective = S3MetadataDirective.REPLACE,
       ContentType = probe.Headers.ContentType,
       Headers =
@@ -560,6 +566,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
         Headers = { ContentLength = contentLength.Value },
         InputStream = uploadStream,
         TagSet = RetentionTags(retention),
+        StorageClass = myStorageClass,
       };
       ApplyObjectMetadata(put.Headers, put.Metadata, requestUri, response);
 
@@ -621,6 +628,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
       BucketName = config.S3!.BucketName,
       Key = s3Key,
       TagSet = RetentionTags(retention),
+      StorageClass = myStorageClass,
     };
     ApplyObjectMetadata(initiate.Headers, initiate.Metadata, requestUri, response);
 
