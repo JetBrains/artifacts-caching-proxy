@@ -22,7 +22,8 @@ namespace JetBrains.CachingProxy;
 /// </summary>
 /// <param name="RewrittenETag">Our ETag for a body <see cref="UpstreamUrlRewrite"/> changed, served in place of
 /// the upstream's validators; <see cref="ETag"/> and <see cref="LastModified"/> then serve revalidation only.</param>
-/// <param name="Retention">Overrides the global CleanupPeriod for this file; null keeps it.</param>
+/// <param name="Retention">Cleanup also deletes the file this long after <see cref="StoredAtUtc"/>, idle or
+/// not; null leaves it to the global CleanupPeriod alone.</param>
 public sealed record CacheEntryMetadata(
   DateTime StoredAtUtc,
   string? ContentType = null,
