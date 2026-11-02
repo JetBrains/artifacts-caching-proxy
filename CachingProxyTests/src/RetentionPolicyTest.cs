@@ -127,9 +127,14 @@ public class RetentionPolicyTest : IDisposable
     var timeProvider = new FakeTimeProvider(DateTimeOffset.UtcNow);
     var now = timeProvider.GetUtcNow().UtcDateTime;
 
-    var shortPolicyExpired = Store(cachePath, "short-expired.zip", now - TimeSpan.FromDays(5), RetentionPolicy.ThreeDays);
+    // Retention counts from the stored time, as on S3, so a file in use still goes.
+    var shortPolicyExpired = Store(cachePath, "short-expired.zip", now - TimeSpan.FromDays(5), RetentionPolicy.ThreeDays,
+      lastAccessUtc: now - TimeSpan.FromHours(1));
     var shortPolicyKept = Store(cachePath, "short-kept.zip", now - TimeSpan.FromDays(2), RetentionPolicy.ThreeDays);
-    var longPolicyKept = Store(cachePath, "long-kept.jar", now - TimeSpan.FromDays(30), RetentionPolicy.OneYear);
+    var longPolicyKept = Store(cachePath, "long-kept.jar", now - TimeSpan.FromDays(30), RetentionPolicy.OneYear,
+      lastAccessUtc: now - TimeSpan.FromDays(1));
+    // Retention only shortens: idle past CleanupPeriod goes whatever the retention.
+    var longPolicyIdleExpired = Store(cachePath, "long-idle.jar", now - TimeSpan.FromDays(30), RetentionPolicy.OneYear);
     var noPolicyKept = Store(cachePath, "default-kept.jar", now - TimeSpan.FromDays(5), retention: null);
     var noPolicyExpired = Store(cachePath, "default-expired.jar", now - TimeSpan.FromDays(30), retention: null);
     var noMetadataExpired = Path.Combine(cachePath, "no-metadata.jar");
@@ -163,19 +168,23 @@ public class RetentionPolicyTest : IDisposable
     Assert.False(File.Exists(noMetadataExpired));
     Assert.False(File.Exists(shortPolicyExpired));
     Assert.False(File.Exists(noPolicyExpired));
+    Assert.False(File.Exists(longPolicyIdleExpired));
     Assert.True(File.Exists(shortPolicyKept));
     Assert.True(File.Exists(longPolicyKept));
     Assert.True(File.Exists(noPolicyKept));
     Assert.True(File.Exists(CacheFileProvider.GetMetadataPath(longPolicyKept)));
   }
 
-  private static string Store(string cachePath, string name, DateTime lastAccessUtc, RetentionPolicy? retention)
+  // Last accessed when stored unless given.
+  private static string Store(string cachePath, string name, DateTime storedAtUtc, RetentionPolicy? retention,
+    DateTime? lastAccessUtc = null)
   {
     var path = Path.Combine(cachePath, name);
     File.WriteAllBytes(path, new byte[10]);
     File.WriteAllText(CacheFileProvider.GetMetadataPath(path),
-      new CacheEntryMetadata(lastAccessUtc, Retention: retention).Format());
-    File.SetLastAccessTimeUtc(path, lastAccessUtc);
+      new CacheEntryMetadata(storedAtUtc, Retention: retention).Format());
+    File.SetLastWriteTimeUtc(path, storedAtUtc);
+    File.SetLastAccessTimeUtc(path, lastAccessUtc ?? storedAtUtc);
     return path;
   }
 

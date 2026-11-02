@@ -67,7 +67,9 @@ public class CleanupService(TimeProvider timeProvider, CachingProxyConfig config
           return;
         }
         await Task.Delay(to - from, timeProvider, stoppingToken);
-        await CleanupOnceAsync(stoppingToken);
+        // The walk is synchronous file I/O for its whole length: a dedicated thread, not a pool one.
+        await Task.Factory.StartNew(() => CleanupOnce(stoppingToken), stoppingToken,
+          TaskCreationOptions.LongRunning, TaskScheduler.Default);
       }
     }
     catch (OperationCanceledException) { }
@@ -88,20 +90,19 @@ public class CleanupService(TimeProvider timeProvider, CachingProxyConfig config
       yield return new Measurement<long>(value);
   }
 
-  private Task CleanupOnceAsync(CancellationToken cancellationToken)
+  private void CleanupOnce(CancellationToken cancellationToken)
   {
     var localCachePath = config.LocalCachePath;
     if (string.IsNullOrWhiteSpace(localCachePath) || !Directory.Exists(localCachePath))
     {
       logger.LogWarning("Cleanup root path '{RootPath}' does not exist", localCachePath);
-      return Task.CompletedTask;
+      return;
     }
 
     var nowUtc = timeProvider.GetUtcNow();
     var cutoffUtc = nowUtc - config.CleanupPeriod;
-    // Recently accessed files are kept under any policy: skip reading their metadata.
-    var shortestPeriod = RetentionPolicy.All.Min(static p => p.Period);
-    var keepAllAfterUtc = nowUtc - (config.CleanupPeriod < shortestPeriod ? config.CleanupPeriod : shortestPeriod);
+    // A file written since is within every retention: its metadata is not read.
+    var retentionFloorUtc = nowUtc - RetentionPolicy.All.Min(static p => p.Period);
     logger.LogInformation("File cleanup started. Deleted files older than {Cutoff}", cutoffUtc);
 
     var stopwatch = Stopwatch.StartNew();
@@ -133,8 +134,7 @@ public class CleanupService(TimeProvider timeProvider, CachingProxyConfig config
         continue;
       }
 
-      var lastAccessUtc = fileInfo.LastAccessTimeUtc;
-      if (lastAccessUtc < keepAllAfterUtc && lastAccessUtc < CutoffFor(filePath) && TryDelete(fileInfo))
+      if ((fileInfo.LastAccessTimeUtc < cutoffUtc || IsPastRetention(fileInfo)) && TryDelete(fileInfo))
         continue;
 
       CountKept(fileInfo);
@@ -165,10 +165,14 @@ public class CleanupService(TimeProvider timeProvider, CachingProxyConfig config
         cutoffUtc, durationSeconds);
     }
 
-    return Task.CompletedTask;
+    return;
 
-    DateTimeOffset CutoffFor(string filePath) =>
-      ReadRetention(filePath) is { } retention ? nowUtc - retention.Period : cutoffUtc;
+    // Counted from when the file was stored or last revalidated, as S3 lifecycle counts from the object's
+    // last write, so a busy file still goes. Only shortens: an idle file goes after CleanupPeriod regardless.
+    bool IsPastRetention(FileInfo file) =>
+      file.LastWriteTimeUtc < retentionFloorUtc &&
+      ReadMetadata(file.FullName) is { Retention: { } retention } metadata &&
+      metadata.StoredAtUtc < (nowUtc - retention.Period).UtcDateTime;
 
     bool TryDelete(FileInfo file)
     {
@@ -212,11 +216,11 @@ public class CleanupService(TimeProvider timeProvider, CachingProxyConfig config
     }
   }
 
-  private RetentionPolicy? ReadRetention(string cacheFilePath)
+  private CacheEntryMetadata? ReadMetadata(string cacheFilePath)
   {
     try
     {
-      return CacheEntryMetadata.TryParse(File.ReadAllText(CacheFileProvider.GetMetadataPath(cacheFilePath)))?.Retention;
+      return CacheEntryMetadata.TryParse(File.ReadAllText(CacheFileProvider.GetMetadataPath(cacheFilePath)));
     }
     catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
     {
