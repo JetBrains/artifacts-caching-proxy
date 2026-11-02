@@ -382,6 +382,23 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     Assert.Equal(new Dictionary<string, string> { ["retention"] = "30d" }, myS3.Tags[key]);
   }
 
+  [Fact]
+  public async Task Revalidated_Object_Loses_A_Retention_Its_Prefix_Dropped()
+  {
+    var server = CreateServer(signedLinks: false, refreshAfter: TimeSpan.FromMinutes(1));
+    var key = GetPathKey("/real/revalidate.txt");
+    myS3.Objects[key] = (ourLargeBody, "text/plain", "\"v1\"");
+    myS3.CreatedAt[key] = DateTimeOffset.UtcNow - TimeSpan.FromHours(1);
+    myS3.Tags[key] = new Dictionary<string, string> { ["retention"] = "1d" };
+    upstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.NotModified;
+
+    using var response = await server.CreateRequest("/real/revalidate.txt").SendAsync(HttpMethod.Get.Method);
+
+    AssertStatusHeader(response, CachingProxyStatus.REVALIDATED);
+    Assert.Equal(1, myS3.CopyObjectCalls);
+    Assert.Empty(myS3.Tags[key]);
+  }
+
   // A midnight UTC in the future, so a signed link minted against the fake clock is still valid.
   private static readonly DateTimeOffset ourLifecycleMidnight = new(DateTime.UtcNow.Date.AddDays(2), TimeSpan.Zero);
 

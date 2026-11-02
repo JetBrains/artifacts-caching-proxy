@@ -481,7 +481,8 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
   /// via a metadata-only self-copy. CopyObject onto the same key is only legal with
   /// <see cref="S3MetadataDirective.REPLACE"/>, so the existing content type, content encoding and
   /// user metadata (read off the probe response) are re-applied to preserve them; only "created-at"
-  /// is bumped to now. A retention re-applies its tag; without one the existing tags are kept.
+  /// is bumped to now. The tags are replaced too, with the prefix's current retention: copying them would
+  /// keep a retention the prefix has since dropped.
   /// Returns false when the object is gone.
   /// </summary>
   private async Task<bool> TouchStoredDateAsync(string s3Key, GetObjectResponse probe, RetentionPolicy? retention, CancellationToken cancellationToken)
@@ -502,11 +503,8 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
     foreach (var key in probe.Metadata.Keys)
       copy.Metadata[key] = probe.Metadata[key];
     copy.Metadata[CreatedAtMetadataKey] = timeProvider.GetUtcNow().ToString("O", CultureInfo.InvariantCulture);
-    if (RetentionTags(retention) is { } tags)
-    {
-      copy.TaggingDirective = TaggingDirective.REPLACE;
-      copy.TagSet = tags;
-    }
+    copy.TaggingDirective = TaggingDirective.REPLACE;
+    copy.TagSet = RetentionTags(retention);
 
     try
     {
