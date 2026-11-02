@@ -36,6 +36,10 @@ public class CachingProxyConfig
     // S3CachingMiddleware.PartSizeFor grows the part instead. S3 requires every part but the last to be
     // at least 5 MiB, so do not take this below that outside tests.
     public int MultipartPartSizeBytes { get; init; } = 16 * 1024 * 1024;
+
+    // Storage class every write sets (e.g. INTELLIGENT_TIERING), so no lifecycle transition is billed
+    // per object. Null leaves it to S3: STANDARD, also for the revalidation self-copy.
+    public string? StorageClass { get; init; }
   }
 
   public record RedisConfig(string? ConnectionString = null)
