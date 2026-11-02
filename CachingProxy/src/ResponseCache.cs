@@ -196,7 +196,8 @@ public class ResponseCache(IFusionCache cache, TimeProvider timeProvider, Cachin
   /// <summary>
   /// Stores a response head to be replayed for its status's <see cref="CacheDuration"/>.
   /// <para><paramref name="maxDuration"/> is the caller's freshness window (a matched
-  /// <see cref="CachingRule.RefreshAfter"/>) and caps every TTL below. A cached entry is replayed without
+  /// <see cref="CachingRule.RefreshAfter"/>), or how long the object a redirect points at outlives
+  /// S3 lifecycle, and caps every TTL below. A cached entry is replayed without
   /// consulting the storage layer, which is the only place a window is enforced, so an entry that outlives
   /// its window is served stale for the difference: an OCI manifest by tag (5 minutes) stored under a
   /// status TTL of an hour is an hour stale. Null for an immutable path, which has no window to respect.</para>

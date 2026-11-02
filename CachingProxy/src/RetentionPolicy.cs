@@ -6,7 +6,7 @@ namespace JetBrains.CachingProxy;
 
 /// <summary>
 /// Per-prefix retention (MRI-5689). A fixed set: each value needs a matching S3 lifecycle rule on the
-/// <see cref="TagKey"/> tag, or tagged objects never expire.
+/// <see cref="TagKey"/> tag, or tagged objects fall back to <see cref="S3Default"/>.
 /// </summary>
 public sealed record RetentionPolicy
 {
@@ -21,8 +21,25 @@ public sealed record RetentionPolicy
 
   public static IReadOnlyList<RetentionPolicy> All { get; } = [OneDay, ThreeDays, ThirtyDays, HalfYear, OneYear];
 
-  /// <summary>The bucket's default expiration for untagged objects.</summary>
+  /// <summary>
+  /// The bucket's catch-all expiration, which applies to tagged objects too: S3 takes the shortest
+  /// matching rule. Must match `data_bucket_default_expiration_days` in Cache-Redirector.
+  /// </summary>
   public static RetentionPolicy S3Default => OneYear;
+
+  /// <summary>
+  /// The earliest moment S3 lifecycle may delete an object created at <paramref name="createdAt"/>: the
+  /// shorter of <paramref name="retention"/> (null: untagged) and <see cref="S3Default"/>, rounded up to
+  /// midnight UTC as S3 does. The removal itself is asynchronous and may come later, never earlier.
+  /// https://docs.aws.amazon.com/AmazonS3/latest/userguide/intro-lifecycle-rules.html
+  /// </summary>
+  public static DateTimeOffset S3ExpiresAt(DateTimeOffset createdAt, RetentionPolicy? retention)
+  {
+    var period = retention != null && retention.Period < S3Default.Period ? retention.Period : S3Default.Period;
+    var due = (createdAt + period).ToUniversalTime();
+    var midnight = new DateTimeOffset(due.UtcDateTime.Date, TimeSpan.Zero);
+    return midnight == due ? midnight : midnight.AddDays(1);
+  }
 
   private RetentionPolicy(string name, TimeSpan period)
   {

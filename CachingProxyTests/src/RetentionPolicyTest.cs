@@ -39,6 +39,25 @@ public class RetentionPolicyTest : IDisposable
   public void No_Value_Is_No_Policy(string? value) => Assert.Null(RetentionPolicy.Parse(value));
 
   [Theory]
+  // S3 adds the days to the creation time and rounds up to the next midnight UTC.
+  [InlineData("2026-01-15T10:30:00Z", "3d", "2026-01-19T00:00:00Z")]
+  [InlineData("2026-01-15T23:59:59Z", "1d", "2026-01-17T00:00:00Z")]
+  // Already on midnight: kept, the earlier of the two readings.
+  [InlineData("2026-01-15T00:00:00Z", "1d", "2026-01-16T00:00:00Z")]
+  // Midnight is UTC's, whatever the offset the time comes in.
+  [InlineData("2026-01-15T23:30:00+02:00", "1d", "2026-01-17T00:00:00Z")]
+  // Untagged, or tagged longer than the catch-all rule: the catch-all.
+  [InlineData("2026-01-15T10:30:00Z", null, "2027-01-16T00:00:00Z")]
+  [InlineData("2026-01-15T10:30:00Z", "1y", "2027-01-16T00:00:00Z")]
+  public void S3_Expiry_Is_The_Shorter_Rule_Rounded_Up_To_Midnight_Utc(string created, string? retention, string expected)
+  {
+    var expiresAt = RetentionPolicy.S3ExpiresAt(DateTimeOffset.Parse(created), RetentionPolicy.Parse(retention));
+
+    Assert.Equal(DateTimeOffset.Parse(expected), expiresAt);
+    Assert.Equal(TimeSpan.Zero, expiresAt.Offset);
+  }
+
+  [Theory]
   [InlineData("2d")]
   [InlineData("7d")]
   [InlineData("365d")]
