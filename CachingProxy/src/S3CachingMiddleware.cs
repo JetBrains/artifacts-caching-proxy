@@ -103,6 +103,9 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
 
     // Tagged on every write; the bucket lifecycle rule for the tag expires the object.
     var retention = remoteServer.Retention;
+    // How long a redirect to the probed object may stay cached (see LinkTimeLeft). Null for an object this
+    // request wrote: its lifecycle has just restarted.
+    TimeSpan? linkTimeLeft = null;
 
     // A content-negotiated endpoint keeps one object per requested representation (see GetCacheVariant),
     // so the variant is folded into the object key — and thereby into the in-memory keys derived from it.
@@ -154,6 +157,17 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
       {
         using var s3Object = probed;
 
+        // Due for lifecycle expiry: store it afresh, which restarts its lifecycle, rather than link to it.
+        if (LinkTimeLeft(s3Object, retention) is { } timeLeft)
+        {
+          if (timeLeft <= TimeSpan.Zero)
+          {
+            logger.LogInformation("Object {S3Key} is due for lifecycle expiry, refetching it", s3Key);
+            goto fetchUpstream;
+          }
+          linkTimeLeft = timeLeft;
+        }
+
         // Past its freshness window? Revalidate against the upstream (a conditional GET on the
         // validators recorded for the stored bytes - see UpstreamETag and UpstreamLastModified) before
         // serving. The freshness clock is our own "created-at" metadata, and it also stands in for a
@@ -180,6 +194,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
               {
                 context.Response.Clear();
                 var freshContentLength = await StoreInBucketAsync(s3Key, upstreamUri, fresh, retention, context.RequestAborted);
+                linkTimeLeft = null;
                 // A HEAD is answered with the object's metadata and no body, so this re-upload delivered
                 // nothing to the client, however much it moved.
                 if (isHead)
@@ -202,6 +217,8 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
               // then serve the object we already probed. If lifecycle expired it meanwhile, fetch it as a miss.
               if (!await TouchStoredDateAsync(s3Key, s3Object, retention, context.RequestAborted))
                 goto fetchUpstream;
+              // The copy is a new object to lifecycle too.
+              linkTimeLeft = null;
               probeStatus = CachingProxyStatus.REVALIDATED;
               break;
 
@@ -260,6 +277,7 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
       // redirect is decided below, from a size only the upstream head can tell us, and the head has to
       // match that decision.
       fetchUpstream:
+      linkTimeLeft = null;
       using var response = await remoteProxy.ProcessAsync(context, s3Key, remoteServer.CacheDuration, upstreamUri,
         auth: remoteServer.Auth, rule: rule, profile: remoteServer.Profile, writeBodyHead: false);
 
@@ -383,8 +401,9 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
           contentLength.Value.ToString(CultureInfo.InvariantCulture);
       // Only a GET redirects (a HEAD is served from memory), so the redirect always belongs under the
       // verb-specific key and is never replayed to a HEAD.
+      var cap = linkTimeLeft is { } left && (maxCacheDuration is not { } max || left < max) ? left : maxCacheDuration;
       await remoteProxy.SetStatusAsync(context, status,
-        await responseCache.PutStatusCode(verbKey, cachingResponse, remoteServer.CacheDuration, context.RequestAborted, maxCacheDuration), rule);
+        await responseCache.PutStatusCode(verbKey, cachingResponse, remoteServer.CacheDuration, context.RequestAborted, cap), rule);
     }
   }
 
@@ -407,6 +426,19 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
       return null;
     }
   }
+
+  /// <summary>
+  /// How long a redirect to a probed object may still be cached. S3 lifecycle deletes the object without
+  /// telling us, and a cached redirect keeps sending clients to it, each with a link valid for
+  /// SignedLinkTTL more. So: until lifecycle may delete it, less SignedLinkTTL. S3's LastModified is the
+  /// lifecycle clock, restarted by every PutObject and CopyObject. Null when S3 sent none.
+  /// The prefix's current retention stands in for the object's tag, which the probe does not return.
+  /// </summary>
+  private TimeSpan? LinkTimeLeft(GetObjectResponse s3Object, RetentionPolicy? retention) =>
+    s3Object.LastModified is { } lastModified
+      ? RetentionPolicy.S3ExpiresAt(new DateTimeOffset(lastModified.ToUniversalTime()), retention)
+        - config.S3!.SignedLinkTTL - timeProvider.GetUtcNow()
+      : null;
 
   /// <summary>Null leaves the object untagged, under the bucket's default rule.</summary>
   private static List<Tag>? RetentionTags(RetentionPolicy? retention) =>

@@ -22,6 +22,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Time.Testing;
 using Xunit;
 using ZiggyCreatures.Caching.Fusion;
 using ZiggyCreatures.Caching.Fusion.Serialization.CysharpMemoryPack;
@@ -58,7 +59,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   private TestServer CreateServer(bool signedLinks, TimeSpan? signedLinkTTL = null, int inlineThresholdBytes = TestInlineThresholdBytes,
     CacheDuration? distributedCacheDuration = null, TimeSpan? refreshAfter = null, CacheDuration? prefixCacheDuration = null,
     bool varyByAccept = false, long? multipartThresholdBytes = null, int? multipartPartSizeBytes = null,
-    string? publicUrl = null, string? retention = null)
+    string? publicUrl = null, string? retention = null, TimeProvider? timeProvider = null)
   {
     // When a freshness window is requested, drive it through a profile with a catch-all rule (so every
     // /real path is revalidated after the window) — mirroring how the disk tests exercise revalidation.
@@ -107,6 +108,9 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
             // Real system clock: the signed-link path lets the real client compute the presigned
             // URL, whose Expires must be in the future (no test here advances time).
               .Replace(ServiceDescriptor.Singleton<IAmazonS3>(myS3));
+            // Lifecycle expiry falls on midnight UTC, so a test placing "now" near it sets the clock.
+            if (timeProvider != null)
+              services.Replace(ServiceDescriptor.Singleton(timeProvider));
 
             // Opt-in L2: wire an in-memory distributed cache so HasDistributedCache is true and the
             // DistributedCacheDuration TTLs actually apply, without needing a real Redis (Program only
@@ -378,21 +382,68 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     Assert.Equal(new Dictionary<string, string> { ["retention"] = "30d" }, myS3.Tags[key]);
   }
 
+  // A midnight UTC in the future, so a signed link minted against the fake clock is still valid.
+  private static readonly DateTimeOffset ourLifecycleMidnight = new(DateTime.UtcNow.Date.AddDays(2), TimeSpan.Zero);
+
   [Fact]
-  public async Task Object_Near_Its_Retention_Is_Still_Linked()
+  public async Task Redirect_To_An_Object_Well_Within_Its_Retention_Is_Cached_For_The_Status_Ttl()
   {
-    // A signed link lives far shorter than lifecycle's grace, so no early expiry.
-    var server = CreateServer(signedLinks: false, retention: "3d");
+    var now = ourLifecycleMidnight - TimeSpan.FromHours(12);
+    var server = CreateServer(signedLinks: false, retention: "3d", timeProvider: new FakeTimeProvider(now),
+      prefixCacheDuration: new CacheDuration { [HttpStatusCode.RedirectKeepVerb] = TimeSpan.FromHours(1) });
     var key = GetPathKey("/real/a.jar");
     myS3.Objects[key] = (ourLargeBody, "application/java-archive", null);
-    myS3.CreatedAt[key] = DateTimeOffset.UtcNow - TimeSpan.FromDays(3) + TimeSpan.FromMinutes(1);
+    myS3.CreatedAt[key] = now - TimeSpan.FromDays(1);
 
     using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
 
     Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
     AssertStatusHeader(response, CachingProxyStatus.MISS);
+    AssertCachedUntil(response, now + TimeSpan.FromHours(1));
     Assert.Equal(0, myS3.PutObjectCalls);
   }
+
+  [Fact]
+  public async Task Redirect_Is_Not_Cached_Past_The_Objects_Lifecycle_Expiry()
+  {
+    // Lifecycle may delete it at midnight, 30 minutes from now. The last replay of the redirect mints a
+    // link valid SignedLinkTTL (10 minutes) more, so the redirect is kept for 20 minutes, not the hour.
+    var now = ourLifecycleMidnight - TimeSpan.FromMinutes(30);
+    var server = CreateServer(signedLinks: false, retention: "3d", timeProvider: new FakeTimeProvider(now),
+      prefixCacheDuration: new CacheDuration { [HttpStatusCode.RedirectKeepVerb] = TimeSpan.FromHours(1) });
+    var key = GetPathKey("/real/a.jar");
+    myS3.Objects[key] = (ourLargeBody, "application/java-archive", null);
+    myS3.CreatedAt[key] = now - TimeSpan.FromDays(3);
+
+    using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
+
+    Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
+    AssertStatusHeader(response, CachingProxyStatus.MISS);
+    AssertCachedUntil(response, now + TimeSpan.FromMinutes(20));
+    Assert.Equal(0, myS3.PutObjectCalls);
+  }
+
+  [Fact]
+  public async Task Object_Due_For_Lifecycle_Expiry_Is_Refetched_Instead_Of_Linked()
+  {
+    // Midnight is 5 minutes away, closer than SignedLinkTTL: a link handed out now could outlive the object.
+    var now = ourLifecycleMidnight - TimeSpan.FromMinutes(5);
+    var server = CreateServer(signedLinks: false, retention: "3d", timeProvider: new FakeTimeProvider(now));
+    var key = GetPathKey("/real/a.jar");
+    myS3.Objects[key] = (ourLargeBody, "application/java-archive", null);
+    myS3.CreatedAt[key] = now - TimeSpan.FromDays(3);
+
+    using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
+
+    Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
+    AssertStatusHeader(response, CachingProxyStatus.MISS);
+    Assert.Equal(1, myS3.PutObjectCalls);
+    Assert.Equal(now, myS3.CreatedAt[key]); // lifecycle restarted
+    Assert.Equal(new Dictionary<string, string> { ["retention"] = "3d" }, myS3.Tags[key]);
+  }
+
+  private static void AssertCachedUntil(HttpResponseMessage response, DateTimeOffset expected) =>
+    Assert.Equal(expected.ToString("R"), response.Headers.GetValues(CachingProxyConstants.CachedUntilHeader).Single());
 
   [Fact]
   public async Task Content_Metric_Counts_The_Bytes_A_Redirect_Sends_A_Client_To_Fetch()
@@ -1662,10 +1713,12 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
         ContentLength = length,
         ContentRange = $"bytes {start}-{lastIndex}/{total}",
         ETag = obj.ETag,
-        LastModified = DateTime.UtcNow,
       };
       response.Headers.ContentType = obj.ContentType;
-      if (CreatedAt.TryGetValue(request.Key, out var createdAt))
+      // Every PutObject and CopyObject sets both, so they move together.
+      var hasCreatedAt = CreatedAt.TryGetValue(request.Key, out var createdAt);
+      response.LastModified = hasCreatedAt ? createdAt.UtcDateTime : DateTime.UtcNow;
+      if (hasCreatedAt)
         response.Metadata["created-at"] = createdAt.ToString("O");
       if (Digests.GetValueOrDefault(request.Key) is { } digest)
         response.Metadata[CachedResponse.DockerContentDigestMetadataKey] = digest;
