@@ -54,8 +54,8 @@ public static class AuthExtensions
     foreach (var (name, auth) in configuration.Get<CachingProxyConfig>()?.UpstreamAuth ?? [])
     {
       // CodeArtifact mode: the token is minted on demand by CodeArtifactTokenProvider, so only the shape is
-      // checked. Keys on any other entry would be sent nowhere, which is a misplaced secret, not a mode.
-      if (auth.IsCodeArtifact || !string.IsNullOrEmpty(auth.AwsAccessKeyId) || !string.IsNullOrEmpty(auth.AwsSecretAccessKey))
+      // checked.
+      if (auth.IsCodeArtifact)
       {
         ValidateCodeArtifact(name, auth);
         continue;
@@ -147,10 +147,7 @@ public static class AuthExtensions
     var domains = auth.UrlPrefixes.Select(CodeArtifactDomain.FromUrlPrefix).ToArray();
     if (domains.Any(static domain => domain == null))
       throw new ArgumentException(
-        auth.IsCodeArtifact
-          ? $"UpstreamAuth '{name}' mixes CodeArtifact endpoints with other UrlPrefixes. An entry authenticates one way only."
-          : $"UpstreamAuth '{name}' sets AwsAccessKeyId/AwsSecretAccessKey but its UrlPrefixes are not CodeArtifact " +
-            "endpoints (<domain>-<owner>.d.codeartifact.<region>.amazonaws.com), so the keys would be sent nowhere.");
+        $"UpstreamAuth '{name}' mixes CodeArtifact endpoints with other UrlPrefixes. An entry authenticates one way only.");
     if (domains.Distinct().Count() > 1)
       throw new ArgumentException(
         $"UpstreamAuth '{name}' spans CodeArtifact domains {string.Join(", ", domains.Distinct())}. Use one entry per domain.");
@@ -158,12 +155,6 @@ public static class AuthExtensions
         !string.IsNullOrEmpty(auth.Password) || !string.IsNullOrEmpty(auth.PrivateKey))
       throw new ArgumentException(
         $"UpstreamAuth '{name}' mixes CodeArtifact with ClientId/Username/Password/PrivateKey. An entry authenticates one way only.");
-    // Half a key pair is what an unresolved secret reference looks like; left alone it would quietly fall
-    // back to the default chain, which off AWS has no identity at all.
-    if (string.IsNullOrEmpty(auth.AwsAccessKeyId) != string.IsNullOrEmpty(auth.AwsSecretAccessKey))
-      throw new ArgumentException(
-        $"UpstreamAuth '{name}' sets only one of AwsAccessKeyId/AwsSecretAccessKey. Set both, or neither to use " +
-        "the default AWS credential chain.");
   }
 
   /// <summary>

@@ -36,7 +36,7 @@ public sealed class UpstreamAuthorizationProvider(
     {
       if (codeArtifactTokenProvider == null)
         return null;
-      var codeArtifactToken = await codeArtifactTokenProvider.GetTokenAsync(auth, domain, ct);
+      var codeArtifactToken = await codeArtifactTokenProvider.GetTokenAsync(domain, ct);
       return new BasicAuthenticationHeaderValue("aws", codeArtifactToken);
     }
 

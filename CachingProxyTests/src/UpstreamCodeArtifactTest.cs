@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using Amazon.Runtime;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -14,8 +13,8 @@ using Xunit;
 
 namespace JetBrains.CachingProxy.Tests;
 
-// CodeArtifact mode: the endpoint host names the domain, an AWS identity mints the token. Covers host
-// parsing, what startup rejects, the header shape, which credentials reach the SDK, and token caching.
+// CodeArtifact mode: the endpoint host names the domain, the default AWS credential chain mints the token.
+// Covers host parsing, what startup rejects, the header shape and token caching.
 public class UpstreamCodeArtifactTest
 {
   private const string Endpoint = "cache-redirector-840632698608.d.codeartifact.eu-west-1.amazonaws.com";
@@ -51,11 +50,7 @@ public class UpstreamCodeArtifactTest
   }
 
   [Fact]
-  public void An_Endpoint_Alone_Uses_The_Default_Chain() => Configure([UrlPrefix]);
-
-  [Fact]
-  public void Static_Keys_Are_Accepted() =>
-    Configure([UrlPrefix], ("AwsAccessKeyId", "AKIAEXAMPLE"), ("AwsSecretAccessKey", "secret"));
+  public void An_Endpoint_Alone_Is_A_Complete_Entry() => Configure([UrlPrefix]);
 
   [Theory]
   [InlineData("ClientId", "svc-proxy")]
@@ -85,24 +80,6 @@ public class UpstreamCodeArtifactTest
     Assert.Contains("spans CodeArtifact domains", exception.Message);
   }
 
-  [Theory]
-  [InlineData("AwsAccessKeyId", "AKIAEXAMPLE")]
-  [InlineData("AwsSecretAccessKey", "secret")]
-  public void Half_A_Key_Pair_Is_Rejected(string key, string value)
-  {
-    // What an unresolved secret reference looks like; it would otherwise fall back to the default chain.
-    var exception = Assert.Throws<ArgumentException>(() => Configure([UrlPrefix], (key, value)));
-    Assert.Contains("only one of AwsAccessKeyId/AwsSecretAccessKey", exception.Message);
-  }
-
-  [Fact]
-  public void Keys_On_Another_Upstream_Are_Rejected()
-  {
-    var exception = Assert.Throws<ArgumentException>(() =>
-      Configure(["packages.jetbrains.team/nuget/p/"], ("AwsAccessKeyId", "AKIAEXAMPLE"), ("AwsSecretAccessKey", "secret")));
-    Assert.Contains("would be sent nowhere", exception.Message);
-  }
-
   [Fact]
   public void An_Endpoint_Counts_As_A_Credential()
   {
@@ -111,26 +88,18 @@ public class UpstreamCodeArtifactTest
   }
 
   [Fact]
-  public void The_Secret_Key_Is_Never_Rendered()
+  public void The_Domain_Is_Rendered()
   {
-    var rendered = new UpstreamAuth
-    {
-      UrlPrefixes = [UrlPrefix], AwsAccessKeyId = "AKIAEXAMPLE", AwsSecretAccessKey = "wJalrXUtnFEMI-secret",
-    }.ToString();
-
-    Assert.Contains("AKIAEXAMPLE", rendered);
-    Assert.Contains("cache-redirector-840632698608", rendered);
-    Assert.DoesNotContain("wJalrXUtnFEMI-secret", rendered);
+    Assert.Contains("CodeArtifact: cache-redirector-840632698608", new UpstreamAuth { UrlPrefixes = [UrlPrefix] }.ToString());
   }
 
   private sealed class FakeTokenClient(FakeTimeProvider time) : ICodeArtifactTokenClient
   {
-    public readonly List<(CodeArtifactDomain Domain, AWSCredentials? Credentials)> Calls = [];
+    public readonly List<CodeArtifactDomain> Calls = [];
 
-    public Task<(string Token, DateTimeOffset ExpiresAt)> GetAuthorizationTokenAsync(
-      CodeArtifactDomain domain, AWSCredentials? credentials, CancellationToken ct)
+    public Task<(string Token, DateTimeOffset ExpiresAt)> GetAuthorizationTokenAsync(CodeArtifactDomain domain, CancellationToken ct)
     {
-      Calls.Add((domain, credentials));
+      Calls.Add(domain);
       // Base64 padding and '+'/'/' on purpose: the header must carry the token verbatim.
       return Task.FromResult(($"tok+/={Calls.Count}", time.GetUtcNow() + TimeSpan.FromHours(12)));
     }
@@ -162,29 +131,13 @@ public class UpstreamCodeArtifactTest
   }
 
   [Fact]
-  public async Task No_Keys_Means_The_Default_Chain()
+  public async Task The_Token_Is_Minted_For_The_Endpoint_Domain()
   {
     var (provider, client, _) = CreateProvider();
 
     await provider.GetAuthorizationHeaderAsync(new UpstreamAuth { UrlPrefixes = [UrlPrefix] }, CancellationToken.None);
 
-    var (domain, credentials) = Assert.Single(client.Calls);
-    Assert.Equal(new CodeArtifactDomain("cache-redirector", "840632698608", "eu-west-1"), domain);
-    Assert.Null(credentials);
-  }
-
-  [Fact]
-  public async Task Static_Keys_Reach_The_Sdk()
-  {
-    var (provider, client, _) = CreateProvider();
-    var auth = new UpstreamAuth { UrlPrefixes = [UrlPrefix], AwsAccessKeyId = "AKIAEXAMPLE", AwsSecretAccessKey = "secret" };
-
-    await provider.GetAuthorizationHeaderAsync(auth, CancellationToken.None);
-
-    var credentials = Assert.IsType<BasicAWSCredentials>(Assert.Single(client.Calls).Credentials);
-    var resolved = await credentials.GetCredentialsAsync();
-    Assert.Equal("AKIAEXAMPLE", resolved.AccessKey);
-    Assert.Equal("secret", resolved.SecretKey);
+    Assert.Equal(new CodeArtifactDomain("cache-redirector", "840632698608", "eu-west-1"), Assert.Single(client.Calls));
   }
 
   [Fact]
@@ -204,18 +157,5 @@ public class UpstreamCodeArtifactTest
     var refreshed = await provider.GetAuthorizationHeaderAsync(auth, CancellationToken.None);
     Assert.Equal(2, client.Calls.Count);
     Assert.NotEqual(first.Parameter, refreshed!.Parameter);
-  }
-
-  [Fact]
-  public async Task Different_Keys_Do_Not_Share_A_Token()
-  {
-    var (provider, client, _) = CreateProvider();
-
-    await provider.GetAuthorizationHeaderAsync(new UpstreamAuth { UrlPrefixes = [UrlPrefix] }, CancellationToken.None);
-    await provider.GetAuthorizationHeaderAsync(
-      new UpstreamAuth { UrlPrefixes = [UrlPrefix], AwsAccessKeyId = "AKIAEXAMPLE", AwsSecretAccessKey = "secret" },
-      CancellationToken.None);
-
-    Assert.Equal(2, client.Calls.Count);
   }
 }

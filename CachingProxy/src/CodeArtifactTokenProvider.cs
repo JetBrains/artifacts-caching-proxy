@@ -5,7 +5,6 @@ using System.Threading.Tasks;
 using Amazon;
 using Amazon.CodeArtifact;
 using Amazon.CodeArtifact.Model;
-using Amazon.Runtime;
 using Microsoft.Extensions.Logging;
 using ZiggyCreatures.Caching.Fusion;
 
@@ -40,9 +39,7 @@ public sealed partial record CodeArtifactDomain(string Name, string Owner, strin
 /// <summary>The one CodeArtifact call the proxy makes, behind an interface so tests need no AWS.</summary>
 public interface ICodeArtifactTokenClient
 {
-  /// <param name="credentials">Static keys, or null for the SDK's default credential chain.</param>
-  Task<(string Token, DateTimeOffset ExpiresAt)> GetAuthorizationTokenAsync(
-    CodeArtifactDomain domain, AWSCredentials? credentials, CancellationToken ct);
+  Task<(string Token, DateTimeOffset ExpiresAt)> GetAuthorizationTokenAsync(CodeArtifactDomain domain, CancellationToken ct);
 }
 
 public sealed class AwsCodeArtifactTokenClient : ICodeArtifactTokenClient
@@ -50,13 +47,12 @@ public sealed class AwsCodeArtifactTokenClient : ICodeArtifactTokenClient
   // The maximum. The token outlives the role session it was minted with, so this holds on ECS too.
   private static readonly TimeSpan ourTokenDuration = TimeSpan.FromHours(12);
 
-  public async Task<(string Token, DateTimeOffset ExpiresAt)> GetAuthorizationTokenAsync(
-    CodeArtifactDomain domain, AWSCredentials? credentials, CancellationToken ct)
+  public async Task<(string Token, DateTimeOffset ExpiresAt)> GetAuthorizationTokenAsync(CodeArtifactDomain domain, CancellationToken ct)
   {
     // The domain's own region, whatever AWS_REGION the deployment runs with. Built per call: a token lasts
-    // hours, so there is nothing to gain from keeping a client around.
-    var region = RegionEndpoint.GetBySystemName(domain.Region);
-    using var client = credentials == null ? new AmazonCodeArtifactClient(region) : new AmazonCodeArtifactClient(credentials, region);
+    // hours, so there is nothing to gain from keeping a client around. Credentials come from the default
+    // chain; off AWS that is web identity (AWSSDK.SecurityToken).
+    using var client = new AmazonCodeArtifactClient(RegionEndpoint.GetBySystemName(domain.Region));
     var response = await client.GetAuthorizationTokenAsync(new GetAuthorizationTokenRequest
     {
       Domain = domain.Name,
@@ -90,16 +86,12 @@ public sealed class CodeArtifactTokenProvider(
   // Lifetime of a token that comes back already inside the refresh window.
   private static readonly TimeSpan ourFallbackDuration = TimeSpan.FromMinutes(1);
 
-  public ValueTask<string> GetTokenAsync(UpstreamAuth auth, CodeArtifactDomain domain, CancellationToken ct) =>
+  public ValueTask<string> GetTokenAsync(CodeArtifactDomain domain, CancellationToken ct) =>
     cache.GetOrSetAsync<string>(
-      // Keyed by identity too: two entries on one domain with different keys must not share a token.
-      $"codeartifact-token::{domain.Name}::{domain.Owner}::{domain.Region}::{auth.AwsAccessKeyId}",
+      $"codeartifact-token::{domain.Name}::{domain.Owner}::{domain.Region}",
       async (ctx, innerCt) =>
       {
-        var credentials = string.IsNullOrEmpty(auth.AwsAccessKeyId)
-          ? null
-          : new BasicAWSCredentials(auth.AwsAccessKeyId, auth.AwsSecretAccessKey);
-        var (token, expiresAt) = await client.GetAuthorizationTokenAsync(domain, credentials, innerCt);
+        var (token, expiresAt) = await client.GetAuthorizationTokenAsync(domain, innerCt);
         var ttl = expiresAt - timeProvider.GetUtcNow() - ourRefreshSkew;
         ctx.Options.SetDuration(ttl > TimeSpan.Zero ? ttl : ourFallbackDuration);
         logger.LogDebug("Obtained CodeArtifact {Domain} authorization token, expires at {ExpiresAt}", domain, expiresAt);

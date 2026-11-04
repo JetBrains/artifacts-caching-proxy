@@ -40,8 +40,8 @@ namespace JetBrains.CachingProxy;
 /// proxy calls <c>GetAuthorizationToken</c> for the domain named in the endpoint host (see
 /// <see cref="CodeArtifactTokenProvider"/>) and sends <c>Authorization: Basic base64(aws:token)</c>.
 /// CodeArtifact has no anonymous reads and no long-lived credential of its own, so this is the only way in.
-/// The AWS identity is <see cref="AwsAccessKeyId"/>/<see cref="AwsSecretAccessKey"/> when set (a deployment
-/// off AWS), otherwise the SDK's default chain (the ECS task or EC2 instance role).</para>
+/// The AWS identity is always the SDK's default chain: the ECS task or EC2 instance role on AWS, web identity
+/// (<c>AWS_ROLE_ARN</c> + <c>AWS_WEB_IDENTITY_TOKEN_FILE</c>) off it, so no AWS key is ever configured.</para>
 ///
 /// <para>Whichever mode, an entry gates the prefixes it matches behind a validated inbound client JWT
 /// (see <see cref="RemoteServers"/>) - including an account that only buys rate limit on an otherwise
@@ -75,11 +75,6 @@ public record UpstreamAuth
   // omitted it is auto-resolved if the App has exactly one installation. GitHubApiBaseUrl defaults to GitHub.com.
   public string? PrivateKey { get; init; }
   public string GitHubApiBaseUrl { get; init; } = "https://api.github.com";
-
-  // CodeArtifact mode: static keys of an IAM user, for a deployment with no AWS role to fall back on. Both or
-  // neither; without them the SDK's default credential chain is used.
-  public string? AwsAccessKeyId { get; init; }
-  public string? AwsSecretAccessKey { get; init; }
 
   /// <summary>
   /// Extra token-endpoint URL prefixes this entry's credentials may be sent to, for an OCI upstream that
@@ -118,8 +113,6 @@ public record UpstreamAuth
     // The password is never rendered; the username identifies the account well enough to debug with.
     .Append(Username != null ? $"{nameof(Username)}: {Username} " : "")
     .Append(GetCodeArtifactDomain() is { } domain ? $"CodeArtifact: {domain} " : "")
-    // Same for the AWS secret key: the key id names the IAM user.
-    .Append(AwsAccessKeyId != null ? $"{nameof(AwsAccessKeyId)}: {AwsAccessKeyId} " : "")
     .Append(UrlPrefixes.Length > 0 ? $", {nameof(UrlPrefixes)}: {string.Join(" ", UrlPrefixes)}" : "")
     .Append(TokenEndpoint != null ? $", {nameof(TokenEndpoint)}: {TokenEndpoint}" : "")
     .Append(Scope != null ? $", {nameof(Scope)}:{Scope}" : "")

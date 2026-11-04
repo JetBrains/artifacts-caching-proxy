@@ -19,6 +19,8 @@
     <PackageVersion Include="AWSSDK.CodeArtifact" Version="4.0.100.14" />
     <PackageVersion Include="AWSSDK.Extensions.NETCore.Setup" Version="4.0.101.4" />
     <PackageVersion Include="AWSSDK.S3" Version="4.0.103.4" />
+    <!-- Loaded by the default credential chain for web identity (AWS_ROLE_ARN + AWS_WEB_IDENTITY_TOKEN_FILE). -->
+    <PackageVersion Include="AWSSDK.SecurityToken" Version="4.0.101" />
     <PackageVersion Include="AWSSDK.SSO" Version="4.0.100.16" />
     <PackageVersion Include="AWSSDK.SSOOIDC" Version="4.0.100.15" />
     <PackageVersion Include="Microsoft.Extensions.Caching.StackExchangeRedis" Version="10.0.12" />
