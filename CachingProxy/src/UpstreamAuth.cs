@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Text;
 
 namespace JetBrains.CachingProxy;
@@ -9,7 +10,7 @@ namespace JetBrains.CachingProxy;
 /// of its resolved URL (see <see cref="RemoteServers"/>). This lets many prefixes pointing at the same
 /// host share a single block.
 ///
-/// An entry operates in one of three modes:
+/// An entry operates in one of four modes:
 ///
 /// <para><b>Credential mode</b> (<see cref="ClientId"/> set): the proxy fetches an access token from
 /// <see cref="TokenEndpoint"/> (the token request itself authenticates the client with HTTP Basic, the
@@ -34,6 +35,13 @@ namespace JetBrains.CachingProxy;
 /// registry accepts an account at the token endpoint its challenge names, not on <c>/v2/…</c>, so for an
 /// OCI upstream this credential goes only there, subject to <see cref="TokenRealms"/>, and the registry
 /// itself sees just the minted token.</para>
+///
+/// <para><b>CodeArtifact mode</b> (<see cref="UrlPrefixes"/> are AWS CodeArtifact repository endpoints): the
+/// proxy calls <c>GetAuthorizationToken</c> for the domain named in the endpoint host (see
+/// <see cref="CodeArtifactTokenProvider"/>) and sends <c>Authorization: Basic base64(aws:token)</c>.
+/// CodeArtifact has no anonymous reads and no long-lived credential of its own, so this is the only way in.
+/// The AWS identity is <see cref="AwsAccessKeyId"/>/<see cref="AwsSecretAccessKey"/> when set (a deployment
+/// off AWS), otherwise the SDK's default chain (the ECS task or EC2 instance role).</para>
 ///
 /// <para>Whichever mode, an entry gates the prefixes it matches behind a validated inbound client JWT
 /// (see <see cref="RemoteServers"/>) - including an account that only buys rate limit on an otherwise
@@ -68,6 +76,11 @@ public record UpstreamAuth
   public string? PrivateKey { get; init; }
   public string GitHubApiBaseUrl { get; init; } = "https://api.github.com";
 
+  // CodeArtifact mode: static keys of an IAM user, for a deployment with no AWS role to fall back on. Both or
+  // neither; without them the SDK's default credential chain is used.
+  public string? AwsAccessKeyId { get; init; }
+  public string? AwsSecretAccessKey { get; init; }
+
   /// <summary>
   /// Extra token-endpoint URL prefixes this entry's credentials may be sent to, for an OCI upstream that
   /// issues its <c>WWW-Authenticate</c> challenge naming a realm on a different host (see
@@ -87,14 +100,26 @@ public record UpstreamAuth
   // True when this entry is a fixed Basic credential rather than something exchanged for a token.
   public bool IsServiceAccount => !string.IsNullOrEmpty(Username);
 
+  // True when any UrlPrefix is a CodeArtifact endpoint. Startup rejects an entry where not all of them are,
+  // or where they span domains, so the dispatch can take the first one's domain.
+  public bool IsCodeArtifact => UrlPrefixes.Any(static prefix => CodeArtifactDomain.FromUrlPrefix(prefix) != null);
+
+  // The domain of the first CodeArtifact UrlPrefix, or null outside CodeArtifact mode. A method, not a
+  // property, so configuration binding and JSON serialization never see it.
+  public CodeArtifactDomain? GetCodeArtifactDomain() =>
+    UrlPrefixes.Select(CodeArtifactDomain.FromUrlPrefix).FirstOrDefault(static domain => domain != null);
+
   // True when the entry has a credential to send at all. Mirrors the dispatch in
   // IUpstreamAuthorizationProvider, where an entry with neither resolves to no Authorization header.
-  public bool HasCredential => IsServiceAccount || !string.IsNullOrEmpty(ClientId);
+  public bool HasCredential => IsServiceAccount || !string.IsNullOrEmpty(ClientId) || IsCodeArtifact;
 
   public override string ToString() => new StringBuilder()
     .Append(ClientId != null ? $"{nameof(ClientId)}: {ClientId} " : "")
     // The password is never rendered; the username identifies the account well enough to debug with.
     .Append(Username != null ? $"{nameof(Username)}: {Username} " : "")
+    .Append(GetCodeArtifactDomain() is { } domain ? $"CodeArtifact: {domain} " : "")
+    // Same for the AWS secret key: the key id names the IAM user.
+    .Append(AwsAccessKeyId != null ? $"{nameof(AwsAccessKeyId)}: {AwsAccessKeyId} " : "")
     .Append(UrlPrefixes.Length > 0 ? $", {nameof(UrlPrefixes)}: {string.Join(" ", UrlPrefixes)}" : "")
     .Append(TokenEndpoint != null ? $", {nameof(TokenEndpoint)}: {TokenEndpoint}" : "")
     .Append(Scope != null ? $", {nameof(Scope)}:{Scope}" : "")
