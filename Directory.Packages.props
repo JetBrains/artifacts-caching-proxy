@@ -15,6 +15,8 @@
     <PackageVersion Include="OpenTelemetry.Extensions.Hosting" Version="1.19.1" />
     <PackageVersion Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.19.0" />
     <PackageVersion Include="OpenTelemetry.Instrumentation.Runtime" Version="1.19.0" />
+    <!-- The release built against the AWSSDK.Core (4.0.102.6) the other AWSSDK packages resolve. -->
+    <PackageVersion Include="AWSSDK.CodeArtifact" Version="4.0.100.14" />
     <PackageVersion Include="AWSSDK.Extensions.NETCore.Setup" Version="4.0.101.4" />
     <PackageVersion Include="AWSSDK.S3" Version="4.0.103.4" />
     <PackageVersion Include="AWSSDK.SSO" Version="4.0.100.16" />

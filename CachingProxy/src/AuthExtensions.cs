@@ -19,6 +19,7 @@ using Microsoft.IdentityModel.Tokens;
 using Microsoft.Net.Http.Headers;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -38,11 +39,12 @@ public static class AuthExtensions
   private const string CombinedInboundScheme = "CombinedInbound";
 
   /// <summary>
-  /// Per-upstream auth. Three credential modes coexist (see <see cref="UpstreamAuth"/>): OAuth
+  /// Per-upstream auth. Four credential modes coexist (see <see cref="UpstreamAuth"/>): OAuth
   /// client-credentials (Duende token management, one client per entry named by its ClientId), GitHub
   /// App (a signed JWT exchanged for an installation token — GitHub does not support the client-credentials
-  /// grant), and a fixed service account sent as Basic (a container-registry PAT), which needs no
-  /// registration here at all. The dispatch between them lives in
+  /// grant), a fixed service account sent as Basic (a container-registry PAT), which needs no
+  /// registration here at all, and CodeArtifact (an AWS identity exchanged for a domain authorization
+  /// token). The dispatch between them lives in
   /// <see cref="IUpstreamAuthorizationProvider"/>, which RemoteProxy resolves optionally, so
   /// unauthenticated deployments pull in nothing extra.
   /// </summary>
@@ -51,6 +53,14 @@ public static class AuthExtensions
     ClientCredentialsTokenManagementBuilder? tokenManagement = null;
     foreach (var (name, auth) in configuration.Get<CachingProxyConfig>()?.UpstreamAuth ?? [])
     {
+      // CodeArtifact mode: the token is minted on demand by CodeArtifactTokenProvider, so only the shape is
+      // checked. Keys on any other entry would be sent nowhere, which is a misplaced secret, not a mode.
+      if (auth.IsCodeArtifact || !string.IsNullOrEmpty(auth.AwsAccessKeyId) || !string.IsNullOrEmpty(auth.AwsSecretAccessKey))
+      {
+        ValidateCodeArtifact(name, auth);
+        continue;
+      }
+
       // Service-account mode: nothing to register, since no token is exchanged for this credential -
       // only a shape to check.
       if (auth.IsServiceAccount || !string.IsNullOrEmpty(auth.Password))
@@ -115,6 +125,9 @@ public static class AuthExtensions
     services.AddHttpClient(nameof(GitHubAppInstallationTokenProvider))
       .AddTokenClientRetryPolicy();
     services.AddSingleton<GitHubAppInstallationTokenProvider>();
+    // TryAdd, so tests can stand in for AWS.
+    services.TryAddSingleton<ICodeArtifactTokenClient, AwsCodeArtifactTokenClient>();
+    services.AddSingleton<CodeArtifactTokenProvider>();
     services.AddSingleton<IUpstreamAuthorizationProvider, UpstreamAuthorizationProvider>();
 
     // The OCI registry token dance. Not driven by UpstreamAuth entries at all — a registry demands a token
@@ -125,6 +138,32 @@ public static class AuthExtensions
     services.AddSingleton<RegistryTokenProvider>();
 
     return services;
+  }
+
+  // One domain per entry, since the token is per domain; every other mode's fields would be ignored, so they
+  // are rejected rather than left to look like they apply.
+  private static void ValidateCodeArtifact(string name, UpstreamAuth auth)
+  {
+    var domains = auth.UrlPrefixes.Select(CodeArtifactDomain.FromUrlPrefix).ToArray();
+    if (domains.Any(static domain => domain == null))
+      throw new ArgumentException(
+        auth.IsCodeArtifact
+          ? $"UpstreamAuth '{name}' mixes CodeArtifact endpoints with other UrlPrefixes. An entry authenticates one way only."
+          : $"UpstreamAuth '{name}' sets AwsAccessKeyId/AwsSecretAccessKey but its UrlPrefixes are not CodeArtifact " +
+            "endpoints (<domain>-<owner>.d.codeartifact.<region>.amazonaws.com), so the keys would be sent nowhere.");
+    if (domains.Distinct().Count() > 1)
+      throw new ArgumentException(
+        $"UpstreamAuth '{name}' spans CodeArtifact domains {string.Join(", ", domains.Distinct())}. Use one entry per domain.");
+    if (!string.IsNullOrEmpty(auth.ClientId) || !string.IsNullOrEmpty(auth.Username) ||
+        !string.IsNullOrEmpty(auth.Password) || !string.IsNullOrEmpty(auth.PrivateKey))
+      throw new ArgumentException(
+        $"UpstreamAuth '{name}' mixes CodeArtifact with ClientId/Username/Password/PrivateKey. An entry authenticates one way only.");
+    // Half a key pair is what an unresolved secret reference looks like; left alone it would quietly fall
+    // back to the default chain, which off AWS has no identity at all.
+    if (string.IsNullOrEmpty(auth.AwsAccessKeyId) != string.IsNullOrEmpty(auth.AwsSecretAccessKey))
+      throw new ArgumentException(
+        $"UpstreamAuth '{name}' sets only one of AwsAccessKeyId/AwsSecretAccessKey. Set both, or neither to use " +
+        "the default AWS credential chain.");
   }
 
   /// <summary>
