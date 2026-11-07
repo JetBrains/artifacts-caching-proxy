@@ -52,6 +52,8 @@ public class RedirectSignatureAuthTest : IAsyncLifetime
   private readonly WebApplication myUpstreamServer;
   private string myTempDirectory = "";
   private IHost? myProxyHost;
+  // The path and Authorization the upstream last received.
+  private volatile string myLastUpstreamRequest = "";
 
   public RedirectSignatureAuthTest()
   {
@@ -75,6 +77,7 @@ public class RedirectSignatureAuthTest : IAsyncLifetime
 
     myUpstreamServer = BuildKestrel(router => router.MapGet("{*path}", (req, res, _) =>
     {
+      myLastUpstreamRequest = $"{req.Path} {req.Headers.Authorization}";
       if (!req.Path.StartsWithSegments("/secure/v3/registration1"))
         return res.WriteAsync("artifact-body");
       // A registration document, whose links name the upstream itself.
@@ -138,6 +141,22 @@ public class RedirectSignatureAuthTest : IAsyncLifetime
 
     Assert.Equal(HttpStatusCode.RedirectKeepVerb, response.StatusCode);
     Assert.Equal($"{UrlOf(myUpstreamServer)}secure/-/v1/search?text=express", response.Headers.Location?.ToString());
+  }
+
+  [Fact]
+  public async Task A_Credentialed_Template_Is_Gated_And_Fetches_With_Its_Credential()
+  {
+    using var client = myProxyHost!.GetTestServer().CreateClient();
+
+    Assert.Equal(HttpStatusCode.Unauthorized, (await client.GetAsync("/private-t/some-repo/one.jar")).StatusCode);
+
+    Assert.Equal(HttpStatusCode.OK, (await client.GetAsync(Sign("/private/some-repo/two.jar"))).StatusCode);
+    var credential = myLastUpstreamRequest.Split(' ', 2)[1];
+    Assert.NotEmpty(credential);
+
+    var response = await client.GetAsync(Sign("/private-t/some-repo/one.jar"));
+    Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    Assert.Equal($"/secure/some-repo/one.jar {credential}", myLastUpstreamRequest);
   }
 
   [Fact]
@@ -633,6 +652,8 @@ public class RedirectSignatureAuthTest : IAsyncLifetime
       Prefixes =
       [
         $"/private={upstreamUrl}secure",
+        // A template inside the same scope: every repository under it is fetched with that credential.
+        $"/private-t/{{repo}}={upstreamUrl}secure/{{repo}}",
         new CachingProxyPrefix($"/private-redirect={upstreamUrl}secure", Profile: "redirect-all"),
         new CachingProxyPrefix($"/private-nuget={upstreamUrl}secure", Profile: "rewrite"),
       ],

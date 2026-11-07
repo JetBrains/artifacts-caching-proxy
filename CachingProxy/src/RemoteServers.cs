@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Authorization;
@@ -22,6 +23,8 @@ public partial class RemoteServers : EndpointDataSource
 
     // Parsed up front, so a prefix's rewrite can map the other prefixes' roots too.
     var parsed = config.Prefixes.Select(prefix => ParsePrefix(prefix, config.UpstreamAuth)).ToArray();
+    var authScopes = config.UpstreamAuth.Values
+      .SelectMany(static auth => auth.UrlPrefixes.Select(urlPrefix => (urlPrefix, auth))).ToArray();
 
     var endpoints = new Endpoint[config.Prefixes.Length];
     var hasGatedOciPrefix = false;
@@ -29,13 +32,18 @@ public partial class RemoteServers : EndpointDataSource
     for (var i = 0; i < config.Prefixes.Length; i++)
     {
       var prefix = config.Prefixes[i];
-      var (trimmedPrefix, remoteUri, matched, isGated) = parsed[i];
+      var (trimmedPrefix, remoteUri, matched, isGated, template) = parsed[i];
       var matchedAuth = matched?.Value;
       if (matchedAuth != null && !remoteUri.IsSecureOrLoopback())
         throw new ArgumentException(
           $"Authenticated upstream '{remoteUri}' must use HTTPS except on loopback.");
       var profile = ResolveProfile(prefix.Profile, config.CachingProfiles);
       ValidateDefaultNamespace(prefix, profile);
+      // Both are built from one fixed root: the namespace splice measures it, and a rewrite holds one per
+      // prefix, which per owner and repository would be a cache keyed by whatever the caller sends.
+      if (template != null && (prefix.DefaultNamespace != null || profile?.Rules.Any(static rule => rule.RewriteUrls) == true))
+        throw new ArgumentException(
+          $"Templated prefix '{prefix}' cannot set DefaultNamespace or use a profile that rewrites URLs.");
       // A prefix is the redirector alias it serves, so the redirector serves this upstream root at the public
       // URL plus the prefix path. Only where the profile rewrites anything.
       var publicUri = publicUrl != null && profile?.Rules.Any(static rule => rule.RewriteUrls) == true
@@ -51,10 +59,12 @@ public partial class RemoteServers : EndpointDataSource
         Retention = ParseRetention(prefix),
         UrlRewrite = publicUri == null ? null
           : new UpstreamUrlRewrite(remoteUri, publicUri, OtherRoots(config.Prefixes, parsed, i, publicUrl!)),
+        UpstreamTemplate = template,
+        AuthScopes = template == null ? [] : authScopes,
       };
 
       logger.LogInformation("RemoteServer: {Prefix} -> {RemoteUri}, Auth: {Auth}, Profile: {Profile}, PublicUrl: {PublicUrl}, Retention: {Retention}",
-        remoteServer.Prefix, remoteServer.RemoteUri, remoteServer.Auth, prefix.Profile, publicUri, remoteServer.Retention);
+        trimmedPrefix, remoteServer.Upstream, remoteServer.Auth, prefix.Profile, publicUri, remoteServer.Retention);
       // A matched entry with no credential is what a half-configured secret looks like: the prefix is gated
       // inbound, so it looks configured, while the upstream is reached anonymously - and an OCI upstream
       // mints its registry token anonymously too, which a private repository answers with a bare 403.
@@ -77,7 +87,8 @@ public partial class RemoteServers : EndpointDataSource
       // catch-all, and routing breaks such ties by Endpoint.Order, NOT by specificity. So order by
       // descending prefix length here, making the longer (more specific) prefix win regardless of the
       // order it was declared in. Equal-length prefixes can never match the same path, so ties between
-      // them are never observed.
+      // them are never observed - except two templates of one shape ("/gh/{a}/x" and "/gh/{b}/x"), which
+      // routing answers with an AmbiguousMatchException. Whoever generates the prefixes must not emit those.
       endpoints[i] = new RouteEndpoint(
         requestDelegate: static _ => Task.CompletedTask,
         routePattern: RoutePatternFactory.Parse(trimmedPrefix + $"/{{**{PathParameterName}}}"),
@@ -140,7 +151,8 @@ public partial class RemoteServers : EndpointDataSource
   }
 
   private readonly record struct ParsedPrefix(
-    string Path, Uri RemoteUri, KeyValuePair<string, UpstreamAuth>? MatchedAuth, bool IsGated);
+    string Path, Uri RemoteUri, KeyValuePair<string, UpstreamAuth>? MatchedAuth, bool IsGated,
+    string[]? UpstreamTemplate);
 
   private static ParsedPrefix ParsePrefix(CachingProxyPrefix prefix, IReadOnlyDictionary<string, UpstreamAuth> auths)
   {
@@ -152,19 +164,110 @@ public partial class RemoteServers : EndpointDataSource
 
     var target = index < 0 ? trimmed : trimmed[(index + 1)..];
     target = target.TrimEnd('/') + '/';
-    var remoteUri = Uri.TryCreate(target, UriKind.Absolute, out var targetUri) ? targetUri :
-      new Uri(Uri.UriSchemeHttps + Uri.SchemeDelimiter + target, UriKind.Absolute);
+    var (head, template) = SplitTemplate(prefix, trimmedPrefix, target);
+    var remoteUri = Uri.TryCreate(head, UriKind.Absolute, out var targetUri) ? targetUri :
+      new Uri(Uri.UriSchemeHttps + Uri.SchemeDelimiter + head, UriKind.Absolute);
     // A query or a fragment leaves the base with no trailing-slash path to resolve a request against
     // ("host/p?x=1" parses as path "/p" plus query), so every request to such a prefix would resolve
-    // outside it and be rejected. Fail at startup rather than on every request.
-    if (remoteUri.Query.Length > 0 || remoteUri.Fragment.Length > 0)
+    // outside it and be rejected. Fail at startup rather than on every request. A template's literal
+    // segments count too, so check them with a sample value in each placeholder.
+    var sample = template == null ? remoteUri
+      : new Uri(remoteUri, string.Concat(template.Select(static s => (IsPlaceholder(s) ? "x" : s) + '/')));
+    if (sample.Query.Length > 0 || sample.Fragment.Length > 0)
       throw new ArgumentException($"Prefix target must have no query or fragment: {prefix}");
     // The credential is a property of the upstream, not of the inbound gate: a repository that is
     // individually public can still sit inside a private origin we may only fetch with our service
     // account. So match regardless of IsPrivate - that flag only decides gating.
+    // A template matches on its literal head, so the credential it gets covers every value a caller may put
+    // after it: whatever that credential can read upstream, this prefix serves. Keep the head as narrow as
+    // the credential's intended reach.
     var matched = MatchAuth(remoteUri, auths);
-    return new ParsedPrefix(trimmedPrefix, remoteUri, matched, prefix.IsPrivate ?? matched?.Value != null);
+    return new ParsedPrefix(trimmedPrefix, remoteUri, matched, prefix.IsPrivate ?? matched?.Value != null, template);
   }
+
+  /// <summary>
+  /// Splits a target into its literal head and, for a templated prefix (<c>/github.com/{owner}/{repo}</c>), the
+  /// path segments from the first placeholder on; the template is null for a plain prefix.
+  /// <para>A placeholder is a whole path segment <c>{name}</c> and the alias and the target name the same set,
+  /// so every value is used exactly once in the upstream. Never in the host: a value the caller chooses must
+  /// not pick where we connect. Only the plain form, since a default, a constraint or an optional parameter
+  /// would let routing fill a value the upstream template cannot reproduce.</para>
+  /// </summary>
+  private static (string Head, string[]? Template) SplitTemplate(CachingProxyPrefix prefix, string alias, string target)
+  {
+    var aliasNames = AliasPlaceholders(prefix, alias);
+    var brace = target.IndexOfAny(['{', '}']);
+    if (brace < 0)
+    {
+      if (aliasNames.Count > 0)
+        throw new ArgumentException($"Prefix '{prefix}' has placeholders in its alias but none in its target.");
+      return (target, null);
+    }
+
+    var segmentStart = target.LastIndexOf('/', brace) + 1;
+    var head = target[..segmentStart];
+    // "https://{x}.host/" splits after "//", which leaves no host.
+    if (segmentStart == 0 || head.EndsWith("//", StringComparison.Ordinal) ||
+        !Uri.TryCreate(head.Contains(Uri.SchemeDelimiter) ? head : Uri.UriSchemeHttps + Uri.SchemeDelimiter + head,
+          UriKind.Absolute, out _))
+      throw new ArgumentException($"Prefix '{prefix}' has a placeholder in its target host.");
+
+    var template = target[segmentStart..].TrimEnd('/').Split('/');
+    var targetNames = new List<string>();
+    foreach (var segment in template)
+    {
+      if (IsPlaceholder(segment) && OurPlaceholderName.IsMatch(segment[1..^1]))
+        targetNames.Add(segment[1..^1]);
+      else if (segment.IndexOfAny(['{', '}']) >= 0)
+        throw new ArgumentException(
+          $"Prefix '{prefix}' has a malformed target placeholder '{segment}'; use a whole segment {{name}}.");
+    }
+
+    if (targetNames.Count != targetNames.Distinct(StringComparer.Ordinal).Count() ||
+        !targetNames.ToHashSet(StringComparer.Ordinal).SetEquals(aliasNames))
+      throw new ArgumentException(
+        $"Prefix '{prefix}' must use each of its alias placeholders exactly once in its target.");
+    return (head, template);
+  }
+
+  private static HashSet<string> AliasPlaceholders(CachingProxyPrefix prefix, string alias)
+  {
+    var names = new HashSet<string>(StringComparer.Ordinal);
+    if (alias.IndexOfAny(['{', '}']) < 0) return names;
+
+    RoutePattern pattern;
+    try
+    {
+      pattern = RoutePatternFactory.Parse(alias);
+    }
+    catch (RoutePatternException e)
+    {
+      throw new ArgumentException($"Prefix '{prefix}' has a malformed alias template: {e.Message}", e);
+    }
+
+    foreach (var segment in pattern.PathSegments.Where(static s => s.Parts.Any(static p => p.IsParameter)))
+    {
+      if (segment.Parts is not [RoutePatternParameterPart parameter] ||
+          parameter.IsOptional || parameter.IsCatchAll || parameter.Default != null ||
+          parameter.ParameterPolicies.Count > 0 || !OurPlaceholderName.IsMatch(parameter.Name) ||
+          string.Equals(parameter.Name, PathParameterName, StringComparison.OrdinalIgnoreCase))
+        throw new ArgumentException(
+          $"Prefix '{prefix}' has an unsupported alias placeholder; use a whole segment {{name}}, name not '{PathParameterName}'.");
+      names.Add(parameter.Name);
+    }
+    return names;
+  }
+
+  private static bool IsPlaceholder(string segment) =>
+    segment.Length > 2 && segment[0] == '{' && segment[^1] == '}';
+
+  [GeneratedRegex("^[A-Za-z][A-Za-z0-9]*$")]
+  private static partial Regex OurPlaceholderName { get; }
+
+  // RFC 3986 unreserved, so a value needs no escaping and a cache key built from it is the URL as sent.
+  // Without '%', a value cannot smuggle in the '%2e%2e' that System.Uri collapses, nor a '%2F'.
+  [GeneratedRegex("^[A-Za-z0-9._~-]+$")]
+  private static partial Regex OurPlaceholderValue { get; }
 
   private static Uri PublicRootOf(Uri publicUrl, string prefixPath) =>
     new(publicUrl.AbsoluteUri + prefixPath.TrimStart('/') + '/', UriKind.Absolute);
@@ -178,7 +281,8 @@ public partial class RemoteServers : EndpointDataSource
   private static IEnumerable<(Uri Upstream, Uri Public)> OtherRoots(
     CachingProxyPrefix[] prefixes, ParsedPrefix[] parsed, int self, Uri publicUrl) =>
     Enumerable.Range(0, prefixes.Length)
-      .Where(j => j != self && prefixes[j].Profile == prefixes[self].Profile && (!parsed[j].IsGated || parsed[self].IsGated))
+      .Where(j => j != self && parsed[j].UpstreamTemplate == null && prefixes[j].Profile == prefixes[self].Profile &&
+                  (!parsed[j].IsGated || parsed[self].IsGated))
       .GroupBy(j => parsed[j].RemoteUri.AbsoluteUri, StringComparer.Ordinal)
       .Select(group =>
       {
@@ -277,6 +381,70 @@ public partial class RemoteServers : EndpointDataSource
     public UpstreamUrlRewrite? UrlRewrite { get; init; }
 
     /// <summary>
+    /// For a templated prefix (<c>/github.com/{owner}/{repo}=…</c>), the upstream path segments from the first
+    /// placeholder on, a placeholder kept as <c>{name}</c>; <see cref="RemoteUri"/> is then only the literal
+    /// head before them. Null for a plain prefix.
+    /// </summary>
+    public IReadOnlyList<string>? UpstreamTemplate { get; init; }
+
+    /// <summary>Every UpstreamAuth UrlPrefix with its entry, for a templated prefix to check against; empty otherwise.</summary>
+    public IReadOnlyList<(string UrlPrefix, UpstreamAuth Auth)> AuthScopes { get; init; } = [];
+
+    /// <summary>The configured upstream, the template included, for logs.</summary>
+    public string Upstream => UpstreamTemplate == null ? RemoteUri.AbsoluteUri
+      : RemoteUri.AbsoluteUri + string.Concat(UpstreamTemplate.Select(static segment => segment + '/'));
+
+    /// <summary>
+    /// <see cref="RemoteUri"/>, or for a templated prefix the base its route values fill in, or <c>null</c>
+    /// when a value is not one path segment we can use as is.
+    /// <para>Only unreserved characters, and never <c>.</c> or <c>..</c>: a value is spliced into the path
+    /// unescaped, and a dot segment there would move the base itself, which no containment check measured
+    /// against that base can see.</para>
+    /// </summary>
+    private Uri? GetBaseUri(RouteValueDictionary? routeValues)
+    {
+      if (UpstreamTemplate == null) return RemoteUri;
+
+      var path = new StringBuilder(RemoteUri.AbsoluteUri);
+      foreach (var segment in UpstreamTemplate)
+      {
+        if (IsPlaceholder(segment))
+        {
+          if (routeValues?[segment[1..^1]] is not string value || !OurPlaceholderValue.IsMatch(value) ||
+              value is "." or "..")
+            return null;
+          path.Append(value);
+        }
+        else
+          path.Append(segment);
+        path.Append('/');
+      }
+      return new Uri(path.ToString(), UriKind.Absolute);
+    }
+
+    /// <summary>
+    /// Whether <paramref name="upstream"/> falls to another credential than <see cref="Auth"/>, by the longest
+    /// covering UpstreamAuth UrlPrefix as at startup. A template reaches upstream paths no one configured, and
+    /// one in another entry's scope is that entry's to fetch and gate: an ungated template would serve its
+    /// cache entries to anyone (MRI-4842), a credentialed one would fetch them with the wrong credential.
+    /// Routing sends a path to a literal prefix over a template already, so this is for a scope no prefix
+    /// spells out, an owner- or host-wide one.
+    /// </summary>
+    private bool InForeignAuthScope(Uri upstream)
+    {
+      // A plain prefix's upstream is fixed, and so is its credential: startup matched it already.
+      if (UpstreamTemplate == null) return false;
+
+      var path = upstream.GetHostPortPath();
+      var owner = AuthScopes
+        .Where(scope => CoversPath(path, scope.UrlPrefix))
+        .OrderByDescending(static scope => scope.UrlPrefix.Length)
+        .Select(static scope => scope.Auth)
+        .FirstOrDefault();
+      return !ReferenceEquals(owner, Auth);
+    }
+
+    /// <summary>
     /// The rewrite to apply to a body under <paramref name="rule"/>, or null for none. On the host of the
     /// redirector deployment a signed request came through, if it named one (MRI-4855).
     /// </summary>
@@ -299,26 +467,32 @@ public partial class RemoteServers : EndpointDataSource
     /// credential to a host of the caller's choosing (MRI-4844). So only a URI inside the base is returned.</para>
     /// <para>The one rewrite applied to a URI that passed all of that is
     /// <see cref="WithDefaultNamespace"/>, which stays inside the base by construction.</para>
+    /// <para>For a templated prefix the base is <see cref="RemoteUri"/> plus <see cref="UpstreamTemplate"/>
+    /// filled from <paramref name="routeValues"/>, see <see cref="GetBaseUri"/>.</para>
     /// </summary>
-    public Uri? GetUpstreamUri(string? remainingPath)
+    public Uri? GetUpstreamUri(string? remainingPath, RouteValueDictionary? routeValues = null)
     {
-      if (string.IsNullOrEmpty(remainingPath)) return RemoteUri;
+      if (GetBaseUri(routeValues) is not { } baseUri) return null;
+
+      if (string.IsNullOrEmpty(remainingPath)) return InForeignAuthScope(baseUri) ? null : baseUri;
 
       // TryCreate, not the throwing constructor: a reference that does not resolve at all (the empty
       // authority of "///x") is one more rejected request, not an exception for the caller to catch.
-      if (!Uri.TryCreate(RemoteUri, remainingPath, out var upstream)) return null;
+      if (!Uri.TryCreate(baseUri, remainingPath, out var upstream)) return null;
 
       // The scheme on its own, because an absolute reference can keep the configured host and path and change
       // only the scheme: that downgrades a credentialed https upstream to cleartext, and "file://<same
       // host>/<same path>" has the very same host+path form the containment check below compares.
-      if (!string.Equals(upstream.Scheme, RemoteUri.Scheme, StringComparison.Ordinal)) return null;
+      if (!string.Equals(upstream.Scheme, baseUri.Scheme, StringComparison.Ordinal)) return null;
 
       // Contained in the base, compared in the one form both the cache key and the UpstreamAuth match are
       // derived from (see GetHostPortPath), so "contained" means "cannot reach another prefix's cache entry
       // and cannot leave this prefix's auth scope". The configured path always ends in '/', so the sibling
       // "/open2/" cannot pass as a child of "/open/"; Ordinal because the key is case-sensitive too.
-      if (!upstream.GetHostPortPath().StartsWith(RemoteUri.GetHostPortPath(), StringComparison.Ordinal))
+      if (!upstream.GetHostPortPath().StartsWith(baseUri.GetHostPortPath(), StringComparison.Ordinal))
         return null;
+
+      if (InForeignAuthScope(upstream)) return null;
 
       // A query, a fragment or userinfo is excluded from that form yet would still travel upstream, so two
       // requests differing only there would share one entry. Nothing legitimate produces them: the routed
@@ -371,7 +545,7 @@ public partial class RemoteServers : EndpointDataSource
         UriKind.Absolute);
     }
 
-    public override string ToString() => $"{Prefix}={RemoteUri}";
+    public override string ToString() => UpstreamTemplate == null ? $"{Prefix}={RemoteUri}" : $"{Prefix}={Upstream}";
   }
 
   public override IChangeToken GetChangeToken() => NullChangeToken.Singleton;
