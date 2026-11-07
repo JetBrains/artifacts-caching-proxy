@@ -29,8 +29,9 @@ namespace JetBrains.CachingProxy.Tests;
 // proxy with cr_exp/cr_sig query parameters (the client JWT is dropped on the cross-host hop), and the
 // proxy must accept that signature as sufficient authorization for a private prefix. The signing here
 // is a faithful C# re-implementation of the redirector's Lua auth.lua, so these tests double as an
-// interop contract. Asserts: valid signature -> proxied (and Cache-Control: private), and every failure
-// mode (no signature, tampered path, wrong key, expired) -> 401. Also asserts that signatures are inert
+// interop contract. Asserts: valid signature -> proxied (and Cache-Control: private), every failure
+// mode (no signature, tampered path, wrong key, expired) -> 401, except an expired signature of ours,
+// which is sent back to the redirector with a 307 to be renewed. Also asserts that signatures are inert
 // when no key is configured, and covers both inbound-auth shapes: a signature alongside JWT validation
 // (JWT still accepted), and the deployed signature-only one, where a client JWT is rejected because the
 // redirector is the layer that validates it.
@@ -380,15 +381,61 @@ public class RedirectSignatureAuthTest : IAsyncLifetime
     Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
   }
 
+  [Theory]
+  // Expired well beyond the default 30s clock-skew tolerance.
+  [InlineData("/private/one.jar", "https://cache-redirector.example.test/private/one.jar")]
+  [InlineData("/private/one.jar?classifier=sources", "https://cache-redirector.example.test/private/one.jar?classifier=sources")]
+  [InlineData("/private/one.jar?cr_host=sandbox.example.test", "https://sandbox.example.test/private/one.jar")]
+  [InlineData("/private-t/some-repo/one.jar", "https://cache-redirector.example.test/private-t/some-repo/one.jar")]
+  public async Task Expired_Signature_Of_Ours_Is_Sent_Back_To_The_Redirector(string pathAndQuery, string redirector)
+  {
+    // CACHE-REDIRECTOR-4Q: a resumed download re-requests the signed URL long after it expired.
+    using var client = myProxyHost!.GetTestServer().CreateClient();
+
+    var response = await client.GetAsync(Sign(pathAndQuery, expiry: DateTimeOffset.UtcNow.AddMinutes(-5)));
+
+    Assert.Equal(HttpStatusCode.TemporaryRedirect, response.StatusCode);
+    Assert.Equal(redirector, response.Headers.Location?.ToString());
+    Assert.True(response.Headers.CacheControl?.NoStore);
+  }
+
   [Fact]
-  public async Task Expired_Signature_Is_Unauthorized()
+  public async Task Expired_Signature_Not_Of_Ours_Is_Unauthorized()
   {
     using var client = myProxyHost!.GetTestServer().CreateClient();
 
-    // Expired well beyond the default 30s clock-skew tolerance.
-    var response = await client.GetAsync(Sign("/private/one.jar", expiry: DateTimeOffset.UtcNow.AddMinutes(-5)));
+    var response = await client.GetAsync(
+      Sign("/private/one.jar", key: "the-wrong-key-of-legal-length-32b", expiry: DateTimeOffset.UtcNow.AddMinutes(-5)));
 
     Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    Assert.Null(response.Headers.Location);
+  }
+
+  [Fact]
+  public async Task Expired_Signature_Is_Unauthorized_With_No_Redirector_To_Renew_It()
+  {
+    using var host = BuildProxyHost(BuildConfig(publicUrl: null));
+    await host.StartAsync();
+    try
+    {
+      using var client = host.GetTestServer().CreateClient();
+      var response = await client.GetAsync(Sign("/private/one.jar", expiry: DateTimeOffset.UtcNow.AddMinutes(-5)));
+      Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    }
+    finally
+    {
+      await host.StopAsync();
+    }
+  }
+
+  [Fact]
+  public async Task Expired_Signature_On_An_Ungated_Prefix_Is_Served()
+  {
+    using var client = myProxyHost!.GetTestServer().CreateClient();
+
+    var response = await client.GetAsync(Sign("/public/one.jar", expiry: DateTimeOffset.UtcNow.AddMinutes(-5)));
+
+    Assert.Equal(HttpStatusCode.OK, response.StatusCode);
   }
 
   [Fact]
@@ -640,7 +687,8 @@ public class RedirectSignatureAuthTest : IAsyncLifetime
   }
 
   private CachingProxyConfig BuildConfig(
-    bool withSignature = true, string signatureKey = SigningKey, bool withJwt = true)
+    bool withSignature = true, string signatureKey = SigningKey, bool withJwt = true,
+    string? publicUrl = ConfiguredPublicUrl)
   {
     var upstreamUrl = UrlOf(myUpstreamServer);
     return new CachingProxyConfig
@@ -656,8 +704,9 @@ public class RedirectSignatureAuthTest : IAsyncLifetime
         $"/private-t/{{repo}}={upstreamUrl}secure/{{repo}}",
         new CachingProxyPrefix($"/private-redirect={upstreamUrl}secure", Profile: "redirect-all"),
         new CachingProxyPrefix($"/private-nuget={upstreamUrl}secure", Profile: "rewrite"),
+        $"/public={upstreamUrl}open",
       ],
-      PublicUrl = ConfiguredPublicUrl,
+      PublicUrl = publicUrl,
       CachingProfiles =
       {
         ["redirect-all"] = new() { Rules = [new CachingRule { Pattern = ".", Redirect = true }] },
