@@ -25,6 +25,12 @@ public class RedirectSignatureOptions : AuthenticationSchemeOptions
   public RedirectSignatureKeyRing KeyRing { get; set; } = null!;
 
   public string? Challenge { get; set; }
+
+  /// <summary>
+  /// Where a gated request with an expired signature of ours is sent to be signed again: the redirector,
+  /// <see cref="CachingProxyConfig.PublicUrl"/>. Null answers it 401 like any other failure.
+  /// </summary>
+  public Uri? RedirectorUrl { get; set; }
 }
 
 /// <summary>
@@ -91,31 +97,16 @@ public sealed class RedirectSignatureAuthenticationHandler(
     // values outside its range, turning a bad credential into a 500 response.
     var nowUnixSeconds = timeProvider.GetUtcNow().ToUnixTimeSeconds();
     if (expiryUnixSeconds < nowUnixSeconds - Options.Config.ClockSkew.TotalSeconds)
-      return Fail("signature expired");
+      return Expired(signature, expiry);
     if (expiryUnixSeconds > nowUnixSeconds + Options.Config.MaxLifetime.TotalSeconds + Options.Config.ClockSkew.TotalSeconds)
       return Fail("signature expiry exceeds the maximum lifetime");
 
-    byte[] providedSignature;
-    try
-    {
-      providedSignature = Base64UrlEncoder.DecodeBytes(signature);
-    }
-    catch (Exception)
-    {
+    if (MatchingKey(signature, expiry) is not { } i)
       return Fail("cr_sig is not valid base64url");
-    }
 
-    var signedPayload = Encoding.UTF8.GetBytes($"{PathAndQueryWithoutSignatureParams()}\n{expiry}");
-
-    // Try each key: the first is the active one, any later one a retiring key still honoured mid-rotation.
-    // Each comparison is constant-time; the number of them reveals only which key matched, not secret.
     var keys = Options.KeyRing.Keys;
-    for (var i = 0; i < keys.Length; i++)
+    if (i >= 0)
     {
-      if (!CryptographicOperations.FixedTimeEquals(
-            providedSignature, HMACSHA256.HashData(keys[i].Bytes, signedPayload)))
-        continue;
-
       // Counted, not logged: a retiring-key match is a successful request on every artifact fetch.
       metrics.IncrementRedirectSignatureVerification(i == 0 ? "active" : "retiring", keys[i].Fingerprint);
 
@@ -141,6 +132,67 @@ public sealed class RedirectSignatureAuthenticationHandler(
     // a key never staged here. The ring's fingerprints are not secret, so log them to make that visible.
     metrics.IncrementRedirectSignatureVerification("mismatch", "none");
     return Fail($"signature mismatch (tried {keys.Length} key(s), fingerprints: {Options.KeyRing})");
+  }
+
+  // The index of the ring key the signature verifies with, -1 for none, or null when cr_sig is not base64url.
+  // Try each key: the first is the active one, any later one a retiring key still honoured mid-rotation.
+  // Each comparison is constant-time; the number of them reveals only which key matched, not secret.
+  private int? MatchingKey(string signature, string expiry)
+  {
+    byte[] providedSignature;
+    try
+    {
+      providedSignature = Base64UrlEncoder.DecodeBytes(signature);
+    }
+    catch (Exception)
+    {
+      return null;
+    }
+
+    var signedPayload = Encoding.UTF8.GetBytes($"{PathAndQueryWithoutSignatureParams()}\n{expiry}");
+    var keys = Options.KeyRing.Keys;
+    for (var i = 0; i < keys.Length; i++)
+      if (CryptographicOperations.FixedTimeEquals(providedSignature, HMACSHA256.HashData(keys[i].Bytes, signedPayload)))
+        return i;
+    return -1;
+  }
+
+  /// <summary>
+  /// An expired signature: a failure, and for one we signed, the redirector URL to renew it at - see
+  /// <see cref="HandleChallengeAsync"/>. Ours is the common case, a client resuming a slow download on the
+  /// signed URL after it expired (CACHE-REDIRECTOR-4Q), so it is logged as information when it can be renewed.
+  /// </summary>
+  private AuthenticateResult Expired(string signature, string expiry)
+  {
+    if (MatchingKey(signature, expiry) is not >= 0 || RedirectorUrlForThisRequest() is not { } renewAt)
+      return Fail("signature expired");
+
+    Context.Items[RenewAtItemKey] = renewAt;
+    Logger.LogInformation("Redirect signature expired; a gated request is sent back to {RenewAt}", renewAt);
+    return AuthenticateResult.Fail("signature expired");
+  }
+
+  private const string RenewAtItemKey = "RedirectSignature.RenewAt";
+
+  // The redirector URL this request was redirected from: the same path, which is the redirector alias, on the
+  // signed cr_host when it names one (Sandbox) or on RedirectorUrl, with the query minus our cr_* parameters.
+  // Only called once the signature verified, so cr_host is ours.
+  private string? RedirectorUrlForThisRequest()
+  {
+    var publicHost = Request.Query[PublicHostQueryParam].ToString();
+    var root = publicHost.Length > 0 && Uri.CheckHostName(publicHost) == UriHostNameType.Dns
+      ? $"https://{publicHost.ToLowerInvariant()}/"
+      : Options.RedirectorUrl?.AbsoluteUri;
+    if (root == null)
+      return null;
+
+    var rawTarget = Context.Features.Get<IHttpRequestFeature>()?.RawTarget;
+    if (string.IsNullOrEmpty(rawTarget))
+      rawTarget = Request.Path + Request.QueryString;
+    var queryStart = rawTarget.IndexOf('?');
+    var path = (queryStart < 0 ? rawTarget : rawTarget[..queryStart]).TrimStart('/');
+    var kept = queryStart < 0 ? "" : KeepNonSignatureParams(rawTarget[(queryStart + 1)..], dropPublicHost: true);
+    return kept.Length > 0 ? $"{root}{path}?{kept}" : $"{root}{path}";
   }
 
   // Reconstruct the exact string the redirector signed: the raw (undecoded) request line with the
@@ -206,8 +258,20 @@ public sealed class RedirectSignatureAuthenticationHandler(
 
   // Mirror the JwtBearer/deny paths: a rejected signed request still advertises Basic so a Basic-only
   // client (Maven/Gradle/npm) can retry against the redirector with credentials.
+  //
+  // An expired signature of ours is renewed instead: a 307 back to the redirector, which checks the client
+  // again and signs a fresh redirect here. Never stored: the edge cache key leaves out cr_exp and cr_sig, so
+  // a stored 307 would bounce the fresh signature too.
   protected override Task HandleChallengeAsync(AuthenticationProperties properties)
   {
+    if (Context.Items[RenewAtItemKey] is string renewAt)
+    {
+      Response.StatusCode = StatusCodes.Status307TemporaryRedirect;
+      Response.Headers.Location = renewAt;
+      Response.Headers.CacheControl = "no-store";
+      return Task.CompletedTask;
+    }
+
     Response.StatusCode = StatusCodes.Status401Unauthorized;
     if (Options.Challenge is {} challenge)
       Response.Headers.Append(HeaderNames.WWWAuthenticate, challenge);

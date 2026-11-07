@@ -299,6 +299,7 @@ public static class AuthExtensions
             options.Config = redirectSignature;
             options.KeyRing = keyRing!;
             options.Challenge = basicChallenge;
+            options.RedirectorUrl = RemoteServers.ParsePublicUrl(cachingProxyConfig!.PublicUrl);
           });
     }
 

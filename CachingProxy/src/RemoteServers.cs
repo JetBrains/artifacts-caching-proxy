@@ -291,7 +291,7 @@ public partial class RemoteServers : EndpointDataSource
       });
 
   // Normalized to end in '/', so a prefix path appends to it.
-  private static Uri? ParsePublicUrl(string? publicUrl)
+  internal static Uri? ParsePublicUrl(string? publicUrl)
   {
     if (string.IsNullOrWhiteSpace(publicUrl)) return null;
     if (!Uri.TryCreate(publicUrl.TrimEnd('/') + '/', UriKind.Absolute, out var uri) ||
