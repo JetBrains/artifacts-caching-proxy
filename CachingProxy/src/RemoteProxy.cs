@@ -85,8 +85,9 @@ public partial class RemoteProxy(
 
     // The remainder after the prefix is an RFC-3986 reference resolved against the upstream base, so it can
     // name a target outside this prefix: another prefix's path, another host, another scheme. GetUpstreamUri
-    // returns null for every such remainder, and there is no upstream left to ask.
-    if (remoteServer.GetUpstreamUri(remainingPath) is not { } upstreamUri)
+    // returns null for every such remainder, and for a template value it cannot use, and there is no
+    // upstream left to ask.
+    if (remoteServer.GetUpstreamUri(remainingPath, context.Request.RouteValues) is not { } upstreamUri)
     {
       await SetStatusAsync(context, CachingProxyStatus.BAD_REQUEST, CachedResponse.InvalidPath);
       return null;

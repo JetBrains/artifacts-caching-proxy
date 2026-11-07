@@ -571,6 +571,175 @@ public class RemoteServersTest
     Assert.Contains("/v2/private", warning.Message);
   }
 
+  private static RouteValueDictionary Values(string owner, string repo) => new() { ["owner"] = owner, ["repo"] = repo };
+
+  [Fact]
+  public void A_Template_Keeps_Its_Literal_Head_As_The_Remote_Uri()
+  {
+    var server = Assert.Single(Build("/github.com/{owner}/{repo}/releases/download"));
+    Assert.Equal("https://github.com/", server.RemoteUri.AbsoluteUri);
+    Assert.Equal(["{owner}", "{repo}", "releases", "download"], server.UpstreamTemplate!);
+    Assert.Equal("https://github.com/{owner}/{repo}/releases/download/", server.Upstream);
+
+    var pattern = new RemoteServers(new CachingProxyConfig { Prefixes = ["/github.com/{owner}/{repo}/releases/download"] },
+      new NullLogger<RemoteServers>()).Endpoints.Cast<RouteEndpoint>().Single().RoutePattern.RawText;
+    Assert.Equal("/github.com/{owner}/{repo}/releases/download/{**path}", pattern);
+  }
+
+  [Fact]
+  public void A_Template_Resolves_Each_Owner_To_The_Key_Its_Plain_Prefix_Has()
+  {
+    // Every (owner, repo) is its own upstream, and the key is the one a literal prefix for the same repository
+    // had, so replacing those with a template keeps what they cached.
+    var servers = Build("/github.com/{owner}/{repo}/releases/download", "/gh/{owner}/{repo}=github.com/{owner}/{repo}/releases/download",
+      "/github.com/JetBrains/kotlin/releases/download");
+    var template = servers[0];
+
+    Assert.Equal("https://github.com/JetBrains/kotlin/releases/download/v2.0/kotlin.zip",
+      template.GetUpstreamUri("v2.0/kotlin.zip", Values("JetBrains", "kotlin"))?.AbsoluteUri);
+    Assert.Equal(servers[2].GetUpstreamUri("v2.0/kotlin.zip")!.ManglePath(),
+      template.GetUpstreamUri("v2.0/kotlin.zip", Values("JetBrains", "kotlin"))!.ManglePath());
+    Assert.Equal(servers[2].GetUpstreamUri("v2.0/kotlin.zip")!.ManglePath(),
+      servers[1].GetUpstreamUri("v2.0/kotlin.zip", Values("JetBrains", "kotlin"))!.ManglePath());
+    Assert.NotEqual(template.GetUpstreamUri("v1/a.zip", Values("a", "b"))!.ManglePath(),
+      template.GetUpstreamUri("v1/a.zip", Values("a", "c"))!.ManglePath());
+    Assert.Equal("https://github.com/o/r/releases/download/", template.GetUpstreamUri(null, Values("o", "r"))?.AbsoluteUri);
+  }
+
+  [Theory]
+  [InlineData(".")]
+  [InlineData("..")]
+  [InlineData("%2e%2e")] // what "%252e%252e" decodes to, which System.Uri would collapse to ".."
+  [InlineData("a%2Fb")]  // Kestrel keeps an escaped slash escaped
+  [InlineData("a/b")]
+  [InlineData("a b")]
+  [InlineData("")]
+  public void A_Template_Value_That_Is_Not_One_Plain_Segment_Is_Rejected(string owner)
+  {
+    // Spliced into the path unescaped, so a dot segment or an escape would move the base itself, past the
+    // containment check that is measured against that base.
+    var server = Assert.Single(Build("/github.com/{owner}/{repo}/releases/download"));
+    Assert.Null(server.GetUpstreamUri("v1/a.zip", Values(owner, "r")));
+  }
+
+  [Fact]
+  public void A_Template_Without_Its_Route_Values_Resolves_Nothing()
+  {
+    var server = Assert.Single(Build("/github.com/{owner}/{repo}/releases/download"));
+    Assert.Null(server.GetUpstreamUri("v1/a.zip"));
+    Assert.Null(server.GetUpstreamUri("v1/a.zip", new RouteValueDictionary { ["owner"] = "o" }));
+  }
+
+  [Theory]
+  [InlineData("/x/a.zip")]
+  [InlineData("../../other/releases/download/a.zip")]
+  [InlineData("%2e%2e/%2e%2e/other/releases/download/a.zip")]
+  [InlineData("https://evil.example/a.zip")]
+  public void A_Template_Remainder_Stays_Inside_Its_Concrete_Base(string remainingPath)
+  {
+    var server = Assert.Single(Build("/github.com/{owner}/{repo}/releases/download"));
+    Assert.Null(server.GetUpstreamUri(remainingPath, Values("o", "r")));
+  }
+
+  [Theory]
+  [InlineData("/gh/{owner}=github.com/x")]                     // alias placeholder unused upstream
+  [InlineData("/gh=github.com/{owner}")]                       // upstream placeholder with no value
+  [InlineData("/gh/{owner}=github.com/{repo}")]
+  [InlineData("/gh/{owner}/{repo}=github.com/{owner}/{owner}")]
+  [InlineData("/gh/{owner}={owner}.github.io/x")]              // never in the host
+  [InlineData("/gh/{owner}=https://{owner}.example.com/x")]
+  [InlineData("/gh/{owner}=example.com:{owner}/x")]
+  [InlineData("/gh/{owner}=github.com/v{owner}")]              // whole segments only
+  [InlineData("/gh/v{owner}=github.com/{owner}")]
+  [InlineData("/gh/{owner}=github.com/{owner}}")]
+  [InlineData("/gh/{owner?}=github.com/{owner}")]
+  [InlineData("/gh/{owner:int}=github.com/{owner}")]
+  [InlineData("/gh/{owner=x}=github.com/{owner}")]
+  [InlineData("/gh/{**owner}=github.com/{owner}")]
+  [InlineData("/gh/{path}=github.com/{path}")]                 // the catch-all's own name
+  [InlineData("/gh/{own_er}=github.com/{own_er}")]
+  [InlineData("/gh/{owner=github.com/{owner}")]
+  [InlineData("/gh/{owner}=github.com/{owner}/x?y")]
+  public void A_Malformed_Template_Is_Rejected_At_Startup(string prefix) =>
+    Assert.Throws<ArgumentException>(() => Build(prefix));
+
+  [Fact]
+  public void A_Template_Is_Refused_A_Namespace_Or_Rewrite_At_Startup()
+  {
+    Assert.Throws<ArgumentException>(() => Build(new CachingProxyConfig
+    {
+      CachingProfiles = { ["docker"] = new CachingProfile { Oci = true } },
+      Prefixes = [new CachingProxyPrefix("/v2/{owner}=registry.example.com/v2/{owner}", Profile: "docker", DefaultNamespace: "library")],
+    }));
+    Assert.Throws<ArgumentException>(() => Build(new CachingProxyConfig
+    {
+      PublicUrl = "https://cr.example",
+      CachingProfiles = { ["pypi"] = new CachingProfile { Rules = [new CachingRule { Pattern = ".", RewriteUrls = true }] } },
+      Prefixes = [new CachingProxyPrefix("/pypi/{owner}=pypi.example.com/{owner}", Profile: "pypi")],
+    }));
+  }
+
+  [Fact]
+  public void A_Template_Stays_Out_Of_Every_Upstream_Auth_Scope()
+  {
+    // The private prefix's cache entries are keyed by the same upstream URL, and only it may serve them. Its
+    // scope is matched like any other, down to a path boundary and in any case.
+    var servers = Build(new CachingProxyConfig
+    {
+      Prefixes =
+      [
+        "/github.com/{owner}/{repo}/releases/download",
+        "/github.com/JetBrains/jbdu/releases/download",
+      ],
+      UpstreamAuth =
+      {
+        ["jbdu"] = new UpstreamAuth { UrlPrefixes = ["github.com/JetBrains/jbdu/releases/download/"], Username = "u", Password = "p" },
+        ["owned"] = new UpstreamAuth { UrlPrefixes = ["github.com/owned/"], Username = "u", Password = "p" },
+      },
+    });
+    var template = servers[0];
+
+    Assert.Null(template.GetUpstreamUri("v1/a.zip", Values("JetBrains", "jbdu")));
+    Assert.Null(template.GetUpstreamUri(null, Values("JetBrains", "jbdu")));
+    Assert.Null(template.GetUpstreamUri("v1/a.zip", Values("jetbrains", "JBDU")));
+    Assert.Null(template.GetUpstreamUri("v1/a.zip", Values("owned", "r")));
+    Assert.NotNull(template.GetUpstreamUri("v1/a.zip", Values("JetBrains", "jbdu2")));
+    Assert.NotNull(servers[1].GetUpstreamUri("v1/a.zip"));
+  }
+
+  [Fact]
+  public void A_Template_Takes_The_Credential_That_Covers_Its_Head_And_No_Other()
+  {
+    // The head is what the credential is matched on, so the template fetches every repository under it with
+    // that credential and is gated like any credentialed prefix. A narrower scope of another entry is still
+    // that entry's: neither its cache entries nor its upstream paths are this template's to serve.
+    var org = new UpstreamAuth { UrlPrefixes = ["github.com/JetBrains/"], Username = "u", Password = "p" };
+    var other = new UpstreamAuth { UrlPrefixes = ["github.com/JetBrains/special/"], Username = "v", Password = "q" };
+    var endpoint = Assert.Single(new RemoteServers(new CachingProxyConfig
+    {
+      Prefixes = ["/github.com/JetBrains/{repo}/releases/download"],
+      UpstreamAuth = { [nameof(org)] = org, [nameof(other)] = other },
+    }, new NullLogger<RemoteServers>()).Endpoints);
+    var template = endpoint.Metadata.GetMetadata<RemoteServers.RemoteServer>()!;
+
+    Assert.Same(org, template.Auth);
+    Assert.NotNull(endpoint.Metadata.GetMetadata<IAuthorizeData>());
+    var values = new RouteValueDictionary { ["repo"] = "jbdu" };
+    Assert.Equal("https://github.com/JetBrains/jbdu/releases/download/v1/a.zip",
+      template.GetUpstreamUri("v1/a.zip", values)?.AbsoluteUri);
+    Assert.Null(template.GetUpstreamUri("v1/a.zip", new RouteValueDictionary { ["repo"] = "special" }));
+  }
+
+  [Fact]
+  public void A_Credentialed_Template_Must_Reach_Its_Upstream_Over_Https()
+  {
+    Assert.Throws<ArgumentException>(() => Build(new CachingProxyConfig
+    {
+      Prefixes = ["/gh/{repo}=http://github.example.com/org/{repo}"],
+      UpstreamAuth = { ["org"] = new UpstreamAuth { UrlPrefixes = ["github.example.com/org/"], Username = "u", Password = "p" } },
+    }));
+  }
+
   // Collects what RemoteServers logged at Warning or above, so a startup misconfiguration can be asserted
   // on. The per-prefix Information lines are dropped, since IsEnabled gates them out.
   private sealed class WarningLogger : ILogger<RemoteServers>
