@@ -1951,7 +1951,23 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
       Prefixes = [new CachingProxyPrefix($"/real={myUpstreamServer.Url}", Profile: "fresh", Retention: retention)],
       MinimumFreeDiskSpaceMb = 2,
     };
+    return CreateExtraServer(config);
+  }
 
+  // A template, and a literal prefix inside its space that routing must prefer.
+  private TestServer CreateTemplateServer() => CreateExtraServer(new CachingProxyConfig
+  {
+    LocalCachePath = myTempDirectory,
+    Prefixes =
+    [
+      $"/t/{{owner}}/{{repo}}={myUpstreamServer.Url}{{owner}}/{{repo}}",
+      $"/t/group/artifact={myUpstreamServer.Url}express/-",
+    ],
+    MinimumFreeDiskSpaceMb = 2,
+  });
+
+  private TestServer CreateExtraServer(CachingProxyConfig config)
+  {
     var host = new HostBuilder()
       .ConfigureWebHost(webHostBuilder => webHostBuilder
         .UseTestServer()
@@ -1990,6 +2006,38 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
     var jarMetadata = CacheEntryMetadata.TryParse(await File.ReadAllTextAsync(CacheFileProvider.GetMetadataPath(jarFile)));
     Assert.NotNull(jarMetadata);
     Assert.Null(jarMetadata.Retention);
+  }
+
+  [Fact]
+  public async Task A_Template_Prefix_Fetches_And_Caches_The_Upstream_Its_Route_Values_Name()
+  {
+    var server = CreateTemplateServer();
+    using (var response = await server.CreateRequest("/t/express/-/express-1.0.0.tgz").GetAsync())
+    {
+      Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+      Assert.Equal("npm-tarball-content", await response.Content.ReadAsStringAsync());
+    }
+
+    Assert.Equal("/express/-/express-1.0.0.tgz", myUpstreamServer.LastRawTarget);
+    Assert.True(File.Exists(Path.Combine(myTempDirectory,
+      new Uri(myUpstreamServer.Url, "express/-/express-1.0.0.tgz").GetFutureCacheFileLocation())));
+  }
+
+  [Fact]
+  public async Task A_Literal_Prefix_Inside_A_Template_Wins()
+  {
+    // Through the template this would be /group/artifact/express-1.0.0.tgz, which the upstream 404s.
+    using var response = await CreateTemplateServer().CreateRequest("/t/group/artifact/express-1.0.0.tgz").GetAsync();
+    Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    Assert.Equal("/express/-/express-1.0.0.tgz", myUpstreamServer.LastRawTarget);
+  }
+
+  [Fact]
+  public async Task A_Template_Value_That_Is_Not_One_Plain_Segment_Is_A_Bad_Request()
+  {
+    using var response = await CreateTemplateServer().CreateRequest("/t/express%2Fx/-/express-1.0.0.tgz").GetAsync();
+    Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    AssertStatusHeader(response, CachingProxyStatus.BAD_REQUEST);
   }
 
   private IEnumerable<string> CacheFiles() =>
