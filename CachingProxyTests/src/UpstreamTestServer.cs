@@ -541,6 +541,7 @@ public class UpstreamTestServer : IAsyncLifetime
       .MapGet("name with spaces.jar", (req, res, data) => res.WriteAsync("zzz.jar"))
       .MapGet("name+with+plus.jar", (req, res, data) => res.WriteAsync("zzz.jar"))
       .MapGet("@username/package/-/package-3.1.2.tgz", (req, res, data) => res.WriteAsync("package-3.1.2.tgz"))
+      .MapGet("github.com/!microsoft/go-winio/@v/v0.6.2.info", (req, res, data) => res.WriteAsync("go-winio-info"))
       .MapGet("a.jar/b.jar", (req, res, data) => res.WriteAsync("b.jar"))
       .MapGet("a.html", (req, res, data) =>
       {

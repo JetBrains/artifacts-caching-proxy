@@ -39,7 +39,8 @@ public partial class RemoteProxy(
   // how a registry client addresses every layer and every resolved manifest. It cannot reach a cache
   // filename: those are SHA256 hashes plus Path.GetExtension of the path, which is empty for a segment
   // whose only ':' follows no dot (so NTFS alternate data streams stay out of reach).
-  [GeneratedRegex(@"^([\x20a-zA-Z_\-0-9./+@:]|%[0-9a-fA-F]{2})+$", RegexOptions.Compiled)]
+  // '!' is the Go module proxy's escape for an uppercase letter ("/github.com/!microsoft/go-winio/@v/list").
+  [GeneratedRegex(@"^([\x20a-zA-Z_\-0-9./+@:!]|%[0-9a-fA-F]{2})+$", RegexOptions.Compiled)]
   private static partial Regex OurGoodPathChars { get; }
 
   private readonly Regex? myBlacklistRegex = !string.IsNullOrWhiteSpace(config.BlacklistUrlRegex) ?

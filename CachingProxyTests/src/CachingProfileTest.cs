@@ -481,6 +481,59 @@ public class CachingProfileTest
     Assert.DoesNotContain(profile.Rules, rule => rule.Redirect);
   }
 
+  [Fact]
+  public void Go_Profile_Caches_Canonical_Versions_Forever_And_Revalidates_Queries()
+  {
+    // Mirrors the shipped go profile (appsettings.json). A canonical version's .info/.mod/.zip never
+    // change; lists, @latest and queries resolve anew as the module moves.
+    var profile = GoProfile();
+
+    foreach (var immutable in new[]
+             {
+               "/proxy.golang.org/github.com/mattn/go-runewidth/@v/v0.0.27.info",
+               "/proxy.golang.org/github.com/mattn/go-runewidth/@v/v0.0.27.mod",
+               "/proxy.golang.org/github.com/mattn/go-runewidth/@v/v0.0.27.zip",
+               "/proxy.golang.org/github.com/!jet!brains/fus-reporting-api-go/@v/v0.0.0-20250623101457-c9c5e6c8b4d1.zip",
+               "/proxy.golang.org/github.com/coder/websocket/v2/@v/v2.0.0-rc.1.mod",
+               "/proxy.golang.org/github.com/example/mod/@v/v1.0.0-!r!c1.info",
+               "/proxy.golang.org/github.com/docker/docker/@v/v28.0.1+incompatible.zip",
+               "/proxy.golang.org/golang.org/toolchain/@v/v0.0.1-go1.27.3.linux-amd64.zip",
+             })
+    {
+      var rule = profile.Match(immutable);
+      Assert.NotNull(rule);
+      Assert.Null(rule!.RefreshAfter);
+    }
+
+    foreach (var mutable in new[]
+             {
+               "/proxy.golang.org/github.com/mattn/go-runewidth/@v/list",
+               "/proxy.golang.org/github.com/mattn/go-runewidth/@latest",
+               "/proxy.golang.org/github.com/mattn/go-runewidth/@v/master.info",
+               "/proxy.golang.org/github.com/mattn/go-runewidth/@v/v0.info",
+               "/proxy.golang.org/github.com/mattn/go-runewidth/@v/v0.0.info",
+               "/proxy.golang.org/github.com/mattn/go-runewidth/@v/v0.0.27.info.bak",
+               "/proxy.golang.org/sumdb/sum.golang.org/supported",
+             })
+    {
+      var rule = profile.Match(mutable);
+      Assert.NotNull(rule);
+      Assert.Equal(TimeSpan.FromMinutes(5), rule!.RefreshAfter);
+    }
+
+    Assert.DoesNotContain(profile.Rules, rule => rule.Redirect);
+  }
+
+  // The shipped go profile, kept in the same order as CachingProxy/appsettings.json.
+  private static CachingProfile GoProfile() => new()
+  {
+    Rules =
+    [
+      new CachingRule { Pattern = @"/@v/v\d+\.\d+\.\d+(?:-[0-9A-Za-z.!-]+)?(?:\+incompatible)?\.(?:info|mod|zip)$" },
+      new CachingRule { Pattern = ".", RefreshAfter = TimeSpan.FromMinutes(5) },
+    ]
+  };
+
   // The shipped nodejs-dist profile, kept in the same order as CachingProxy/appsettings.json.
   private static CachingProfile NodejsDistProfile() => new()
   {
