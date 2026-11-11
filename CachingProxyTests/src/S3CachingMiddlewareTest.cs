@@ -855,6 +855,20 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   }
 
   [Fact]
+  public async Task Existing_Empty_Object_Is_Served_Inline()
+  {
+    var server = CreateServer(signedLinks: true);
+    myS3.Objects[GetPathKey("/real/a.jar")] = ([], "text/plain", null);
+    using var response = await server.CreateRequest("/real/a.jar").SendAsync(HttpMethod.Get.Method);
+
+    Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    AssertStatusHeader(response, CachingProxyStatus.MISS);
+    Assert.Empty(await response.Content.ReadAsByteArrayAsync());
+    Assert.Equal(2, myS3.GetObjectCalls); // the ranged probe, then the whole object
+    Assert.Equal(0, myS3.PutObjectCalls);
+  }
+
+  [Fact]
   public async Task Object_Exactly_Prefetch_Window_Size_Is_Inlined()
   {
     // Boundary: an object whose size equals the prefetch window is fully returned by the probe
@@ -1744,6 +1758,21 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
         throw new AmazonS3Exception(nameof(HttpStatusCode.NotFound)) { StatusCode = HttpStatusCode.NotFound };
 
       var total = obj.Body.Length;
+      if (request.ByteRange == null)
+      {
+        var whole = new GetObjectResponse
+        {
+          HttpStatusCode = HttpStatusCode.OK,
+          ResponseStream = new MemoryStream(obj.Body),
+          ContentLength = total,
+          ETag = obj.ETag,
+        };
+        whole.Headers.ContentType = obj.ContentType;
+        return whole;
+      }
+      if (total == 0)
+        throw new AmazonS3Exception("InvalidRange") { StatusCode = HttpStatusCode.RequestedRangeNotSatisfiable };
+
       var start = (int)request.ByteRange.Start;
       var lastIndex = Math.Min((int)request.ByteRange.End, total - 1);
       var length = lastIndex - start + 1;

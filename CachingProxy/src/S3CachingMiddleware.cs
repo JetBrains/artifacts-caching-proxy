@@ -237,12 +237,15 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
         // Content-Range ("bytes <from>-<to>/<total>"), whose semantics are unambiguous: the bytes
         // returned are (to - from + 1) and the object's full size is the total.
         // When the returned range spans the whole object it fit the window, so
-        // inline it (shared by both verbs); otherwise we only got a slice and must redirect.
-        if (ContentRangeHeaderValue.TryParse(s3Object.ContentRange, out var contentRange)
-            && contentRange is { HasRange: true, HasLength: true }
-            && contentRange.To - contentRange.From + 1 == contentRange.Length)
+        // inline it (shared by both verbs); otherwise we only got a slice and must redirect. An empty
+        // object comes unranged (see ProbeAsync).
+        var contentRange = ContentRangeHeaderValue.TryParse(s3Object.ContentRange, out var parsedRange) ? parsedRange : null;
+        long? wholeLength = contentRange is { HasRange: true, HasLength: true } && contentRange.To - contentRange.From + 1 == contentRange.Length
+          ? contentRange.Length
+          : s3Object.ContentRange == null && s3Object.ContentLength == 0 ? 0 : null;
+        if (wholeLength is { } length)
         {
-          var body = new byte[contentRange.To!.Value - contentRange.From!.Value + 1];
+          var body = new byte[length];
           await s3Object.ResponseStream.ReadExactlyAsync(body, 0, body.Length, context.RequestAborted);
 
           var cachingResponse = new CachedResponse(s3Object) { StatusCode = HttpStatusCode.OK, Body = body };
@@ -418,12 +421,20 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
   {
     try
     {
-      return await amazonS3.GetObjectAsync(new GetObjectRequest
+      try
       {
-        BucketName = config.S3!.BucketName,
-        Key = s3Key,
-        ByteRange = myPrefetchSize
-      }, cancellationToken);
+        return await amazonS3.GetObjectAsync(new GetObjectRequest
+        {
+          BucketName = config.S3!.BucketName,
+          Key = s3Key,
+          ByteRange = myPrefetchSize
+        }, cancellationToken);
+      }
+      // S3 refuses any range of an empty object (an empty Go @v/list), so read it whole.
+      catch (AmazonServiceException ex) when (ex.StatusCode is HttpStatusCode.RequestedRangeNotSatisfiable)
+      {
+        return await amazonS3.GetObjectAsync(new GetObjectRequest { BucketName = config.S3!.BucketName, Key = s3Key }, cancellationToken);
+      }
     }
     catch (AmazonServiceException ex) when (ex.StatusCode is HttpStatusCode.NotFound)
     {
