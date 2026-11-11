@@ -377,6 +377,14 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
     await AssertGetResponse(url, HttpStatusCode.OK, (message, bytes) => Assert.Equal("go-winio-info", Encoding.UTF8.GetString(bytes)));
   }
 
+  [Theory]
+  [InlineData("/real/git.sr.ht/~sbinet/gg/@v/v0.3.1.mod")]
+  [InlineData("/real/git.sr.ht/%7Esbinet/gg/@v/v0.3.1.mod")]
+  public async Task Path_With_Go_Tilde(string url)
+  {
+    await AssertGetResponse(url, HttpStatusCode.OK, (message, bytes) => Assert.Equal("gg-mod", Encoding.UTF8.GetString(bytes)));
+  }
+
   [Fact]
   public async Task Path_With_Percent_Encoded_Slash()
   {

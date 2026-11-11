@@ -1121,7 +1121,7 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   public async Task Invalid_Path_Is_Rejected_Before_Probing_S3()
   {
     var server = CreateServer(signedLinks: true);
-    using var response = await server.CreateRequest("/real/bad~name.jar").SendAsync(HttpMethod.Get.Method);
+    using var response = await server.CreateRequest("/real/bad*name.jar").SendAsync(HttpMethod.Get.Method);
 
     Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
     AssertStatusHeader(response, CachingProxyStatus.BAD_REQUEST);
