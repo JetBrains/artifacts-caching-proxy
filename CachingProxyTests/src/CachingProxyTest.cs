@@ -82,7 +82,7 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
         },
         // The nuget profile, in the shipped order (appsettings.json): package content under
         // {id}/{version}/ is immutable and cached forever, every index document over the feed grows and
-        // revalidates on an hourly window. Nothing redirects - a synthesized service index advertises
+        // revalidates on a five-minute window. Nothing redirects - a synthesized service index advertises
         // NuGet's query-carrying endpoints away from these prefixes entirely.
         ["nuget"] = new()
         {
@@ -91,9 +91,9 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
             new CachingRule { Pattern = @"\.nupkg$" },
             new CachingRule { Pattern = @"\.snupkg$" },
             new CachingRule { Pattern = @"\.nuspec$" },
-            new CachingRule { Pattern = "/v3/registration[^/]*/", RefreshAfter = TimeSpan.FromHours(1), RewriteUrls = true },
-            new CachingRule { Pattern = @"/v3/vulnerabilities/index\.json$", RefreshAfter = TimeSpan.FromHours(1), RewriteUrls = true },
-            new CachingRule { Pattern = ".", RefreshAfter = TimeSpan.FromHours(1) },
+            new CachingRule { Pattern = "/v3/registration[^/]*/", RefreshAfter = TimeSpan.FromMinutes(5), RewriteUrls = true },
+            new CachingRule { Pattern = @"/v3/vulnerabilities/index\.json$", RefreshAfter = TimeSpan.FromMinutes(5), RewriteUrls = true },
+            new CachingRule { Pattern = ".", RefreshAfter = TimeSpan.FromMinutes(5) },
           ]
         },
         // The docker profile, in the shipped order (appsettings.json): digest-addressed blobs and
@@ -956,7 +956,7 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
   public async Task Nuget_Version_List_Is_Revalidated_And_Served_Stale()
   {
     // The flat-container version list gains an entry on every publish, so it falls to the catch-all and
-    // revalidates hourly rather than being cached forever.
+    // revalidates every five minutes rather than being cached forever.
     const string path = "/real-nuget/v3-flatcontainer/newtonsoft.json/index.json";
     myUpstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.Ok;
 
@@ -964,7 +964,7 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
       (message, bytes) =>
       {
         AssertStatusHeader(message, CachingProxyStatus.MISS);
-        Assert.Equal("public, max-age=3600", message.Headers.CacheControl?.ToString());
+        Assert.Equal("public, max-age=300", message.Headers.CacheControl?.ToString());
         Assert.Contains("13.0.3", Encoding.UTF8.GetString(bytes));
       });
 
@@ -972,7 +972,7 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
       (message, bytes) => AssertStatusHeader(message, CachingProxyStatus.HIT));
 
     // Past the window it revalidates; a 304 keeps the stored copy.
-    myTimeProvider.Advance(TimeSpan.FromMinutes(61));
+    myTimeProvider.Advance(TimeSpan.FromMinutes(6));
     myUpstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.NotModified;
     await AssertGetResponse(path, HttpStatusCode.OK,
       (message, bytes) =>
@@ -983,7 +983,7 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
 
     // The offline guarantee this ticket is about: with the upstream unreachable, a restore still
     // resolves off the stored version list instead of failing or being bounced to nuget.org.
-    myTimeProvider.Advance(TimeSpan.FromMinutes(61));
+    myTimeProvider.Advance(TimeSpan.FromMinutes(6));
     myUpstreamServer.Revalidate = UpstreamTestServer.RevalidateBehavior.ServerError;
     await AssertGetResponse(path, HttpStatusCode.OK,
       (message, bytes) =>
@@ -1004,7 +1004,7 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
       {
         AssertStatusHeader(message, CachingProxyStatus.MISS);
         Assert.Equal("gzip", message.Content.Headers.ContentEncoding.SingleOrDefault());
-        Assert.Equal("public, max-age=3600", message.Headers.CacheControl?.ToString());
+        Assert.Equal("public, max-age=300", message.Headers.CacheControl?.ToString());
       });
 
     await AssertGetResponse("/real-nuget/gzipEncoding.txt", HttpStatusCode.OK,

@@ -186,21 +186,21 @@ public class CachingProfileTest
     // The flat-container version list gains an entry on every publish.
     var versions = profile.Match("/api.nuget.org/v3-flatcontainer/newtonsoft.json/index.json");
     Assert.NotNull(versions);
-    Assert.Equal(TimeSpan.FromHours(1), versions!.RefreshAfter);
+    Assert.Equal(TimeSpan.FromMinutes(5), versions!.RefreshAfter);
 
     // Registration documents carry deprecation and vulnerability metadata, which changes in place.
     var registration = profile.Match("/api.nuget.org/v3/registration5-gz-semver2/newtonsoft.json/index.json");
     Assert.NotNull(registration);
-    Assert.Equal(TimeSpan.FromHours(1), registration!.RefreshAfter);
+    Assert.Equal(TimeSpan.FromMinutes(5), registration!.RefreshAfter);
 
     var page = profile.Match("/api.nuget.org/v3/registration5-gz-semver2/newtonsoft.json/page/3.0.0/13.0.3.json");
     Assert.NotNull(page);
-    Assert.Equal(TimeSpan.FromHours(1), page!.RefreshAfter);
+    Assert.Equal(TimeSpan.FromMinutes(5), page!.RefreshAfter);
 
     // The vulnerability index is republished as advisories land.
     var vulnerabilities = profile.Match("/api.nuget.org/v3/vulnerabilities/index.json");
     Assert.NotNull(vulnerabilities);
-    Assert.Equal(TimeSpan.FromHours(1), vulnerabilities!.RefreshAfter);
+    Assert.Equal(TimeSpan.FromMinutes(5), vulnerabilities!.RefreshAfter);
 
     // MRI-4855: the documents whose links a client follows are rewritten, under nuget.org's registration
     // shapes and Space's registration1 alike. The version list and package content are not.
@@ -226,7 +226,7 @@ public class CachingProfileTest
 
     var index = profile.Match("/api.nuget.org/v3-flatcontainer/some.nupkg.tool/index.json");
     Assert.NotNull(index);
-    Assert.Equal(TimeSpan.FromHours(1), index!.RefreshAfter);
+    Assert.Equal(TimeSpan.FromMinutes(5), index!.RefreshAfter);
   }
 
   [Fact]
@@ -579,9 +579,9 @@ public class CachingProfileTest
       new CachingRule { Pattern = @"\.nupkg$" },
       new CachingRule { Pattern = @"\.snupkg$" },
       new CachingRule { Pattern = @"\.nuspec$" },
-      new CachingRule { Pattern = "/v3/registration[^/]*/", RefreshAfter = TimeSpan.FromHours(1), RewriteUrls = true },
-      new CachingRule { Pattern = @"/v3/vulnerabilities/index\.json$", RefreshAfter = TimeSpan.FromHours(1), RewriteUrls = true },
-      new CachingRule { Pattern = ".", RefreshAfter = TimeSpan.FromHours(1) },
+      new CachingRule { Pattern = "/v3/registration[^/]*/", RefreshAfter = TimeSpan.FromMinutes(5), RewriteUrls = true },
+      new CachingRule { Pattern = @"/v3/vulnerabilities/index\.json$", RefreshAfter = TimeSpan.FromMinutes(5), RewriteUrls = true },
+      new CachingRule { Pattern = ".", RefreshAfter = TimeSpan.FromMinutes(5) },
     ]
   };
 
