@@ -97,6 +97,7 @@ public static class Program
       .AddSingleton(TimeProvider.System)
       .AddSingleton<CachingProxyMetrics>()
       .AddSingleton<ResponseCache>()
+      .AddSingleton<S3RequestSigner>(static sp => new S3RequestSigner(sp.GetRequiredService<TimeProvider>()))
       .AddSingleton<RemoteProxy>()
       .AddSingleton<RemoteServers>()
       .ConfigureOptions<HealthCheck>()

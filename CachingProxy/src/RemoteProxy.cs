@@ -33,7 +33,8 @@ public partial class RemoteProxy(
   CachingProxyMetrics metrics,
   ILogger<RemoteProxy> logger,
   IUpstreamAuthorizationProvider? authProvider = null,
-  RegistryTokenProvider? registryTokenProvider = null)
+  RegistryTokenProvider? registryTokenProvider = null,
+  S3RequestSigner? s3Signer = null)
 {
   // ':' is for OCI digest references ("/blobs/sha256:<hex>").
   [GeneratedRegex(@"^([\x20a-zA-Z_\-0-9./+@:!~]|%[0-9a-fA-F]{2})+$", RegexOptions.Compiled)]
@@ -487,7 +488,12 @@ public partial class RemoteProxy(
   {
     if (registryTokenProvider == null || profile is not { Oci: true })
     {
-      request.Headers.Authorization = credentials;
+      // A virtual-hosted S3 upstream is signed as our own AWS identity, so a private bucket that grants it read
+      // access needs no credential of its own (see S3RequestSigner). An UpstreamAuth entry still wins.
+      if (credentials == null && s3Signer != null && S3Bucket.FromUri(upstreamUri) is { } bucket)
+        await s3Signer.SignAsync(request, bucket, cancellationToken);
+      else
+        request.Headers.Authorization = credentials;
       return await httpClient.Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
     }
 
