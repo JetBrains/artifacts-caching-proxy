@@ -19,7 +19,7 @@ namespace JetBrains.CachingProxy.Tests;
 [CollectionDefinition(nameof(WebIdentityCredentialsTest), DisableParallelization = true)]
 public class WebIdentityCredentialsTest
 {
-  private const string RoleArn = "arn:aws:iam::840632698608:role/codeartifact-reader-eqx";
+  private const string RoleArn = "arn:aws:iam::840632698608:role/artifacts-caching-proxy-eqx";
 
   [Fact]
   public void The_Default_Chain_Picks_Web_Identity_From_The_Environment()
