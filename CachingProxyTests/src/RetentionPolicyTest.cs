@@ -20,6 +20,7 @@ public class RetentionPolicyTest : IDisposable
   [Theory]
   [InlineData("1d", 1)]
   [InlineData("3d", 3)]
+  [InlineData("7d", 7)]
   [InlineData("30d", 30)]
   [InlineData("180d", 180)]
   [InlineData("1y", 365)]
@@ -38,7 +39,7 @@ public class RetentionPolicyTest : IDisposable
     // Copied in Cache-Redirector: the Kotlin `Retention` enum (config-gen) and the data bucket lifecycle
     // rules (`data_bucket.tf`). A change here needs both.
     Assert.Equal(
-      [("1d", 1), ("3d", 3), ("30d", 30), ("180d", 180), ("1y", 365)],
+      [("1d", 1), ("3d", 3), ("7d", 7), ("30d", 30), ("180d", 180), ("1y", 365)],
       RetentionPolicy.All.Select(static p => (p.Name, (int)p.Period.TotalDays)));
     // `data_bucket_default_expiration_days`.
     Assert.Equal(TimeSpan.FromDays(365), RetentionPolicy.S3Default.Period);
@@ -71,7 +72,7 @@ public class RetentionPolicyTest : IDisposable
 
   [Theory]
   [InlineData("2d")]
-  [InlineData("7d")]
+  [InlineData("14d")]
   [InlineData("365d")]
   [InlineData("forever")]
   public void A_Prefix_With_An_Unknown_Retention_Fails_Startup(string retention)

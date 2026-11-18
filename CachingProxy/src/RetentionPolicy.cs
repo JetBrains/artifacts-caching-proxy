@@ -15,11 +15,12 @@ public sealed record RetentionPolicy
 
   public static readonly RetentionPolicy OneDay = new("1d", TimeSpan.FromDays(1));
   public static readonly RetentionPolicy ThreeDays = new("3d", TimeSpan.FromDays(3));
+  public static readonly RetentionPolicy SevenDays = new("7d", TimeSpan.FromDays(7));
   public static readonly RetentionPolicy ThirtyDays = new("30d", TimeSpan.FromDays(30));
   public static readonly RetentionPolicy HalfYear = new("180d", TimeSpan.FromDays(180));
   public static readonly RetentionPolicy OneYear = new("1y", TimeSpan.FromDays(365));
 
-  public static IReadOnlyList<RetentionPolicy> All { get; } = [OneDay, ThreeDays, ThirtyDays, HalfYear, OneYear];
+  public static IReadOnlyList<RetentionPolicy> All { get; } = [OneDay, ThreeDays, SevenDays, ThirtyDays, HalfYear, OneYear];
 
   /// <summary>
   /// The bucket's catch-all expiration, which applies to tagged objects too: S3 takes the shortest
