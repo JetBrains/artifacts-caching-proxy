@@ -68,7 +68,8 @@ public partial class RemoteServers : EndpointDataSource
       // A matched entry with no credential is what a half-configured secret looks like: the prefix is gated
       // inbound, so it looks configured, while the upstream is reached anonymously - and an OCI upstream
       // mints its registry token anonymously too, which a private repository answers with a bare 403.
-      if (matchedAuth is { HasCredential: false })
+      // Not for a virtual-hosted S3 upstream: S3RequestSigner signs it as our own AWS identity.
+      if (matchedAuth is { HasCredential: false } && S3Bucket.FromUri(remoteUri) == null)
         logger.LogWarning(Event.IncompleteUpstreamAuth,
           "UpstreamAuth '{Name}' matched {Prefix} but has no credential to send, so {RemoteUri} is reached anonymously",
           matched!.Value.Key, remoteServer.Prefix, remoteServer.RemoteUri);

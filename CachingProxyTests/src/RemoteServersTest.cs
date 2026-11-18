@@ -571,6 +571,22 @@ public class RemoteServersTest
     Assert.Contains("/v2/private", warning.Message);
   }
 
+  [Fact]
+  public void A_Matched_Entry_With_No_Credential_For_An_S3_Bucket_Is_Not_Warned_About()
+  {
+    var bucket = new UpstreamAuth { UrlPrefixes = ["mirror.s3.eu-west-1.amazonaws.com/"] };
+    var config = new CachingProxyConfig
+    {
+      Prefixes = ["/files=mirror.s3.eu-west-1.amazonaws.com"],
+      UpstreamAuth = { [nameof(bucket)] = bucket },
+    };
+
+    var logger = new WarningLogger();
+    _ = new RemoteServers(config, logger);
+
+    Assert.Empty(logger.Warnings);
+  }
+
   private static RouteValueDictionary Values(string owner, string repo) => new() { ["owner"] = owner, ["repo"] = repo };
 
   [Fact]
