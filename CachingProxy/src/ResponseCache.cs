@@ -100,7 +100,7 @@ public sealed record CachedResponse(HttpStatusCode StatusCode, IHeaderDictionary
       Headers[DockerContentDigestHeader] = digest;
   }
 
-  public async ValueTask InvokeAsync(HttpContext context, CachingRule? rule = null)
+  public async ValueTask InvokeAsync(HttpContext context, CachingRule? rule = null, bool relaysUnsizedBody = false)
   {
     foreach (var (key, value) in Headers)
     {
@@ -108,7 +108,7 @@ public sealed record CachedResponse(HttpStatusCode StatusCode, IHeaderDictionary
         context.Response.Headers[key] = value;
     }
     context.Response.StatusCode = (int)StatusCode;
-    SetCachingHeaderFor(context, rule);
+    SetCachingHeaderFor(context, rule, relaysUnsizedBody);
 
     if (Body != null)
       await context.Response.BodyWriter.WriteAsync(Body, context.RequestAborted);
@@ -146,8 +146,15 @@ public sealed record CachedResponse(HttpStatusCode StatusCode, IHeaderDictionary
     context.User.Identity is { IsAuthenticated: true, AuthenticationType: RedirectSignatureAuthenticationHandler.SchemeName } &&
     context.Request.Headers[CachingProxyConstants.EdgeVerifiedHeader] == "1";
 
-  public static void SetCachingHeaderFor(HttpContext context, CachingRule? rule = null)
+  public static void SetCachingHeaderFor(HttpContext context, CachingRule? rule = null, bool relaysUnsizedBody = false)
   {
+    // See RemoteProxy.SetStatusAsync. Checked before the edge-cacheable flag, which would make CloudFront store it.
+    if (relaysUnsizedBody && context.Response.StatusCode is >= StatusCodes.Status200OK and < StatusCodes.Status300MultipleChoices)
+    {
+      context.Response.Headers.CacheControl = ourNoStoreHeaderValue;
+      return;
+    }
+
     // For successful (2xx) responses, the cached response is always eternally cacheable.
     if (context.Response.StatusCode is >= StatusCodes.Status200OK and < StatusCodes.Status300MultipleChoices)
     {

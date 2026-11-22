@@ -97,9 +97,9 @@ public class InboundAuthTest : IAsyncLifetime
           return res.WriteAsync("upstream-unauthorized");
         }
 
-        return res.WriteAsync(PrivateArtifact);
+        return res.WriteSizedAsync(PrivateArtifact);
       })
-      .MapGet("{*path}", (_, res, _) => res.WriteAsync("artifact-body")));
+      .MapGet("{*path}", (_, res, _) => res.WriteSizedAsync("artifact-body")));
 
     myCollectorServer = BuildKestrel(router => router.MapGet("{*path}", (req, res, _) =>
     {

@@ -229,7 +229,7 @@ public class UpstreamTestServer : IAsyncLifetime
         var wantsIndex = accept.Contains(IndexMediaType, StringComparison.OrdinalIgnoreCase);
         res.ContentType = wantsIndex ? IndexMediaType : ManifestMediaType;
         res.Headers[CachedResponse.DockerContentDigestHeader] = ManifestDigest;
-        return res.WriteAsync(wantsIndex ? "{\"manifests\":[]}" : "{\"layers\":[]}");
+        return res.WriteSizedAsync(wantsIndex ? "{\"manifests\":[]}" : "{\"layers\":[]}");
       })
       .MapGet($"v2/testimage/manifests/{ManifestDigest}", (req, res, data) =>
       {
@@ -237,14 +237,14 @@ public class UpstreamTestServer : IAsyncLifetime
         ManifestAcceptHeaders.Enqueue(req.Headers.Accept.ToString());
         res.ContentType = ManifestMediaType;
         res.Headers[CachedResponse.DockerContentDigestHeader] = ManifestDigest;
-        return res.WriteAsync("{\"layers\":[]}");
+        return res.WriteSizedAsync("{\"layers\":[]}");
       })
       .MapGet($"v2/testimage/blobs/{BlobDigest}", (req, res, data) =>
       {
         Interlocked.Increment(ref BlobRequestCount);
         res.ContentType = MediaTypeNames.Application.Octet;
         res.Headers[CachedResponse.DockerContentDigestHeader] = BlobDigest;
-        return res.WriteAsync("blob-content");
+        return res.WriteSizedAsync("blob-content");
       })
       .MapGet("slow.txt", async (req, res, data) =>
       {
@@ -387,7 +387,7 @@ public class UpstreamTestServer : IAsyncLifetime
             res.StatusCode = StatusCodes.Status500InternalServerError;
             return res.WriteAsync("boom");
           default:
-            return res.WriteAsync(RevalidateContent);
+            return res.WriteSizedAsync(RevalidateContent);
         }
       })
       .MapGet("group/artifact/maven-metadata.xml", (req, res, data) =>
@@ -400,17 +400,17 @@ public class UpstreamTestServer : IAsyncLifetime
           return Task.CompletedTask;
         }
         res.ContentType = MediaTypeNames.Text.Xml;
-        return res.WriteAsync("<metadata><versioning/></metadata>");
+        return res.WriteSizedAsync("<metadata><versioning/></metadata>");
       })
       .MapGet("group/artifact/1.0-SNAPSHOT/artifact-1.0-SNAPSHOT.jar", (req, res, data) =>
       {
         Interlocked.Increment(ref SnapshotRequestCount);
-        return res.WriteAsync("snapshot-jar-content");
+        return res.WriteSizedAsync("snapshot-jar-content");
       })
       .MapGet("archetype-catalog.xml", (req, res, data) =>
       {
         res.ContentType = MediaTypeNames.Text.Xml;
-        return res.WriteAsync("<archetype-catalog/>");
+        return res.WriteSizedAsync("<archetype-catalog/>");
       })
       .MapGet("express", (req, res, data) =>
       {
@@ -433,12 +433,12 @@ public class UpstreamTestServer : IAsyncLifetime
         res.ContentType = MediaTypeNames.Application.Json;
         // A validator to revalidate on, as registry.npmjs.org sends: without one the request is unconditional.
         res.Headers.LastModified = "Tue, 10 Jul 2018 04:58:42 GMT";
-        return res.WriteAsync("{\"name\":\"express\",\"dist-tags\":{\"latest\":\"1.0.0\"}}");
+        return res.WriteSizedAsync("{\"name\":\"express\",\"dist-tags\":{\"latest\":\"1.0.0\"}}");
       })
       .MapGet("express/-/express-1.0.0.tgz", (req, res, data) =>
       {
         Interlocked.Increment(ref TarballRequestCount);
-        return res.WriteAsync("npm-tarball-content");
+        return res.WriteSizedAsync("npm-tarball-content");
       })
       // NuGet v3 flat container. The version list is conditional-aware, like the npm packument, so the
       // nuget tests can script a 304 (kept) or a 5xx (serve stale) after the freshness window.
@@ -459,7 +459,7 @@ public class UpstreamTestServer : IAsyncLifetime
         }
         res.ContentType = MediaTypeNames.Application.Json;
         res.Headers.LastModified = "Tue, 10 Jul 2018 04:58:42 GMT"; // as api.nuget.org sends
-        return res.WriteAsync("{\"versions\":[\"13.0.3\"]}");
+        return res.WriteSizedAsync("{\"versions\":[\"13.0.3\"]}");
       })
       .MapGet("v3/registration5-semver1/newtonsoft.json/index.json", (req, res, data) =>
         RegistrationAsync(req, res, gzip: false))
@@ -468,7 +468,7 @@ public class UpstreamTestServer : IAsyncLifetime
       .MapGet("v3-flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg", (req, res, data) =>
       {
         Interlocked.Increment(ref NugetPackageRequestCount);
-        return res.WriteAsync("nupkg-content");
+        return res.WriteSizedAsync("nupkg-content");
       })
       .MapGet("a.jar", (req, res, data) => res.WriteAsync("a.jar"))
       // Declares Content-Length, which the routes around it do not: the byte counter reads a MISS's size
@@ -504,7 +504,10 @@ public class UpstreamTestServer : IAsyncLifetime
           gs.Write(textContent);
 
         if (mso.TryGetBuffer(out var buffer))
+        {
+          res.ContentLength = buffer.Count;
           return res.Body.WriteAsync(buffer).AsTask();
+        }
 
         return Task.CompletedTask;
       })
@@ -535,7 +538,7 @@ public class UpstreamTestServer : IAsyncLifetime
         res.Headers.ContentEncoding = "deflate, gzip";
         return res.WriteAsync("garbage");
       })
-      .MapGet("extensionless", (req, res, data) => res.WriteAsync("no-extension-content"))
+      .MapGet("extensionless", (req, res, data) => res.WriteSizedAsync("no-extension-content"))
       .MapVerb(HttpMethods.Head, "extensionless", (req, res, data) => Task.CompletedTask)
       .MapGet("@scope%2fpackage", (req, res, data) => res.WriteAsync("scoped-package-content"))
       .MapGet("name with spaces.jar", (req, res, data) => res.WriteAsync("zzz.jar"))
@@ -592,4 +595,15 @@ public class UpstreamTestServer : IAsyncLifetime
   public Task InitializeAsync() => myWebApp.StartAsync();
 
   public Task DisposeAsync() => myWebApp.StopAsync();
+}
+
+// Real registries declare a length; a bare WriteAsync goes out chunked, which the proxy keeps out of
+// downstream caches. Routes that test chunked upstreams on purpose (a.jar, chunked.bin) use WriteAsync.
+internal static class SizedResponseExtensions
+{
+  public static Task WriteSizedAsync(this HttpResponse response, string body)
+  {
+    response.ContentLength = System.Text.Encoding.UTF8.GetByteCount(body);
+    return response.WriteAsync(body);
+  }
 }

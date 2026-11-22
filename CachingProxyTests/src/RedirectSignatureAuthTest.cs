@@ -80,7 +80,7 @@ public class RedirectSignatureAuthTest : IAsyncLifetime
     {
       myLastUpstreamRequest = $"{req.Path} {req.Headers.Authorization}";
       if (!req.Path.StartsWithSegments("/secure/v3/registration1"))
-        return res.WriteAsync("artifact-body");
+        return res.WriteSizedAsync("artifact-body");
       // A registration document, whose links name the upstream itself.
       res.ContentType = "application/json";
       return res.WriteAsync($"{{\"@id\":\"{UrlOf(myUpstreamServer!)}{req.Path.Value![1..]}\"}}");

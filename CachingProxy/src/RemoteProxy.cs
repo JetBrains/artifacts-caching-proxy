@@ -565,7 +565,12 @@ public partial class RemoteProxy(
   {
     SetStatusHeader(context, status, rule, countContentBytes ? ContentLengthOf(response) : null);
 
-    await response.InvokeAsync(context, rule);
+    // A body relayed from an upstream that declared no length (GAR always sends chunked) goes out chunked.
+    // Strict clients (IntelliJ's JarHttpDownloader) reject that, and CloudFront would replay it for a year.
+    // Keep it out of downstream caches; the next request is served off the stored copy, with its length.
+    var relaysUnsizedBody = status is CachingProxyStatus.MISS or CachingProxyStatus.REVALIDATED &&
+                            response.Body == null && response.Headers.ContentLength == null;
+    await response.InvokeAsync(context, rule, relaysUnsizedBody);
   }
 
   // The size of the content a cached head stands for. A redirect describes something it does not carry, so

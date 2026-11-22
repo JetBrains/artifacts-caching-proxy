@@ -437,6 +437,37 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
   }
 
   [Fact]
+  public async Task Unsized_Miss_Is_Kept_Out_Of_Downstream_Caches()
+  {
+    // A chunked upstream (GAR) leaves the MISS without a Content-Length. CloudFront cached that for a year
+    // and JarHttpDownloader rejects it on every retry, so it must not be stored downstream. The HIT is
+    // served off the file with its length and is cacheable again.
+    await AssertGetResponse("/real/a.jar", HttpStatusCode.OK,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.MISS);
+        Assert.True(message.Headers.CacheControl?.NoStore);
+      });
+    await AssertGetResponse("/real/a.jar", HttpStatusCode.OK,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.HIT);
+        Assert.Equal(5, message.Content.Headers.ContentLength);
+        Assert.False(message.Headers.CacheControl?.NoStore);
+        Assert.True(message.Headers.CacheControl?.Public);
+      });
+
+    // An upstream that declares its length keeps the MISS cacheable.
+    await AssertGetResponse("/real/sized.jar", HttpStatusCode.OK,
+      (message, bytes) =>
+      {
+        AssertStatusHeader(message, CachingProxyStatus.MISS);
+        Assert.Equal(9, message.Content.Headers.ContentLength);
+        Assert.False(message.Headers.CacheControl?.NoStore);
+      });
+  }
+
+  [Fact]
   public async Task Content_Metric_Counts_The_Bytes_Served_To_The_Client()
   {
     // Traffic delivered, wherever it came from: a MISS relays the body from the upstream and a HIT reads it
@@ -816,7 +847,7 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
   {
     // An immutable coordinate on the maven-profiled prefix matches no rule => cached forever, with the
     // eternal 365-day max-age (not the shorter freshness windows the profile gives mutable endpoints).
-    await AssertGetResponse("/real/a.jar", HttpStatusCode.OK,
+    await AssertGetResponse("/real/sized.jar", HttpStatusCode.OK,
       (message, bytes) =>
       {
         AssertStatusHeader(message, CachingProxyStatus.MISS);
