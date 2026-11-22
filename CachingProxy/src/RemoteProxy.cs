@@ -565,7 +565,7 @@ public partial class RemoteProxy(
   {
     SetStatusHeader(context, status, rule, countContentBytes ? ContentLengthOf(response) : null);
 
-    // A body relayed from an upstream that declared no length (GAR always sends chunked) goes out chunked.
+    // A body relayed from an upstream that declared no length (GAR sends small files chunked) goes out chunked.
     // Strict clients (IntelliJ's JarHttpDownloader) reject that, and CloudFront would replay it for a year.
     // Keep it out of downstream caches; the next request is served off the stored copy, with its length.
     var relaysUnsizedBody = status is CachingProxyStatus.MISS or CachingProxyStatus.REVALIDATED &&
