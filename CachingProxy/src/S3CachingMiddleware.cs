@@ -353,7 +353,8 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
           // Pass the exception, not just its message: without it Sentry has no stack trace and the
           // throttled call (probe GetObject / PutObject / the CopyObject touch / DeleteObject) is
           // indistinguishable.
-          logger.LogError(Event.FailedToCacheInS3, ase, "Failed to cache {RequestPath} with S3 error {s3ErrorCode}: {s3ErrorMessage}", context.Request.Path, ase.ErrorCode, ase.Message);
+          // The request IDs are what AWS support asks for; the SDK keeps only the last attempt's.
+          logger.LogError(Event.FailedToCacheInS3, ase, "Failed to cache {RequestPath} with S3 error {s3ErrorCode} (request {s3RequestId}, host {s3HostId}): {s3ErrorMessage}", context.Request.Path, ase.ErrorCode, ase.RequestId, (ase as AmazonS3Exception)?.AmazonId2, ase.Message);
           break;
         default:
           logger.LogError(Event.FailedToCacheInS3, e, "Failed to cache {RequestPath}", context.Request.Path);
@@ -675,7 +676,8 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
         // Swallowed: the upload failure below is what the caller has to see, and this one only costs
         // storage. It is logged because that cost is otherwise silent.
         logger.LogWarning(Event.FailedToCacheInS3, abortFailure,
-          "Failed to abort multipart upload {UploadId} of {S3Key}", uploadId, s3Key);
+          "Failed to abort multipart upload {UploadId} of {S3Key} (S3 request {s3RequestId}, host {s3HostId})", uploadId, s3Key,
+          (abortFailure as AmazonServiceException)?.RequestId, (abortFailure as AmazonS3Exception)?.AmazonId2);
       }
 
       throw;
