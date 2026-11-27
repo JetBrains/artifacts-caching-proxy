@@ -18,6 +18,7 @@ public static class Event
   public static readonly EventId IncompleteUpstreamBody = new(10, nameof(IncompleteUpstreamBody));
   public static readonly EventId IncompleteUpstreamAuth = new(11, nameof(IncompleteUpstreamAuth));
   public static readonly EventId RewriteTooLarge = new(12, nameof(RewriteTooLarge));
+  public static readonly EventId UpstreamPending = new(13, nameof(UpstreamPending));
 
   private static readonly ConcurrentDictionary<HttpStatusCode, EventId> ourNegativeHitEventIDs = new();
   public static EventId NegativeMiss(HttpStatusCode httpStatusCode) =>

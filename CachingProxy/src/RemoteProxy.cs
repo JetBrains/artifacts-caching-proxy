@@ -10,6 +10,7 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.Extensions;
 using Microsoft.Extensions.Logging;
 using Microsoft.Net.Http.Headers;
 using Sentry;
@@ -32,6 +33,7 @@ public partial class RemoteProxy(
   ResponseCache responseCache,
   CachingProxyMetrics metrics,
   ILogger<RemoteProxy> logger,
+  OciPendingUpstreams pendingUpstreams,
   IUpstreamAuthorizationProvider? authProvider = null,
   RegistryTokenProvider? registryTokenProvider = null,
   S3RequestSigner? s3Signer = null)
@@ -240,12 +242,21 @@ public partial class RemoteProxy(
       var credentials = authProvider != null && auth != null ?
         await authProvider.GetAuthorizationHeaderAsync(auth, context.RequestAborted) : null;
       response = await SendAsync(request, upstreamUri, auth, profile, credentials, context.RequestAborted);
+      if (profile is { Oci: true })
+        pendingUpstreams.Resolved(cacheKey);
     }
     catch (OperationCanceledException canceledException)
     {
       if (canceledException.CancellationToken == context.RequestAborted) throw;
 
       // Canceled by internal token means timeout
+
+      if (profile is { Oci: true } && pendingUpstreams.KeepWaiting(cacheKey))
+      {
+        logger.LogInformation(Event.UpstreamPending, "No answer from {UpstreamUri} in time; sending the client back to ask again", upstreamUri);
+        await RedirectToSelfAsync(context, rule);
+        return null;
+      }
 
       logger.LogWarning(Event.Timeout, "Timeout requesting {UpstreamUri}", upstreamUri);
 
@@ -572,6 +583,24 @@ public partial class RemoteProxy(
                             response.Body == null && response.Headers.ContentLength == null;
     await response.InvokeAsync(context, rule, relaysUnsizedBody);
   }
+
+  /// <summary>
+  /// Sends the client back to the URL it asked for, so it asks again with its header timer reset (see
+  /// <see cref="OciPendingUpstreams"/>). The query rides along: the redirector's signature covers it, so the next
+  /// request authenticates like this one, until the signature expires. Relative, so it stays on whichever host
+  /// the client reached us by, CloudFront included. no-store: it answers about this moment, and an edge that kept
+  /// it would loop every client until it expired.
+  /// </summary>
+  public ValueTask RedirectToSelfAsync(HttpContext context, CachingRule? rule) =>
+    SetStatusAsync(context, CachingProxyStatus.UPSTREAM_PENDING,
+      new CachedResponse(HttpStatusCode.RedirectKeepVerb, new HeaderDictionary())
+      {
+        Headers =
+        {
+          Location = UriHelper.GetEncodedPathAndQuery(context.Request),
+          CacheControl = "no-store",
+        }
+      }, rule);
 
   // The size of the content a cached head stands for. A redirect describes something it does not carry, so
   // it states that size on an internal header instead (see S3CachingMiddleware.RedirectToBucket); anything

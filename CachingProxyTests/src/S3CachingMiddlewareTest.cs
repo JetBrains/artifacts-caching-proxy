@@ -59,7 +59,8 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
   private TestServer CreateServer(bool signedLinks, TimeSpan? signedLinkTTL = null, int inlineThresholdBytes = TestInlineThresholdBytes,
     CacheDuration? distributedCacheDuration = null, TimeSpan? refreshAfter = null, CacheDuration? prefixCacheDuration = null,
     bool varyByAccept = false, long? multipartThresholdBytes = null, int? multipartPartSizeBytes = null,
-    string? publicUrl = null, string? retention = null, TimeProvider? timeProvider = null, string? storageClass = null)
+    string? publicUrl = null, string? retention = null, TimeProvider? timeProvider = null, string? storageClass = null,
+    bool oci = false, long? requestTimeoutSec = null)
   {
     // When a freshness window is requested, drive it through a profile with a catch-all rule (so every
     // /real path is revalidated after the window) — mirroring how the disk tests exercise revalidation.
@@ -73,9 +74,16 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
       };
       prefix = new CachingProxyPrefix($"/real={upstreamServer.Url}", prefixCacheDuration, Profile: "fresh", Retention: retention);
     }
+    // The upstream as an OCI registry at /v2/real.
+    if (oci)
+    {
+      profiles["docker"] = new CachingProfile { Oci = true };
+      prefix = new CachingProxyPrefix($"/v2/real={upstreamServer.Url}", prefixCacheDuration, Profile: "docker", Retention: retention);
+    }
 
     var config = new CachingProxyConfig
     {
+      RequestTimeoutSec = requestTimeoutSec ?? new CachingProxyConfig().RequestTimeoutSec,
       S3 = new CachingProxyConfig.S3Config(BucketName, signedLinks)
       {
         SignedLinkTTL = signedLinkTTL ?? TimeSpan.FromMinutes(10),
@@ -249,6 +257,37 @@ public class S3CachingMiddlewareTest(UpstreamTestServer upstreamServer)
     Assert.Equal([5, 5, 2], myS3.CompletedPartSizes);
     Assert.True(myS3.Objects.TryGetValue(GetPathKey("/real/chunked.bin"), out var stored));
     Assert.Equal("chunk1chunk2", Encoding.UTF8.GetString(stored.Body));
+  }
+
+  [Fact]
+  public async Task Oci_Request_Queued_Behind_A_Slow_Fetch_Is_Sent_Back_To_Ask_Again()
+  {
+    // Requests for one object queue behind the one fetching it, for its whole fetch and relay, and Docker 29
+    // gives up after 30 s without a response head (MRI-5989). So an OCI request waits at most the head budget for
+    // its turn, then is redirected to itself. Here the body takes ~4 s against a 1 s budget, and whichever request
+    // gets the lease first is the one that completes.
+    upstreamServer.SlowBodyChunks = 8;
+    upstreamServer.SlowBodyChunkDelayMs = 500;
+    try
+    {
+      var server = CreateServer(signedLinks: false, oci: true, requestTimeoutSec: 1);
+      var responses = await Task.WhenAll(
+        server.CreateRequest("/v2/real/slow-body.bin").GetAsync(),
+        server.CreateRequest("/v2/real/slow-body.bin").GetAsync());
+
+      var statuses = responses.Select(r => r.Headers.GetValues(CachingProxyConstants.StatusHeader).Single()).Order().ToArray();
+      Assert.Equal([nameof(CachingProxyStatus.MISS), nameof(CachingProxyStatus.UPSTREAM_PENDING)], statuses);
+
+      var pending = responses.Single(r => r.StatusCode == HttpStatusCode.TemporaryRedirect &&
+                                          r.Headers.Location?.OriginalString == "/v2/real/slow-body.bin");
+      AssertStatusHeader(pending, CachingProxyStatus.UPSTREAM_PENDING);
+      foreach (var response in responses) response.Dispose();
+    }
+    finally
+    {
+      upstreamServer.SlowBodyChunks = 20;
+      upstreamServer.SlowBodyChunkDelayMs = 200;
+    }
   }
 
   [Fact]

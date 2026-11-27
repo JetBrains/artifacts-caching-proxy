@@ -80,6 +80,27 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
     return (Nibble(s3Key[0]) << 12) | (Nibble(s3Key[1]) << 8) | (Nibble(s3Key[3]) << 4) | Nibble(s3Key[4]);
   }
 
+  // Null for an OCI request still queued after the upstream head budget: Docker 29 and BuildKit give up after 30 s
+  // without a response head, and a request queued behind a cold blob's fill and relay waits far longer. The caller
+  // sends it back to ask again (see OciPendingUpstreams). Other clients wait their turn as before. Real time, not
+  // the domain clock: this is an I/O watchdog.
+  private async ValueTask<RateLimitLease?> AcquireKeyLockAsync(string s3Key, CachingProfile? profile, CancellationToken requestAborted)
+  {
+    if (profile is not { Oci: true } || config.RequestTimeoutSec <= 0)
+      return await myKeyLocks.AcquireAsync(s3Key, permitCount: 1, requestAborted);
+
+    using var bounded = CancellationTokenSource.CreateLinkedTokenSource(requestAborted);
+    bounded.CancelAfter(TimeSpan.FromSeconds(config.RequestTimeoutSec));
+    try
+    {
+      return await myKeyLocks.AcquireAsync(s3Key, permitCount: 1, bounded.Token);
+    }
+    catch (OperationCanceledException) when (!requestAborted.IsCancellationRequested)
+    {
+      return null;
+    }
+  }
+
   public async Task InvokeAsync(HttpContext context)
   {
     if (RemoteServers.GetRemoteServer(context, out var remainingPath) is not {} remoteServer)
@@ -142,8 +163,14 @@ public class S3CachingMiddleware(RequestDelegate requestDelegate, IAmazonS3 amaz
       // against one prefix (S3 SlowDown). Pass the verb-agnostic s3Key (the limiter partitions it down
       // to its "aa/bb" prefix) so a concurrent HEAD and GET share one probe; the only verb-specific
       // outputs (large-object HEAD head, GET redirect) are cheap local work.
-      // The unbounded queue guarantees the permit is granted, so the lease is always acquired.
-      using var keyLock = await myKeyLocks.AcquireAsync(s3Key, permitCount: 1, context.RequestAborted);
+      // The unbounded queue guarantees the permit is granted, so the lease is always acquired - unless an OCI
+      // request runs out of time first.
+      using var keyLock = await AcquireKeyLockAsync(s3Key, remoteServer.Profile, context.RequestAborted);
+      if (keyLock == null)
+      {
+        await remoteProxy.RedirectToSelfAsync(context, rule);
+        return;
+      }
 
       // Re-check after acquiring (double-checked locking): a prior leader may have populated the
       // verb-specific head (a large-object redirect or HEAD metadata) while we waited.

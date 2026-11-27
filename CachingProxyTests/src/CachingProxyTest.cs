@@ -2353,7 +2353,8 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
   // abandoned transfer looks the same to the client either way, but only the handled one is logged.
   private sealed record TimeoutProxy(TestServer Server, string CachePath, WarningCollector Warnings);
 
-  private TimeoutProxy CreateTimeoutProxy(long requestTimeoutSec, long idleReadTimeoutSec, Uri? upstreamUrl = null)
+  // oci serves the upstream as an OCI registry at /v2/slow instead of /slow.
+  private TimeoutProxy CreateTimeoutProxy(long requestTimeoutSec, long idleReadTimeoutSec, Uri? upstreamUrl = null, bool oci = false)
   {
     var cachePath = Path.Combine(myTempDirectory, Path.GetRandomFileName());
     Directory.CreateDirectory(cachePath);
@@ -2361,7 +2362,10 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
     var config = new CachingProxyConfig
     {
       LocalCachePath = cachePath,
-      Prefixes = [$"/slow={upstreamUrl ?? myUpstreamServer.Url}"],
+      CachingProfiles = oci ? new Dictionary<string, CachingProfile> { ["docker"] = new() { Oci = true } } : new(),
+      Prefixes = oci
+        ? [new CachingProxyPrefix($"/v2/slow={upstreamUrl ?? myUpstreamServer.Url}", Profile: "docker")]
+        : [$"/slow={upstreamUrl ?? myUpstreamServer.Url}"],
       MinimumFreeDiskSpaceMb = 2,
       RequestTimeoutSec = requestTimeoutSec,
       IdleReadTimeoutSec = idleReadTimeoutSec,
@@ -2438,6 +2442,54 @@ public class CachingProxyTest : IAsyncLifetime, IClassFixture<UpstreamTestServer
     // bound this assertion would also pass against an upstream that simply has no such route.
     Assert.True(stopwatch.Elapsed > TimeSpan.FromMilliseconds(750),
       $"expected to wait out the 1s budget, but the request returned in {stopwatch.ElapsedMilliseconds}ms");
+  }
+
+  [Fact]
+  public async Task Oci_Head_Timeout_Sends_The_Client_Back_Without_Caching()
+  {
+    // A registry filling a cold blob from its own upstream answers only once it holds all of it (GAR: 80 s for
+    // 3 GB, MRI-5989), and Docker 29 gives up after 30 s without a head and never retries a 404. So an OCI timeout
+    // is a redirect to the same URL, query included (it carries the redirector's signature), and nothing is
+    // negative-cached: the next request asks the upstream again.
+    myUpstreamServer.SlowResponseDelayMs = 1500;
+    var proxy = CreateTimeoutProxy(requestTimeoutSec: 1, idleReadTimeoutSec: 60, oci: true);
+    try
+    {
+      using (var pending = await proxy.Server.CreateRequest("/v2/slow/slow.txt?a=1&b=2").GetAsync())
+      {
+        Assert.Equal(HttpStatusCode.TemporaryRedirect, pending.StatusCode);
+        AssertStatusHeader(pending, CachingProxyStatus.UPSTREAM_PENDING);
+        Assert.Equal("/v2/slow/slow.txt?a=1&b=2", pending.Headers.Location?.OriginalString);
+        Assert.True(pending.Headers.CacheControl?.NoStore);
+      }
+
+      myUpstreamServer.SlowResponseDelayMs = 0;
+      using var answered = await proxy.Server.CreateRequest("/v2/slow/slow.txt").GetAsync();
+      Assert.Equal(HttpStatusCode.OK, answered.StatusCode);
+      AssertStatusHeader(answered, CachingProxyStatus.MISS);
+    }
+    finally
+    {
+      myUpstreamServer.SlowResponseDelayMs = 1500;
+    }
+  }
+
+  [Fact]
+  public async Task Oci_Object_Pending_Past_The_Limit_Is_Negative_Cached()
+  {
+    // Docker 26 follows any number of redirects, so the loop is bounded per object: once it has been pending for
+    // OciPendingUpstreams.Limit, the next timeout is negative-cached like any other.
+    myUpstreamServer.SlowResponseDelayMs = 1500;
+    var proxy = CreateTimeoutProxy(requestTimeoutSec: 1, idleReadTimeoutSec: 60, oci: true);
+
+    using (var pending = await proxy.Server.CreateRequest("/v2/slow/slow.txt").GetAsync())
+      AssertStatusHeader(pending, CachingProxyStatus.UPSTREAM_PENDING);
+
+    myTimeProvider.Advance(OciPendingUpstreams.Limit);
+
+    using var stuck = await proxy.Server.CreateRequest("/v2/slow/slow.txt").GetAsync();
+    Assert.Equal(HttpStatusCode.NotFound, stuck.StatusCode);
+    AssertStatusHeader(stuck, CachingProxyStatus.NEGATIVE_MISS);
   }
 
   [Fact]
