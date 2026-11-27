@@ -39,13 +39,13 @@ public static class AuthExtensions
   private const string CombinedInboundScheme = "CombinedInbound";
 
   /// <summary>
-  /// Per-upstream auth. Four credential modes coexist (see <see cref="UpstreamAuth"/>): OAuth
+  /// Per-upstream auth. Five credential modes coexist (see <see cref="UpstreamAuth"/>): OAuth
   /// client-credentials (Duende token management, one client per entry named by its ClientId), GitHub
   /// App (a signed JWT exchanged for an installation token — GitHub does not support the client-credentials
   /// grant), a fixed service account sent as Basic (a container-registry PAT), which needs no
-  /// registration here at all, and CodeArtifact (an AWS identity exchanged for a domain authorization
-  /// token). The dispatch between them lives in
-  /// <see cref="IUpstreamAuthorizationProvider"/>, which RemoteProxy resolves optionally, so
+  /// registration here at all, CodeArtifact (an AWS identity exchanged for a domain authorization
+  /// token) and Google workload identity (the same AWS identity exchanged for a Google federated token). The
+  /// dispatch between them lives in <see cref="IUpstreamAuthorizationProvider"/>, which RemoteProxy resolves optionally, so
   /// unauthenticated deployments pull in nothing extra.
   /// </summary>
   public static IServiceCollection AddUpstreamAuth(this IServiceCollection services, IConfiguration configuration)
@@ -53,6 +53,14 @@ public static class AuthExtensions
     ClientCredentialsTokenManagementBuilder? tokenManagement = null;
     foreach (var (name, auth) in configuration.Get<CachingProxyConfig>()?.UpstreamAuth ?? [])
     {
+      // Google workload identity mode: the token is exchanged on demand by GoogleWorkloadIdentityTokenProvider,
+      // so only the shape is checked. First, so a CodeArtifact prefix cannot hide a stray audience.
+      if (auth.IsGoogleWorkloadIdentity)
+      {
+        ValidateGoogleWorkloadIdentity(name, auth);
+        continue;
+      }
+
       // CodeArtifact mode: the token is minted on demand by CodeArtifactTokenProvider, so only the shape is
       // checked.
       if (auth.IsCodeArtifact)
@@ -128,6 +136,10 @@ public static class AuthExtensions
     // TryAdd, so tests can stand in for AWS.
     services.TryAddSingleton<ICodeArtifactTokenClient, AwsCodeArtifactTokenClient>();
     services.AddSingleton<CodeArtifactTokenProvider>();
+    services.AddHttpClient(nameof(GoogleFederatedTokenClient))
+      .AddTokenClientRetryPolicy();
+    services.TryAddSingleton<IGoogleFederatedTokenClient, GoogleFederatedTokenClient>();
+    services.AddSingleton<GoogleWorkloadIdentityTokenProvider>();
     services.AddSingleton<IUpstreamAuthorizationProvider, UpstreamAuthorizationProvider>();
 
     // The OCI registry token dance. Not driven by UpstreamAuth entries at all — a registry demands a token
@@ -138,6 +150,23 @@ public static class AuthExtensions
     services.AddSingleton<RegistryTokenProvider>();
 
     return services;
+  }
+
+  // The audience is the provider's resource name; anything else fails only at the first fetch, as a 400 from Google.
+  private static void ValidateGoogleWorkloadIdentity(string name, UpstreamAuth auth)
+  {
+    var audience = auth.GoogleWorkloadIdentityAudience!;
+    if (!audience.StartsWith("//iam.googleapis.com/projects/", StringComparison.Ordinal) ||
+        !audience.Contains("/workloadIdentityPools/", StringComparison.Ordinal) ||
+        !audience.Contains("/providers/", StringComparison.Ordinal))
+      throw new ArgumentException(
+        $"UpstreamAuth '{name}' has GoogleWorkloadIdentityAudience '{audience}', which is no workload identity pool " +
+        "provider. Expected //iam.googleapis.com/projects/<number>/locations/global/workloadIdentityPools/<pool>/providers/<provider>.");
+    if (auth.IsCodeArtifact || !string.IsNullOrEmpty(auth.ClientId) || !string.IsNullOrEmpty(auth.Username) ||
+        !string.IsNullOrEmpty(auth.Password) || !string.IsNullOrEmpty(auth.PrivateKey))
+      throw new ArgumentException(
+        $"UpstreamAuth '{name}' mixes GoogleWorkloadIdentityAudience with CodeArtifact/ClientId/Username/Password/PrivateKey. " +
+        "An entry authenticates one way only.");
   }
 
   // One domain per entry, since the token is per domain; every other mode's fields would be ignored, so they

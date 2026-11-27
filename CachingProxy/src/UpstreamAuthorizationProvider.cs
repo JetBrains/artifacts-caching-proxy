@@ -9,7 +9,7 @@ namespace JetBrains.CachingProxy;
 /// <summary>
 /// Builds the <c>Authorization</c> header sent to an authenticated upstream, dispatching on the matched
 /// <see cref="UpstreamAuth"/> entry's mode. Returns <c>null</c> when there is nothing to add (unauthenticated
-/// upstream, or an entry with neither a client id, a service account nor a CodeArtifact endpoint).
+/// upstream, or an entry with no client id, service account, CodeArtifact endpoint or workload identity audience).
 /// <para>For an OCI upstream the result goes somewhere else entirely: a registry takes an account at the
 /// token endpoint its challenge names, not on <c>/v2/…</c>, so <see cref="RegistryTokenProvider"/>
 /// presents this header there and only the minted token is sent to the registry. The account itself never
@@ -23,12 +23,23 @@ public interface IUpstreamAuthorizationProvider
 public sealed class UpstreamAuthorizationProvider(
   GitHubAppInstallationTokenProvider gitHubAppTokenProvider,
   IClientCredentialsTokenManager? tokenManager = null,
-  CodeArtifactTokenProvider? codeArtifactTokenProvider = null) : IUpstreamAuthorizationProvider
+  CodeArtifactTokenProvider? codeArtifactTokenProvider = null,
+  GoogleWorkloadIdentityTokenProvider? googleTokenProvider = null) : IUpstreamAuthorizationProvider
 {
   public async ValueTask<AuthenticationHeaderValue?> GetAuthorizationHeaderAsync(UpstreamAuth? auth, CancellationToken ct)
   {
     if (auth == null)
       return null;
+
+    // Google workload identity mode: Artifact Registry takes an OAuth access token as the Basic password under
+    // the fixed username "oauth2accesstoken".
+    if (auth.IsGoogleWorkloadIdentity)
+    {
+      if (googleTokenProvider == null)
+        return null;
+      var googleToken = await googleTokenProvider.GetTokenAsync(auth.GoogleWorkloadIdentityAudience!, ct);
+      return new BasicAuthenticationHeaderValue("oauth2accesstoken", googleToken);
+    }
 
     // CodeArtifact mode: the endpoint host names the domain, and CodeArtifact takes its token as the Basic
     // password under the fixed username "aws".

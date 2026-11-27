@@ -10,7 +10,7 @@ namespace JetBrains.CachingProxy;
 /// of its resolved URL (see <see cref="RemoteServers"/>). This lets many prefixes pointing at the same
 /// host share a single block.
 ///
-/// An entry operates in one of four modes:
+/// An entry operates in one of five modes:
 ///
 /// <para><b>Credential mode</b> (<see cref="ClientId"/> set): the proxy fetches an access token from
 /// <see cref="TokenEndpoint"/> (the token request itself authenticates the client with HTTP Basic, the
@@ -42,6 +42,12 @@ namespace JetBrains.CachingProxy;
 /// CodeArtifact has no anonymous reads and no long-lived credential of its own, so this is the only way in.
 /// The AWS identity is always the SDK's default chain: the ECS task or EC2 instance role on AWS, web identity
 /// (<c>AWS_ROLE_ARN</c> + <c>AWS_WEB_IDENTITY_TOKEN_FILE</c>) off it, so no AWS key is ever configured.</para>
+///
+/// <para><b>Google workload identity mode</b> (<see cref="GoogleWorkloadIdentityAudience"/> set): the proxy
+/// exchanges that same AWS identity for a Google federated access token at the named workload identity pool
+/// provider (see <see cref="GoogleFederatedTokenClient"/>) and sends <c>Authorization: Basic
+/// base64(oauth2accesstoken:token)</c>, which Google Artifact Registry accepts for Maven and, at its token
+/// endpoint, for Docker. The pool decides which AWS roles get in, so no Google key is configured.</para>
 ///
 /// <para>Whichever mode, an entry gates the prefixes it matches behind a validated inbound client JWT
 /// (see <see cref="RemoteServers"/>) - including an account that only buys rate limit on an otherwise
@@ -88,6 +94,11 @@ public record UpstreamAuth
   /// </summary>
   public string[] TokenRealms { get; init; } = [];
 
+  // Google workload identity mode: the provider's full resource name, the STS audience
+  // "//iam.googleapis.com/projects/<number>/locations/global/workloadIdentityPools/<pool>/providers/<provider>".
+  // Not a secret.
+  public string? GoogleWorkloadIdentityAudience { get; init; }
+
   // True when this entry uses GitHub App auth (a private key is configured); ClientId then acts as the
   // JWT issuer rather than an OAuth client id.
   public bool IsGitHubApp => !string.IsNullOrEmpty(PrivateKey);
@@ -99,6 +110,9 @@ public record UpstreamAuth
   // or where they span domains, so the dispatch can take the first one's domain.
   public bool IsCodeArtifact => UrlPrefixes.Any(static prefix => CodeArtifactDomain.FromUrlPrefix(prefix) != null);
 
+  // True when this entry exchanges the AWS identity for a Google federated token.
+  public bool IsGoogleWorkloadIdentity => !string.IsNullOrEmpty(GoogleWorkloadIdentityAudience);
+
   // The domain of the first CodeArtifact UrlPrefix, or null outside CodeArtifact mode. A method, not a
   // property, so configuration binding and JSON serialization never see it.
   public CodeArtifactDomain? GetCodeArtifactDomain() =>
@@ -106,13 +120,14 @@ public record UpstreamAuth
 
   // True when the entry has a credential to send at all. Mirrors the dispatch in
   // IUpstreamAuthorizationProvider, where an entry with neither resolves to no Authorization header.
-  public bool HasCredential => IsServiceAccount || !string.IsNullOrEmpty(ClientId) || IsCodeArtifact;
+  public bool HasCredential => IsServiceAccount || !string.IsNullOrEmpty(ClientId) || IsCodeArtifact || IsGoogleWorkloadIdentity;
 
   public override string ToString() => new StringBuilder()
     .Append(ClientId != null ? $"{nameof(ClientId)}: {ClientId} " : "")
     // The password is never rendered; the username identifies the account well enough to debug with.
     .Append(Username != null ? $"{nameof(Username)}: {Username} " : "")
     .Append(GetCodeArtifactDomain() is { } domain ? $"CodeArtifact: {domain} " : "")
+    .Append(IsGoogleWorkloadIdentity ? $"{nameof(GoogleWorkloadIdentityAudience)}: {GoogleWorkloadIdentityAudience} " : "")
     .Append(UrlPrefixes.Length > 0 ? $", {nameof(UrlPrefixes)}: {string.Join(" ", UrlPrefixes)}" : "")
     .Append(TokenEndpoint != null ? $", {nameof(TokenEndpoint)}: {TokenEndpoint}" : "")
     .Append(Scope != null ? $", {nameof(Scope)}:{Scope}" : "")

@@ -65,6 +65,14 @@ public sealed class S3RequestSigner(TimeProvider timeProvider, AwsCredentialSour
   /// published AWS example, which signs <c>range</c> too.
   /// </summary>
   public static void Sign(HttpRequestMessage request, ImmutableCredentials credentials, string region,
+    DateTimeOffset now, params string[] extraSignedHeaders) =>
+    Sign(request, credentials, region, "s3", now, extraSignedHeaders);
+
+  /// <summary>
+  /// The same for another AWS service: <see cref="GoogleFederatedTokenClient"/> signs an STS call. Every request
+  /// here has an empty body; only S3 also gets <c>x-amz-content-sha256</c>.
+  /// </summary>
+  public static void Sign(HttpRequestMessage request, ImmutableCredentials credentials, string region, string service,
     DateTimeOffset now, params string[] extraSignedHeaders)
   {
     var uri = request.RequestUri ?? throw new ArgumentException("Request has no URI.", nameof(request));
@@ -78,7 +86,9 @@ public sealed class S3RequestSigner(TimeProvider timeProvider, AwsCredentialSour
     request.Headers.Remove("x-amz-content-sha256");
     request.Headers.Remove("x-amz-security-token");
     request.Headers.TryAddWithoutValidation("x-amz-date", amzDate);
-    request.Headers.TryAddWithoutValidation("x-amz-content-sha256", EmptyPayloadHash);
+    // S3 requires it; Google STS rejects a GetCallerIdentity that signs it.
+    if (service == "s3")
+      request.Headers.TryAddWithoutValidation("x-amz-content-sha256", EmptyPayloadHash);
     if (credentials.UseToken)
       request.Headers.TryAddWithoutValidation("x-amz-security-token", credentials.Token);
 
@@ -102,12 +112,12 @@ public sealed class S3RequestSigner(TimeProvider timeProvider, AwsCredentialSour
       signedHeaders,
       EmptyPayloadHash);
 
-    var scope = $"{date}/{region}/s3/aws4_request";
+    var scope = $"{date}/{region}/{service}/aws4_request";
     var stringToSign = $"AWS4-HMAC-SHA256\n{amzDate}\n{scope}\n{Hex(SHA256.HashData(Encoding.UTF8.GetBytes(canonicalRequest)))}";
 
     var key = Hmac(Encoding.UTF8.GetBytes("AWS4" + credentials.SecretKey), date);
     key = Hmac(key, region);
-    key = Hmac(key, "s3");
+    key = Hmac(key, service);
     key = Hmac(key, "aws4_request");
     var signature = Hex(Hmac(key, stringToSign));
 
